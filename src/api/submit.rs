@@ -4,7 +4,7 @@
 use super::client::{check_business, ApiClient};
 use crate::crypto::decrypt::{decrypt_response, derive_paes_key};
 use crate::crypto::envelope::{build_envelope, build_envelope_ts, rsa_public_key, OuterOrder};
-use crate::crypto::header::{build_android_header, HeaderIdentity, UA_ANDROID};
+use crate::crypto::header::build_android_header;
 use crate::crypto::sign::{original_sign, signature};
 use crate::track::calorie::{avg_power, official_kcal};
 use crate::track::geom::round_to;
@@ -233,13 +233,23 @@ fn send_record(
     } else {
         client.identity.device_id.clone()
     };
-    let android_identity = HeaderIdentity {
-        platform: "android".into(),
-        device_id: device_id.clone(),
-        os_version: "14".into(),
-        device_name: "22081212C".into(),
-        ..client.identity.clone()
-    };
+    // 提交接口固定走 Android 身份（osType=0 + androidId）。
+    // 关键：机型/分辨率/androidId 必须来自同一套自洽指纹。
+    // 原实现硬编码 22081212C + Android 14，一旦设备页配的是别的机型，
+    // 就会上报"机型 A + 分辨率 B"这种矛盾组合。
+    let mut android_identity = client.identity.clone();
+    android_identity.platform = "android".into();
+    android_identity.device_id = device_id.clone();
+    if matches!(android_identity.device_name.as_str(), "" | "iPhone" | "Android") {
+        // iOS 身份或占位机型：按 device_id 派生一整套 Android 指纹。
+        let seed = crate::crypto::header::fingerprint_seed(&device_id);
+        let profile = crate::api::fingerprint::DeviceProfile::from_parts("", "", "", "", seed);
+        android_identity.device_name = profile.device_name;
+        android_identity.os_version = profile.os_version;
+        android_identity.pixel = profile.pixel;
+        android_identity.android_id = profile.android_id;
+    }
+    android_identity.ensure_fingerprint();
     let (hp, hp_extra) =
         build_android_header(&android_identity, p.uid, &client_token(client), None);
     let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
@@ -254,11 +264,16 @@ fn send_record(
     let runes = format!("{}{}", p.policy_ts, p.uid);
     let runef = format!("{}{}", run_uuid, start_ms);
     client.ensure_session_valid()?;
-    let mut req = client.agent.post(&client.record_url());
+    // 克隆 agent：错误分支需要可变借用 client 回报出口健康度。
+    let agent = client.agent.clone();
+    let mut req = agent.post(&client.record_url());
     req = req
         .set("Content-Type", "application/json; charset=utf-8")
-        .set("User-Agent", UA_ANDROID)
-        .set("appVersion", "7.3.40")
+        // UA 由身份拼出：机型/系统版本必须与 header 的 deviceName/osVersion 一致。
+        .set("User-Agent", &crate::crypto::header::ua_android(&android_identity))
+        // appVersion 与 UA / 信封保持同源：UA 写着 SWCampus/7.3.70、
+        // 信封 appVersion 也是 7.3.70，外层头部却报 iOS 的 7.3.40 是最廉价的矛盾特征。
+        .set("appVersion", crate::crypto::header::ANDROID_APP_VERSION)
         .set("headerSign", &header_env.json)
         .set("runes", &runes)
         .set("runef", &runef);
@@ -266,10 +281,13 @@ fn send_record(
         req = req.set(k, v);
     }
     let resp = req.send_string(&body_env.json).map_err(|error| {
+        let transport = matches!(&error, ureq::Error::Transport(_));
+        client.report_egress(!transport);
         let rejected = matches!(&error, ureq::Error::Status(401, _));
         let message = client.handle_request_error(error);
         if rejected { SubmitFailure::Rejected(message) } else { SubmitFailure::Unknown(message) }
     })?;
+    client.report_egress(true);
     let status = resp.status();
     let raw = resp.into_string().unwrap_or_default();
     log(&format!(

@@ -11,9 +11,37 @@ use crate::crypto::envelope::{
 use crate::crypto::header::{build_header_for, HeaderIdentity, UA_IOS};
 
 pub fn make_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
+    make_agent_with_proxy(None)
+}
+
+/// 构造 HTTP agent。`proxy_url` 为 `socks5://host:port` 或 `http://host:port`。
+///
+/// 注意：调用方（`bind_egress_for_city`）会**先校验**代理串，校验失败直接报错，
+/// 不会走到这里的兜底分支。这里的 `Err` 分支只是防御性处理 —— 一旦真的触发，
+/// 说明"以为在走代理、其实直连"，比不配代理更糟，所以必须留日志。
+/// 直连与走代理的出口 IP 不同，两者绝不能在同一次跑步任务里混用。
+pub fn make_agent_with_proxy(proxy_url: Option<&str>) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30));
+    if let Some(url) = proxy_url {
+        match ureq::Proxy::new(url) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(error) => eprintln!("[net] 代理 {url} 配置无效，本次改为直连：{error}"),
+        }
+    }
+    builder.build()
+}
+
+/// 从数据目录读取 `proxies.json`。文件不存在 = 直连（与改造前一致）。
+fn load_egress_from_disk() -> Option<crate::api::egress::EgressPool> {
+    let path = crate::platform::data_dir().join("proxies.json");
+    match crate::api::egress::EgressPool::load(&path) {
+        Ok(pool) if !pool.is_empty() => Some(pool),
+        Ok(_) => None,
+        Err(error) => {
+            eprintln!("[net] 出口配置被忽略（本次直连）：{error:?}");
+            None
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -38,6 +66,10 @@ pub struct ApiClient {
     pub session: EnvelopeSession,
     pub identity: HeaderIdentity,
     pub login: Option<Session>,
+    /// 出口池；None 或空池都表示直连（与改造前行为一致）。
+    pub egress: Option<crate::api::egress::EgressPool>,
+    /// 本次任务实际绑定的出口，用于失败回报与展示。
+    pub egress_entry: Option<crate::api::egress::ProxyEntry>,
 }
 
 pub struct RequestOutcome {
@@ -59,6 +91,59 @@ impl ApiClient {
             session: EnvelopeSession::new(),
             identity,
             login,
+            egress: load_egress_from_disk(),
+            egress_entry: None,
+        }
+    }
+
+    /// 按城市绑定出口，并把代理装到 HTTP agent 上。
+    ///
+    /// - `Ok(Some(entry))`：已绑定同城出口；
+    /// - `Ok(None)`：该城市没有配置出口 —— 直连（可能暴露真实 IP，由调用方提示）；
+    /// - `Err`：配了同城出口但全部在冷却中。此时**不要**降级直连，
+    ///   否则等于主动把异地/家宽 IP 暴露给服务端。
+    pub fn bind_egress_for_city(
+        &mut self,
+        city: &str,
+    ) -> Result<Option<crate::api::egress::ProxyEntry>, String> {
+        let Some(pool) = self.egress.as_mut() else {
+            return Ok(None);
+        };
+        match pool.acquire(city) {
+            Ok(entry) => {
+                // 先验证代理串：配置写错时宁可报错，也不要"以为在走代理、其实直连"。
+                // 直连等于把真实 IP 直接交给服务端 —— 这比不配代理更糟，因为用户
+                // 以为自己已经被保护了。
+                ureq::Proxy::new(&entry.url)
+                    .map_err(|error| format!("出口 {} 的代理地址不可用：{error}", entry.url))?;
+                self.agent = make_agent_with_proxy(Some(&entry.url));
+                self.egress_entry = Some(entry.clone());
+                Ok(Some(entry))
+            }
+            Err(crate::api::egress::PoolError::NoCandidate) => {
+                self.agent = make_agent_with_proxy(None);
+                self.egress_entry = None;
+                Ok(None)
+            }
+            Err(crate::api::egress::PoolError::Exhausted) => {
+                Err("同城出口全部处于冷却中，本次不发请求（避免暴露异地 IP）".into())
+            }
+            Err(crate::api::egress::PoolError::Config(error)) => Err(error),
+        }
+    }
+
+    /// 回报当前出口的成败，驱动冷却与轮换。
+    pub fn report_egress(&mut self, ok: bool) {
+        let Some(entry) = self.egress_entry.clone() else {
+            return;
+        };
+        if let Some(pool) = self.egress.as_mut() {
+            let outcome = if ok {
+                crate::api::egress::Outcome::Ok
+            } else {
+                crate::api::egress::Outcome::Failed
+            };
+            pool.report(entry.key(), outcome);
         }
     }
 
@@ -140,16 +225,31 @@ impl ApiClient {
         });
         #[cfg(test)]
         let url = test_url.as_deref().unwrap_or(url);
-        let mut req = self.agent.request(method, url);
+        // 克隆 agent（内部 Arc）：让下面的错误分支仍能可变借用 self 回报出口健康度。
+        let agent = self.agent.clone();
+        let mut req = agent.request(method, url);
         req = req.set("Content-Type", "application/json; charset=utf-8");
         req = req.set("User-Agent", ua);
-        req = req.set("appVersion", "7.3.40");
+        // appVersion 必须与 UA 同源：Android 请求却报 iOS 的 7.3.40，
+        // 和 UA 里的 SWCampus/7.3.70、信封里的 appVersion 三方矛盾。
+        req = req.set(
+            "appVersion",
+            if ua.contains("Android") {
+                crate::crypto::header::ANDROID_APP_VERSION
+            } else {
+                crate::crypto::header::IOS_APP_VERSION
+            },
+        );
         req = req.set("headerSign", &header_env.json);
         for (k, v) in extra_headers {
             req = req.set(k, v);
         }
-        let resp = req.send_string(&body_env.json)
-            .map_err(|e| self.handle_request_error(e))?;
+        let resp = req.send_string(&body_env.json).map_err(|e| {
+            // 只有传输层失败才算"出口坏了"；拿到 HTTP 响应说明代理是通的。
+            let transport = matches!(&e, ureq::Error::Transport(_));
+            self.report_egress(!transport);
+            self.handle_request_error(e)
+        })?;
         let status = resp.status();
         let raw = resp.into_string().unwrap_or_default();
         let raw_len = raw.len();

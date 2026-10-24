@@ -82,6 +82,9 @@ pub struct Config {
     /// 路线算法：legacy | road。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// 提交行为护栏（深夜/每日次数/批量补签）。缺省即默认开启。
+    #[serde(default)]
+    pub safety: crate::safety::SafetyPolicy,
 }
 
 fn default_route_mode() -> String {
@@ -126,6 +129,7 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            safety: crate::safety::SafetyPolicy::default(),
         }
     }
 }
@@ -184,6 +188,10 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
         id.mac_address = crate::crypto::header::random_mac();
         dirty = true;
     }
+    // 指纹自洽：老配置补齐 androidId / 分辨率（同一 device_id 结果恒定）。
+    if id.ensure_fingerprint() {
+        dirty = true;
+    }
     if dirty {
         let _ = save_identity(&id);
     }
@@ -196,6 +204,15 @@ pub struct DeviceInfo {
     pub manufacturer: String,
     pub model: String,
     pub os_version: String,
+    /// 本机当前窗口分辨率（`widthPixels x heightPixels`）。老版本 Java 不返回时为空。
+    #[serde(default)]
+    pub pixel: String,
+    /// `DisplayMetrics.densityDpi`，仅本地展示与自检用。
+    #[serde(default)]
+    pub density_dpi: u32,
+    /// `Settings.Secure.ANDROID_ID`：16 位小写 hex。老版本 Java 不返回时为空。
+    #[serde(default)]
+    pub android_id: String,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -211,6 +228,20 @@ pub fn identity_with_device_info(
     updated.device_name = info.model.trim().into();
     updated.manufacturer = info.manufacturer.trim().into();
     updated.os_version = info.os_version.trim().into();
+    // 真机读到的分辨率 / androidId 优先：这两个值**由构造即自洽**，
+    // 比任何机型对照表都可靠 —— 官方客户端在同一台手机上上报的就是它们。
+    // 只有真机把两个值都给全了才标记来源为「真机」；否则仍按机型库补齐并标记为推算值。
+    let from_device = !info.pixel.trim().is_empty() && !info.android_id.trim().is_empty();
+    if !info.pixel.trim().is_empty() {
+        updated.pixel = info.pixel.trim().into();
+    }
+    if !info.android_id.trim().is_empty() {
+        updated.android_id = info.android_id.trim().into();
+    }
+    updated.fingerprint_from_device = from_device;
+    if !from_device {
+        updated.ensure_fingerprint();
+    }
     Ok(updated)
 }
 
@@ -303,6 +334,13 @@ mod storage_tests {
         expected["device_name"] = "Phone 16".into();
         expected["manufacturer"] = "Example".into();
         expected["os_version"] = "16".into();
+        // 转到 Android 身份后必须补齐指纹（本次改动新增的语义）
+        expected["android_id"] = imported.android_id.clone().into();
+        expected["pixel"] = imported.pixel.clone().into();
+        // 本用例的 info 不含真机分辨率/androidId → 按机型库补齐，来源标记为 false
+        expected["fingerprint_from_device"] = false.into();
+        assert_eq!(imported.android_id.len(), 16, "导入后必须补齐 16 位 androidId");
+        assert!(!imported.pixel.is_empty(), "导入后必须有分辨率");
         assert_eq!(
             serde_json::to_value(&imported).unwrap(),
             expected,
@@ -343,6 +381,49 @@ mod storage_tests {
     }
 
     #[test]
+    fn device_read_fingerprint_is_authoritative_and_needs_no_model_table() {
+        let identity = HeaderIdentity::default();
+        // 一台不在机型库里的真机（分辨率/AndroidID 都由系统读到）
+        let info: DeviceInfo = serde_json::from_str(
+            r#"{"manufacturer":"Xiaomi","model":"23013RK75C","os_version":"13",
+                "pixel":"1080x2400","density_dpi":440,"android_id":"0123456789abcdef"}"#,
+        )
+        .unwrap();
+        let updated = identity_with_device_info(&identity, &info).unwrap();
+        assert!(updated.fingerprint_from_device, "真机读数必须标记来源");
+        assert_eq!(updated.pixel, "1080x2400");
+        assert_eq!(updated.android_id, "0123456789abcdef");
+        // 机型不在库内也不该被自检报警（真机读数是权威值）
+        let profile = crate::api::fingerprint::DeviceProfile::from_parts(
+            &updated.device_name,
+            &updated.os_version,
+            &updated.pixel,
+            &updated.android_id,
+            0,
+        );
+        assert!(
+            crate::api::fingerprint::audit_ex(&profile, false).is_empty(),
+            "真机读数不应触发机型库告警"
+        );
+        // 只给机型、不给读数时退回机型库补齐。
+        // 注意：真实路径里 device_id 一定由 load_identity_for_platform 补好，
+        // 空 device_id 不会派生指纹（MD5("") 是常量，会让所有设备撞同一个 androidId）。
+        let with_id = HeaderIdentity {
+            device_id: "0E5A5B4C-1111-4A2B-9C3D-5E6F70819234".into(),
+            ..identity.clone()
+        };
+        let partial: DeviceInfo =
+            serde_json::from_str(r#"{"manufacturer":"Xiaomi","model":"23127PN0CC","os_version":"14"}"#)
+                .unwrap();
+        let inferred = identity_with_device_info(&with_id, &partial).unwrap();
+        assert!(!inferred.fingerprint_from_device);
+        assert!(!inferred.pixel.is_empty() && inferred.android_id.len() == 16);
+        // 空 device_id 不派生：宁可缺字段，也不要所有设备共用一个 androidId
+        let no_id = identity_with_device_info(&identity, &partial).unwrap();
+        assert!(no_id.android_id.is_empty(), "空 device_id 不应派生指纹");
+    }
+
+    #[test]
     fn incomplete_native_device_info_cannot_replace_identity() {
         let identity = HeaderIdentity::default();
         for (model, os_version) in [("", "16"), ("Phone", " ")] {
@@ -350,6 +431,9 @@ mod storage_tests {
                 manufacturer: String::new(),
                 model: model.into(),
                 os_version: os_version.into(),
+                pixel: String::new(),
+                density_dpi: 0,
+                android_id: String::new(),
             };
             assert!(identity_with_device_info(&identity, &info).is_err());
         }
@@ -396,6 +480,9 @@ pub struct PointsCacheScope {
     pub uid: i64,
     pub unid: String,
     pub run_area_id: Option<String>,
+    /// 拉点位时用的目标距离（米，取整）。不同距离对应不同点位集合，不能复用。
+    #[serde(default)]
+    pub distance_m: i64,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -463,6 +550,7 @@ mod points_cache_tests {
                 uid: 1,
                 unid: "school".into(),
                 run_area_id: None,
+                distance_m: 2000,
             },
             points: vec![serde_json::json!({"lat":39.9,"lon":116.4})],
         };
@@ -481,6 +569,11 @@ mod points_cache_tests {
             },
             PointsCacheScope {
                 run_area_id: Some("42".into()),
+                ..cache.scope.clone()
+            },
+            // 距离不同 → 点位集合不同，不能复用
+            PointsCacheScope {
+                distance_m: 3000,
                 ..cache.scope.clone()
             },
         ] {

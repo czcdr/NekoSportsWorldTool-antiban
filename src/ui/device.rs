@@ -6,11 +6,6 @@ use crate::crypto::header::HeaderIdentity;
 use eframe::egui;
 
 const IOS_OS_POOL: [&str; 5] = ["17.5.1", "18.0.1", "18.1", "18.2", "26.5.2"];
-const ANDROID_MODEL_POOL: [&str; 8] = [
-    "22081212C", "OPPO PGBM10", "Redmi K60", "HUAWEI Mate 40", "vivo V2309A",
-    "Pixel 8", "SM-S9210", "OnePlus ACE3",
-];
-const ANDROID_OS_POOL: [&str; 4] = ["12", "13", "14", "15"];
 
 #[derive(Default)]
 pub struct DevicePage {
@@ -38,8 +33,10 @@ impl App {
                         Ok(()) => {
                             self.identity = self.device_buf.clone();
                             crate::android::complete_device_info();
-                            self.status = format!("已读取 {} {} / Android {}；UUID 保持不变",
-                                info.manufacturer, info.model, info.os_version);
+                            self.status = format!(
+                                "已读取 {} {} / Android {} / {}（{}dpi）；UUID 保持不变",
+                                info.manufacturer, info.model, info.os_version, info.pixel, info.density_dpi
+                            );
                         }
                         Err(error) => {
                             self.tab = 5;
@@ -47,7 +44,10 @@ impl App {
                         }
                     }
                 } else {
-                    self.status = format!("已读取 {} {}；点击保存后生效，UUID 保持不变", info.manufacturer, info.model);
+                    self.status = format!(
+                        "已读取 {} {} / {}；点击保存后生效，UUID 保持不变",
+                        info.manufacturer, info.model, info.pixel
+                    );
                 }
             }
             Err(error) => self.status = format!("× {error}"),
@@ -160,6 +160,22 @@ impl App {
         ui.add_space(8.0);
         mobile::row(ui, |ui| {
             if ui.add(theme::primary_btn("保存")).clicked() {
+                // 机型变了就重置派生指纹：否则会得到"新机型 + 旧分辨率/androidId"
+                // 这种自相矛盾的组合，比不做随机更糟。
+                // 手改机型后来源不再是真机读取，标记回 false，让自检恢复按机型库核对。
+                if self.device_buf.platform != "android" {
+                    self.device_buf.android_id.clear();
+                    self.device_buf.pixel.clear();
+                    self.device_buf.fingerprint_from_device = false;
+                } else {
+                    if self.device_buf.device_name != self.identity.device_name {
+                        self.device_buf.android_id.clear();
+                        self.device_buf.pixel.clear();
+                        self.device_buf.fingerprint_from_device = false;
+                    }
+                    // 只补空字段，不覆盖真机读数 / 用户手填值。
+                    self.device_buf.ensure_fingerprint();
+                }
                 match crate::api::model::save_identity(&self.device_buf) {
                     Ok(()) => {
                         self.identity = self.device_buf.clone();
@@ -204,11 +220,77 @@ impl App {
                 "运行前请填写实际城市和定位锚点；默认大连配置不会用于提交",
             );
         }
+        // 指纹自洽自检：机型↔分辨率↔系统版本↔androidId，比轨迹更容易被服务端判定。
+        // 读数来自真机时（fingerprint_from_device）不按机型库核对 —— 这台机不在那 13 款里是正常的。
+        if self.identity.platform == "android" {
+            let profile = crate::api::fingerprint::DeviceProfile::from_parts(
+                &self.identity.device_name,
+                &self.identity.os_version,
+                &self.identity.pixel,
+                &self.identity.android_id,
+                0,
+            );
+            let issues =
+                crate::api::fingerprint::audit_ex(&profile, !self.identity.fingerprint_from_device);
+            if issues.is_empty() {
+                ui.colored_label(
+                    theme::ok(),
+                    format!(
+                        "√ 指纹自洽{}：{} / {} / androidId {}",
+                        if self.identity.fingerprint_from_device { "（本机读数）" } else { "" },
+                        profile.device_name,
+                        profile.pixel,
+                        profile.android_id
+                    ),
+                );
+            } else {
+                for issue in issues {
+                    ui.colored_label(theme::warn(), format!("⚠ {issue}"));
+                }
+            }
+        }
         if page.saved_flash > 0.0 {
             page.saved_flash -= ui.ctx().input(|i| i.stable_dt);
         }
         if self.identity.platform == "android" && !self.identity.manufacturer.is_empty() {
             ui.label(format!("当前保存品牌：{}", self.identity.manufacturer));
+        }
+
+        // ── 安全护栏开关 ──────────────────────────────────────────
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label("安全护栏（防封）");
+        ui.colored_label(
+            theme::text_dim(),
+            "时段本身已有设计：随机时刻在 7:00-20:00、补签在 7:00-21:00 内抽样。\n\
+             这里额外守住三件原本不管的事：深夜提交、同一自然日多条、一次补太多天。关闭后不再有任何频率保护。",
+        );
+        let policy = self.config.safety.clone();
+        let label = format!(
+            "启用（深夜 {}-{} 点、每日跑步 {} 次、AI {} 次、补签 ≤{} 天、同日重复 ≤{} 次）",
+            policy.night_from,
+            policy.night_to,
+            policy.daily_runs,
+            policy.daily_ai,
+            policy.backfill_days,
+            policy.batch_per_day
+        );
+        let mut enabled = policy.enabled;
+        if ui.checkbox(&mut enabled, label).changed() {
+            self.config.safety.enabled = enabled;
+            match crate::api::model::save_config(&self.config) {
+                Ok(()) => {
+                    self.status = if enabled {
+                        "√ 安全护栏已开启".into()
+                    } else {
+                        "⚠ 安全护栏已关闭：深夜与频率不再受保护".into()
+                    }
+                }
+                Err(error) => self.status = format!("× 保存失败：{error}"),
+            }
+        }
+        if !self.config.safety.enabled {
+            ui.colored_label(theme::warn(), "⚠ 护栏已关闭：提交时段与次数完全由你控制");
         }
     }
 }
@@ -219,25 +301,33 @@ fn location_fields_changed(saved: &HeaderIdentity, pending: &HeaderIdentity) -> 
         || (saved.anchor_lon - pending.anchor_lon).abs() > 1e-9
 }
 
-/// 整套随机：uuid v4 设备 ID（大写）；机型/系统按平台池抽取。
+/// 整套随机：uuid v4 设备 ID（大写）；Android 走真实机型库生成自洽指纹。
 fn randomize(buf: &mut HeaderIdentity, platform: &str) {
     buf.manufacturer.clear();
     buf.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
     buf.app_install_time = HeaderIdentity::fresh_install_time(platform);
     if platform == "android" {
-        let i = (rand::random::<f64>() * ANDROID_MODEL_POOL.len() as f64) as usize
-            % ANDROID_MODEL_POOL.len();
-        let j =
-            (rand::random::<f64>() * ANDROID_OS_POOL.len() as f64) as usize % ANDROID_OS_POOL.len();
-        buf.device_name = ANDROID_MODEL_POOL[i].into();
-        buf.os_version = ANDROID_OS_POOL[j].into();
+        // 机型 / 分辨率 / 系统版本 / androidId 一次生成，保证内部自洽：
+        // 伪机型名（Redmi K60、OnePlus ACE3 之类）不是真实 Build.MODEL，
+        // 服务端一旦对照机型库就会露馅。
+        let profile = crate::api::fingerprint::DeviceProfile::mint(rand::random::<u64>());
+        buf.device_name = profile.device_name;
+        buf.manufacturer = profile.brand;
+        buf.os_version = profile.os_version;
+        buf.pixel = profile.pixel;
+        buf.android_id = profile.android_id;
         buf.idfa = String::new();
+        // 随机生成的档案来自机型库，不是本机读数 → 自检按机型库核对。
+        buf.fingerprint_from_device = false;
         buf.platform = "android".into();
     } else {
         let k = (rand::random::<f64>() * IOS_OS_POOL.len() as f64) as usize % IOS_OS_POOL.len();
         buf.device_name = "iPhone".into();
         buf.os_version = IOS_OS_POOL[k].into();
         buf.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
+        buf.android_id.clear();
+        buf.pixel.clear();
+        buf.fingerprint_from_device = false;
         buf.platform = "ios".into();
     }
 }
@@ -260,15 +350,37 @@ mod tests {
         assert!(location_fields_changed(&saved, &pending));
     }
 
+    /// 随机生成必须换掉旧品牌，并且 Android 新身份必须是**自洽**的一套
+    /// （机型↔分辨率↔系统版本↔androidId），否则等于换了个更明显的破绽。
     #[test]
-    fn random_device_does_not_keep_a_previously_imported_brand() {
+    fn random_device_replaces_brand_and_yields_a_consistent_identity() {
         for platform in ["android", "ios"] {
             let mut identity = HeaderIdentity {
                 manufacturer: "Previously imported brand".into(),
                 ..Default::default()
             };
             randomize(&mut identity, platform);
-            assert!(identity.manufacturer.is_empty(), "random {platform} identity must not retain a different device's brand");
+            assert_ne!(
+                identity.manufacturer, "Previously imported brand",
+                "random {platform} identity must not retain a different device's brand"
+            );
+            if platform == "android" {
+                assert!(!identity.manufacturer.is_empty(), "Android 必须带与机型匹配的品牌");
+                assert_eq!(identity.android_id.len(), 16, "androidId 必须是 16 位");
+                assert!(!identity.pixel.is_empty(), "分辨率必须一并生成");
+                let profile = crate::api::fingerprint::DeviceProfile::from_parts(
+                    &identity.device_name,
+                    &identity.os_version,
+                    &identity.pixel,
+                    &identity.android_id,
+                    0,
+                );
+                let issues = crate::api::fingerprint::audit(&profile);
+                assert!(issues.is_empty(), "随机生成不自洽: {issues:?}");
+            } else {
+                assert!(identity.manufacturer.is_empty(), "iOS 没有品牌字段");
+                assert!(identity.android_id.is_empty(), "iOS 不应携带 androidId");
+            }
         }
     }
 }

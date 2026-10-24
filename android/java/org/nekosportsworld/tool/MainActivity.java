@@ -34,8 +34,8 @@ public final class MainActivity extends NativeActivity {
                 : "允许后只填写设备页，点击“保存”后用于后续登录和业务请求。";
             AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("读取本机信息")
-                .setMessage("是否允许读取本机品牌、型号和 Android 系统版本？\n\n" + purpose
-                    + "品牌仅用于设备页展示。"
+                .setMessage("是否允许读取本机品牌、型号、系统版本、屏幕分辨率和本应用的 ANDROID_ID？\n\n" + purpose
+                    + "品牌仅用于设备页展示；以上数值只用于让本应用上报的设备信息与这台手机保持一致。"
                     + "\n\n设备 UUID 继续沿用本应用首次生成并保存的值，不会更换。拒绝后仍可手动填写，也可在设备页再次读取。")
                 .setPositiveButton("允许读取", (ignored, which) -> {
                     // First-run completion is acknowledged only after Rust saves it.
@@ -47,6 +47,16 @@ public final class MainActivity extends NativeActivity {
                         info.put("manufacturer", android.os.Build.MANUFACTURER);
                         info.put("model", android.os.Build.MODEL);
                         info.put("os_version", android.os.Build.VERSION.RELEASE);
+                        // 分辨率与 ANDROID_ID：真机读到的值由构造即自洽，
+                        // 比任何"机型对照表"都可靠（官方客户端在同一台机上上报的就是它们）。
+                        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+                        int w = Math.min(metrics.widthPixels, metrics.heightPixels);
+                        int h = Math.max(metrics.widthPixels, metrics.heightPixels);
+                        info.put("pixel", w > 0 && h > 0 ? (w + "x" + h) : "");
+                        info.put("density_dpi", metrics.densityDpi);
+                        String androidId = android.provider.Settings.Secure.getString(
+                            getContentResolver(), android.provider.Settings.Secure.ANDROID_ID);
+                        info.put("android_id", androidId == null ? "" : androidId);
                         nativeDeviceInfo(initial, info.toString(), "");
                     } catch (Exception error) {
                         nativeDeviceInfo(initial, "", "读取本机信息失败，请在设备页重试或手动填写");

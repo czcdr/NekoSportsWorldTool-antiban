@@ -117,7 +117,10 @@ pub fn login(
     let login_body = json!({
         "device_model": identity.device_name,
         "os_version": identity.os_version,
-        "mac_address": identity.mac_address,
+        // Android 6+ 普通应用读到的 MAC 固定是 02:00:00:00:00:00；
+        // 这里必须与提交头一致，否则同一账号「登录说随机 MAC、提交说占位 MAC」，
+        // 比轨迹分析便宜得多就能对出来。
+        "mac_address": crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC,
         "imei": "",
         "loginType": 0,
         "username": username,

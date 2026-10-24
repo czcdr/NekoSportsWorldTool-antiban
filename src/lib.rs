@@ -8,6 +8,7 @@ pub mod location;
 pub mod platform;
 mod relaunch;
 mod road_status;
+pub mod safety;
 mod task_control;
 pub mod template;
 mod textlog;

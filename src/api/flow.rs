@@ -81,10 +81,51 @@ impl Verification {
             None => "未知",
         }
     }
+
+    /// 未达标时服务端给出的具体原因（`reasonList` 里 `complete=false` 的 `reason`）。
+    ///
+    /// 这是「记录还在但不算数」最直接的诊断：服务端会说明是哪一项没满足
+    /// （里程、有效时间、点位、步频……），比只看「未达标」有用得多。
+    pub fn failure_reasons(&self) -> Vec<String> {
+        let Some(detail) = &self.detail else {
+            return Vec::new();
+        };
+        detail
+            .get("reasonList")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.get("complete").and_then(Value::as_bool) == Some(false))
+                    .filter_map(|r| r.get("reason").and_then(Value::as_str))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
-fn sleep_secs(s: u64) {
-    std::thread::sleep(std::time::Duration::from_secs(s));
+/// 固定的 2s / 1s / 2s 间隔本身就是一种机器节奏。抖动到 [base, 2*base) 毫秒，
+/// 让"拉策略→拉点位→提交→传 OBS→读详情"这条链的时序不像脚本。
+fn sleep_jitter(base_ms: u64) {
+    let extra = rand::random::<u64>() % base_ms.max(1);
+    std::thread::sleep(std::time::Duration::from_millis(base_ms + extra));
+}
+
+/// 用 policy 响应的服务端时间戳估算本地时钟偏差（毫秒）。
+///
+/// 服务端可能给秒或毫秒，按量级判断；给 0 表示未知，不报偏差。
+/// 返回正值 = 服务器比本地快。
+fn server_skew_ms(server_ts: i64) -> i64 {
+    if server_ts <= 0 {
+        return 0;
+    }
+    let server_ms = if server_ts > 1_000_000_000_000 {
+        server_ts
+    } else {
+        server_ts.saturating_mul(1000)
+    };
+    server_ms.saturating_sub(crate::crypto::envelope::now_ms())
 }
 
 /// 跑步全链。
@@ -113,6 +154,30 @@ pub fn run_full_flow_cancellable(
     }
     let sess: Session = client.login.clone().ok_or("未登录")?;
 
+    // 行为护栏：深夜提交、同日多次提交是最容易被人工审查的特征。
+    // 纯本地判断，不发任何请求；被拦时立刻返回，不浪费出口与额度。
+    // 这里**占位而不是只检查**：锁内完成「校验 + 计数 +1」，提交失败由 RAII 归还，
+    // 既堵住并发提交同时读到 0 条的竞态，也避免写盘失败变成"永远 0 条"的 fail-open。
+    let safety = super::model::load_config().safety;
+    let reservation = crate::safety::reserve_run(&safety, params.start_ms)?;
+
+    // 出口与轨迹同城：策略 / 点位 / 提交 / OBS / 详情整条链路共用同一出口 IP。
+    // 服务端把「轨迹所在城市」和「请求来源 IP」做对比，是最廉价的风控手段。
+    let city = client.identity.city.clone();
+    match client.bind_egress_for_city(&city)? {
+        Some(entry) => log(&format!(
+            "[net] 出口已绑定 {}（同城：{city}）",
+            if entry.id.is_empty() { &entry.url } else { &entry.id }
+        )),
+        None => {
+            if client.egress.is_some() {
+                log(&format!(
+                    "[net] ⚠ 出口池里没有 {city} 的节点，本次直连 —— 来源 IP 可能与轨迹城市不符"
+                ));
+            }
+        }
+    }
+
     super::submission_guard::preflight(client, params.start_ms, params.dur, log)?;
 
     // ① policy
@@ -122,7 +187,31 @@ pub fn run_full_flow_cancellable(
         "√ [policy] ts={} policy={} minDistance={} validTime={}",
         pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
     ));
-    sleep_secs(2);
+    // 服务端时钟对齐：本地时间偏差会让请求 timeStamp 与服务端对不上，
+    // 是成本很低的异常特征，也是「提交成功却不算数」的常见原因之一。
+    let skew_ms = server_skew_ms(pol.timestamp);
+    if skew_ms.abs() > 60_000 {
+        log(&format!(
+            "⚠ [time] 本地时间与服务器相差约 {} 分钟 —— 请校准设备时间，否则 timeStamp 会异常",
+            skew_ms / 60_000
+        ));
+    } else if skew_ms.abs() > 5_000 {
+        log(&format!(
+            "[time] 本地与服务器时钟偏差 {}s（在可接受范围内）",
+            skew_ms / 1000
+        ));
+    }
+    // 时区口径：随机时刻/「今天-昨天」用的是设备本地时区，护栏用的是北京时间。
+    // 设备时区不是 UTC+8 时两者会错位（白天可能被当成深夜拦，日期也会错一天）。
+    let offset = chrono::Local::now().offset().local_minus_utc();
+    if offset != 8 * 3600 {
+        log(&format!(
+            "⚠ [time] 设备时区不是 UTC+8（{:+.1} 小时）：随机时刻与「今天/昨天」按本地时区算，\
+             而深夜判定按北京时间 —— 请把手机时区设为北京时间，否则配额与时段会错位",
+            offset as f64 / 3600.0
+        ));
+    }
+    sleep_jitter(1500);
 
     control.check()?;
     log("[road] 获取并核对当前校区围栏…");
@@ -145,7 +234,8 @@ pub fn run_full_flow_cancellable(
     }
     let anchor: Coordinate = client.identity.anchor_coordinate()?;
     let area_id = (fences.area.run_area_id >= 0).then(|| fences.area.run_area_id.to_string());
-    let pts = points::fetch_points_ext(client, anchor, area_id, log)?;
+    // 点位集合随目标距离变化（官方路径 `/distance/<米>`），这里传本次目标距离
+    let pts = points::fetch_points_ext(client, anchor, area_id, params.dist, log)?;
     if pts.is_empty() {
         return Err("实时点位为空 —— 拒绝本地样本兜底".into());
     }
@@ -274,7 +364,9 @@ pub fn run_full_flow_cancellable(
         address: client.identity.city.clone(),
     };
     let result = submit_record(client, &sp, log)?;
-    sleep_secs(1);
+    // 服务端已接受：保留这次额度。前面的任何失败路径都已经由 Drop 归还。
+    reservation.commit();
+    sleep_jitter(700);
 
     // ⑥ OBS 上传（双 key）
     log("[obs] 上传 OBS 对象（gzip+base64，10 键）…");
@@ -298,7 +390,7 @@ pub fn run_full_flow_cancellable(
     }
 
     // ⑦ 详情验证
-    sleep_secs(2);
+    sleep_jitter(1500);
     log("[verify] 拉取详情验证…");
     let verification = Verification::from_result(fetch_one_record(client, result.rrid));
     log(&format!(
@@ -312,6 +404,10 @@ pub fn run_full_flow_cancellable(
     ));
     if let Some(error) = &verification.error {
         log(&format!("⚠ [verify] {error}"));
+    }
+    // 记录"不算数"的直接原因：服务端会写明是哪一项没满足。
+    for reason in verification.failure_reasons() {
+        log(&format!("⚠ [verify] 未计数原因：{reason}"));
     }
     Ok(RunOutcome {
         result,
@@ -327,8 +423,14 @@ pub fn run_ai_submit(
     mode: super::ai::AiMode,
     log: &mut dyn FnMut(&str),
 ) -> Result<Value, String> {
+    // AI 运动同样受行为护栏约束（深夜 / 每日条数）。
+    let safety = super::model::load_config().safety;
+    crate::safety::check_ai(&safety, 1)?;
     log(&format!("[ai] 提交 sportId={sport_id} mode={mode:?}…"));
     let biz = super::ai::upload(client, sport_id, mode, None)?;
+    if let Err(error) = crate::safety::record_ai(&safety, 1) {
+        log(&format!("⚠ [safety] 当日计数写入失败：{error}"));
+    }
     log("√ [ai] 提交成功");
     Ok(biz)
 }
@@ -382,6 +484,35 @@ mod verification_tests {
         ));
         assert_eq!(contradictory.complete, Some(false));
     }
+    #[test]
+    fn server_skew_handles_seconds_and_millis() {
+        let now = crate::crypto::envelope::now_ms();
+        // 毫秒级
+        let skew = server_skew_ms(now + 10_000);
+        assert!((skew - 10_000).abs() <= 2, "毫秒单位换算有误: {skew}");
+        // 秒级（精度 1 秒，允许 1 秒误差）
+        let secs = (now + 10_000) / 1000;
+        let skew = server_skew_ms(secs);
+        assert!((skew - 10_000).abs() <= 1_000, "秒单位换算有误: {skew}");
+        // 未知时间戳不报偏差
+        assert_eq!(server_skew_ms(0), 0);
+    }
+
+    #[test]
+    fn failure_reasons_expose_only_unmet_entries() {
+        let v = Verification::from_result(Ok(json!({
+            "complete": false,
+            "reasonList": [
+                {"reason": "里程未达标", "complete": false},
+                {"reason": "时长达标", "complete": true},
+                {"reason": "  ", "complete": false}
+            ]
+        })));
+        assert_eq!(v.failure_reasons(), vec!["里程未达标".to_string()]);
+        // 没有 detail 时不编造原因
+        assert!(Verification::from_result(Err("offline".into())).failure_reasons().is_empty());
+    }
+
     #[test]
     fn consecutive_results_do_not_share_details() {
         let first = Verification::from_result(Ok(json!({"complete": true, "rrid": 1})));

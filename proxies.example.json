@@ -1,0 +1,14 @@
+[
+  {
+    "id": "sample-socks-local",
+    "url": "socks5://127.0.0.1:1080",
+    "city": "大连市",
+    "carrier": "联通"
+  },
+  {
+    "id": "sample-http-relay",
+    "url": "http://127.0.0.1:8080",
+    "city": "大连市",
+    "carrier": "移动"
+  }
+]

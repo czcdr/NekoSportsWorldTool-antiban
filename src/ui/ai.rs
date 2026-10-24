@@ -224,6 +224,20 @@ impl App {
 
     /// 批量补签：单线程顺序提交，过去天数取当天 7:00-21:00 随机时刻。
     fn run_ai_batch(&mut self, plan: AiBatchPlan) {
+        // 批量补签补的是历史日期，不套"每日条数"上限，但受天数/同日重复/单批总量与深夜约束。
+        // 每成功一条都要记账（按记录所属日期分桶），否则单发检查会以为今天 0 条。
+        let policy = self.config.safety.clone();
+        let planned = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
+        for check in [
+            crate::safety::check_night(&policy),
+            crate::safety::check_backfill(&policy, plan.days, plan.per_day, planned),
+        ] {
+            if let Err(error) = check {
+                self.status = format!("× {error}");
+                self.log.push(&format!("× [safety] {error}"));
+                return;
+            }
+        }
         let identity = self.identity.clone();
         let session = self.session.clone().unwrap_or_default();
         self.ai_submit_active = true;
@@ -249,6 +263,13 @@ impl App {
                             Ok(biz) if biz.get("error").and_then(|e| e.as_i64()) == Some(10000) => {
                                 ok += 1;
                                 log(&format!("√ [ai] {tag} sport={sport} 成功（{done}/{total}）"));
+                                // 记账落到这条记录所属的那一天（历史日按 at 分桶）
+                                let when = at.unwrap_or_else(crate::crypto::envelope::now_ms);
+                                if let Err(error) =
+                                    crate::safety::record_ai_on(&policy, when, 1)
+                                {
+                                    log(&format!("⚠ [safety] 补签计数写入失败：{error}"));
+                                }
                             }
                             Ok(biz) => {
                                 let msg = biz.get("message").and_then(|m| m.as_str()).unwrap_or("");

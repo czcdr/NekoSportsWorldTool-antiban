@@ -11,6 +11,12 @@ pub const IOS_APP_VERSION: &str = "7.3.40";
 pub const ANDROID_APP_VERSION: &str = "7.3.70";
 
 pub const UA_IOS: &str = "SWCampus/7.3.40 (iPhone; iOS 18.1; Scale/3.00)";
+/// 上游写死的 Android UA 模板（机型/系统版本固定成 22081212C + Android 14）。
+///
+/// **不要再直接用它发请求**：身份里的机型被换成别的机型时，UA 会与 header 的
+/// `deviceName`/`osVersion` 自相矛盾。需要 Android UA 时调用 [`ua_android`]，
+/// 由身份拼出来。这里保留只为记录原始模板。
+#[cfg_attr(not(test), allow(dead_code))]
 pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.3.70";
 
 /// 设备身份。app_install_time <= 0 表示尚未生成。
@@ -38,6 +44,17 @@ pub struct HeaderIdentity {
     /// 设备 MAC（首次生成后持久化，避免写死指纹）
     #[serde(default)]
     pub mac_address: String,
+    /// Android `Settings.Secure.ANDROID_ID`：16 位小写 hex，首次生成后固定。
+    /// 官方客户端一定能取到该值，留空是"非官方请求"的强特征。
+    #[serde(default)]
+    pub android_id: String,
+    /// 机型对应的逻辑分辨率（如 `"1220x2712"`）；空则按机型库推断。
+    #[serde(default)]
+    pub pixel: String,
+    /// `pixel` / `android_id` 是否**读自本机真机**（而不是按机型库推算）。
+    /// 真机读数是权威值：机型表里没有他这台机是正常的，本地自检不该因此告警。
+    #[serde(default)]
+    pub fingerprint_from_device: bool,
     /// 提交 body 的城市名
     #[serde(default = "default_city")]
     pub city: String,
@@ -105,9 +122,87 @@ impl Default for HeaderIdentity {
             anchor_lon: default_anchor_lon(),
             app_install_time: 0,
             mac_address: String::new(),
+            android_id: String::new(),
+            pixel: String::new(),
+            fingerprint_from_device: false,
             city: default_city(),
         }
     }
+}
+
+impl HeaderIdentity {
+    /// 补齐指纹字段：androidId / 分辨率缺失时按机型库推导，保证一套身份内部自洽。
+    /// 返回 true 表示有字段被补上（调用方负责落盘）。
+    pub fn ensure_fingerprint(&mut self) -> bool {
+        if self.platform != "android" {
+            return false;
+        }
+        if !self.android_id.is_empty() && !self.pixel.is_empty() {
+            return false;
+        }
+        // device_id 为空时**不派生**指纹：MD5("") 是常量，会让所有空 ID 的设备
+        // 拿到同一个机型 + 同一个 androidId（ANDROID_ID 跨设备重复在真机不可能）。
+        // 调用方（load_identity_for_platform）会先把 device_id 补好再进来。
+        if self.device_id.is_empty() {
+            return false;
+        }
+        let seed = fingerprint_seed(&self.device_id);
+        let profile = crate::api::fingerprint::DeviceProfile::from_parts(
+            &self.device_name,
+            &self.os_version,
+            &self.pixel,
+            &self.android_id,
+            seed,
+        );
+        let mut changed = false;
+        if self.android_id.is_empty() {
+            self.android_id = profile.android_id;
+            changed = true;
+        }
+        if self.pixel.is_empty() {
+            self.pixel = profile.pixel;
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// Android UA 必须由**身份本身**拼出来。
+///
+/// 写死 `Android 14; 22081212C` 而 header 里 `deviceName`/`osVersion` 是别的机型时，
+/// 同一条请求里 UA 与头部自相矛盾 —— 比轨迹分析便宜得多就能对出来。
+pub fn ua_android(identity: &HeaderIdentity) -> String {
+    let model = if identity.device_name.trim().is_empty() {
+        "22081212C"
+    } else {
+        identity.device_name.trim()
+    };
+    let os = if identity.os_version.trim().is_empty() {
+        "14"
+    } else {
+        identity.os_version.trim()
+    };
+    format!(
+        "Mozilla/5.0 (Linux; Android {os}; {model} Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/{ANDROID_APP_VERSION}"
+    )
+}
+
+/// 由稳定 device_id 派生指纹 seed：同一设备反复启动得到同一套补齐值。
+pub(crate) fn fingerprint_seed(device_id: &str) -> u64 {
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(device_id.as_bytes());
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(buf)
+}
+
+/// 空 device_id 的兜底值：进程内固定。
+fn stable_fallback_device_id() -> String {
+    use std::sync::OnceLock;
+    static FALLBACK: OnceLock<String> = OnceLock::new();
+    FALLBACK
+        .get_or_init(|| uuid::Uuid::new_v4().to_string().to_uppercase())
+        .clone()
 }
 
 /// SWEncryption.signObject:suffix: 的 tokenSign。
@@ -133,7 +228,8 @@ pub fn build_native_ios_header(
 ) -> (String, Vec<(String, String)>) {
     let mut m = serde_json::Map::new();
     let device_id = if identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
+        // 与 Android 侧一致：进程内固定，避免「DeviceId 逐请求漂移」。
+        stable_fallback_device_id()
     } else {
         identity.device_id.clone()
     };
@@ -192,7 +288,10 @@ pub fn build_android_header(
 ) -> (String, Vec<(String, String)>) {
     let mut m = serde_json::Map::new();
     let device_id = if identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
+        // 兜底：同一进程内固定，绝不"每请求新生成 UUID"。
+        // 否则会形成「DeviceId 逐请求漂移、androidId 恒定」这种真机不可能的组合。
+        // 正常路径下 identity.device_id 由 load_identity_for_platform 保证非空。
+        stable_fallback_device_id()
     } else {
         identity.device_id.clone()
     };
@@ -207,11 +306,30 @@ pub fn build_android_header(
     m.insert("osVersion".into(), serde_json::Value::String(identity.os_version.clone()));
     m.insert("deviceName".into(), serde_json::Value::String(identity.device_name.clone()));
     m.insert("IMEI".into(), serde_json::Value::String(String::new()));
-    m.insert("logicPixel".into(), serde_json::Value::String("1080x2400".into()));
-    m.insert("physicPixel".into(), serde_json::Value::String("1080x2400".into()));
-    m.insert("androidId".into(), serde_json::Value::String(String::new()));
-    m.insert("blMac".into(), serde_json::Value::String(String::new()));
-    m.insert("wifiMac".into(), serde_json::Value::String(String::new()));
+    // 分辨率必须与 deviceName 自洽：22081212C 的真机是 1220x2712，
+    // 统一上报 1080x2400 会形成"机型-屏幕"矛盾指纹。
+    let pixel = if identity.pixel.trim().is_empty() {
+        "1080x2400".to_string()
+    } else {
+        identity.pixel.clone()
+    };
+    m.insert("logicPixel".into(), serde_json::Value::String(pixel.clone()));
+    m.insert("physicPixel".into(), serde_json::Value::String(pixel));
+    // Android 10+ 普通应用取不到 IMEI（留空即官方行为）；androidId 一定能取到。
+    m.insert(
+        "androidId".into(),
+        serde_json::Value::String(identity.android_id.clone()),
+    );
+    // Android 6+ 起 getMacAddress() 对普通应用固定返回 02:00:00:00:00:00，
+    // 伪造随机 MAC 反而是异常。
+    m.insert(
+        "blMac".into(),
+        serde_json::Value::String(crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC.into()),
+    );
+    m.insert(
+        "wifiMac".into(),
+        serde_json::Value::String(crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC.into()),
+    );
     m.insert("cpuModel".into(), serde_json::Value::String("arm64-v8a".into()));
     m.insert("isRoot".into(), serde_json::Value::Bool(false));
     m.insert("appUpdateTime".into(), serde_json::Value::from(install));
