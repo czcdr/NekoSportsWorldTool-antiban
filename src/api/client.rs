@@ -8,7 +8,7 @@ use crate::crypto::decrypt::{decrypt_response, derive_paes_key, Decrypted};
 use crate::crypto::envelope::{
     build_envelope, build_envelope_ts, rsa_public_key, EnvelopeSession, OuterOrder,
 };
-use crate::crypto::header::{build_header_for, HeaderIdentity, UA_IOS};
+use crate::crypto::header::{build_header_for, HeaderIdentity};
 
 pub fn make_agent() -> ureq::Agent {
     make_agent_with_proxy(None)
@@ -78,6 +78,11 @@ pub struct ApiClient {
     pub egress: Option<crate::api::egress::EgressPool>,
     /// 本次任务实际绑定的出口，用于失败回报与展示。
     pub egress_entry: Option<crate::api::egress::ProxyEntry>,
+    /// 配了同城出口但绑不上（全部冷却/配置坏了）时的错误。
+    ///
+    /// **必须在发请求前拦住**：一旦放行，这条链路就变成直连，等于把真实 IP
+    /// 交给服务端，而调用方还以为自己走了代理。
+    egress_error: Option<String>,
 }
 
 pub struct RequestOutcome {
@@ -90,7 +95,7 @@ pub struct RequestOutcome {
 
 impl ApiClient {
     pub fn new(identity: HeaderIdentity, login: Option<Session>) -> Self {
-        Self {
+        let mut client = Self {
             auth_context: None,
             auth_rejected: false,
             #[cfg(test)]
@@ -101,6 +106,26 @@ impl ApiClient {
             login,
             egress: load_egress_from_disk(),
             egress_entry: None,
+            egress_error: None,
+        };
+        client.bootstrap_egress();
+        client
+    }
+
+    /// 构造期就把出口绑好。
+    ///
+    /// 原来绑定只发生在 `flow::run_full_flow` 一处，于是登录、AI 提交、读记录、
+    /// 排行榜、违规自查全部直连真实 IP：同一个账号几分钟内「家宽 → 代理 → 家宽」
+    /// 来回跳。一直用一个出口是「一个客户端」，来回跳是「一个人在两地」——
+    /// 后者比不配代理更容易被关联。绑定必须在所有请求之前发生。
+    fn bootstrap_egress(&mut self) {
+        if self.egress.is_none() || self.egress_entry.is_some() {
+            return;
+        }
+        let city = self.identity.city.clone();
+        if let Err(error) = self.bind_egress_for_city(&city) {
+            // 配了同城出口却绑不上：记下来，请求前拦下，绝不降级直连。
+            self.egress_error = Some(error);
         }
     }
 
@@ -114,6 +139,11 @@ impl ApiClient {
         &mut self,
         city: &str,
     ) -> Result<Option<crate::api::egress::ProxyEntry>, String> {
+        // 幂等：已经绑过就直接返回。重复 acquire 会把游标推走，
+        // 让同一次任务在中途换出口 —— 那本身就是可疑信号。
+        if let Some(entry) = &self.egress_entry {
+            return Ok(Some(entry.clone()));
+        }
         let Some(pool) = self.egress.as_mut() else {
             return Ok(None);
         };
@@ -123,25 +153,46 @@ impl ApiClient {
                 // 直连等于把真实 IP 直接交给服务端 —— 这比不配代理更糟，因为用户
                 // 以为自己已经被保护了。
                 ureq::Proxy::new(&entry.url).map_err(|error| {
-                    format!(
+                    let message = format!(
                         "出口 {} 的代理地址不可用：{}",
                         crate::textlog::redact_url(&entry.url),
                         crate::textlog::redact_text(&error.to_string())
-                    )
+                    );
+                    self.egress_error = Some(message.clone());
+                    message
                 })?;
                 self.agent = make_agent_with_proxy(Some(&entry.url));
                 self.egress_entry = Some(entry.clone());
+                self.egress_error = None;
                 Ok(Some(entry))
             }
             Err(crate::api::egress::PoolError::NoCandidate) => {
                 self.agent = make_agent_with_proxy(None);
                 self.egress_entry = None;
+                self.egress_error = None;
                 Ok(None)
             }
             Err(crate::api::egress::PoolError::Exhausted) => {
-                Err("同城出口全部处于冷却中，本次不发请求（避免暴露异地 IP）".into())
+                let message =
+                    "同城出口全部处于冷却中，本次不发请求（避免暴露异地 IP）".to_string();
+                self.egress_error = Some(message.clone());
+                Err(message)
             }
-            Err(crate::api::egress::PoolError::Config(error)) => Err(error),
+            Err(crate::api::egress::PoolError::Config(error)) => {
+                self.egress_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// 请求前的出口闸门。
+    ///
+    /// 绑定失败（全部冷却 / 配置坏了）时**不发请求**：继续发就等于直连，
+    /// 而调用方还以在走代理。
+    pub fn egress_guard(&self) -> Result<(), String> {
+        match &self.egress_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
     }
 
@@ -221,6 +272,7 @@ impl ApiClient {
         ua: &str,
         extra_headers: &[(String, String)],
     ) -> Result<RequestOutcome, String> {
+        self.egress_guard()?;
         self.ensure_session_valid()?;
         let uid = self.uid();
         let token = self.token();
@@ -301,7 +353,11 @@ impl ApiClient {
         extra_headers: &[(String, String)],
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}{}", host, path);
-        let out = self.envelope_request(method, &url, body_plain, UA_IOS, extra_headers)?;
+        // UA 必须与信封同源：信封按 identity.platform 生成（android 是 osType=0 +
+        // androidId），UA 却恒为 iOS 时，同一条请求会同时出现「Android 指纹 +
+        // iPhone UA + 外层 appVersion 7.3.40 / 信封 7.3.70」三方矛盾。
+        let ua = crate::crypto::header::ua_for(&self.identity);
+        let out = self.envelope_request(method, &url, body_plain, &ua, extra_headers)?;
         let dec = out.decrypted.ok_or_else(|| {
             format!(
                 "HTTP {} 响应解密失败（len={}）原文: {}",

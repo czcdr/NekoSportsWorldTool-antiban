@@ -193,6 +193,10 @@ mod validation_tests {
 
 /// 10s 时间窗，id=(rrid%100000)*1000+窗口序秒（6 个真人样本跨 9 月记录验证一致；
 /// 旧版 App 样本为全局序号，不适用当前版本）。
+/// 步频上限（步/分）。窗口里的 `stepsNum` 与提交 body 的汇总 `avgStepFreq`
+/// 必须用同一个上限，否则短时长会算出「窗口 220、汇总 250」的自相矛盾数据。
+pub const MAX_STEP_FREQ_PER_MIN: f64 = 220.0;
+
 pub(crate) fn build_windows(track: &Track, rrid: i64) -> (Vec<Value>, Vec<Value>) {
     let start_ms = track.startTime;
     let total_time = track.totalTime;
@@ -212,7 +216,7 @@ pub(crate) fn build_windows(track: &Track, rrid: i64) -> (Vec<Value>, Vec<Value>
         let window_s = (hi - lo).max(1) as f64;
         let frac = (window_s / a.time.max(1) as f64).clamp(0.01, 1.0);
         let win_dist = (a.value * frac * 100.0).round() / 100.0;
-        let max_steps = (220.0 * window_s / 60.0).ceil() as i64;
+        let max_steps = (MAX_STEP_FREQ_PER_MIN * window_s / 60.0).ceil() as i64;
         let win_steps = ((b.value as f64 * frac).round() as i64).min(max_steps.max(0));
         let id = id_base + i as i64;
         sp.push(json!({

@@ -64,6 +64,86 @@ pub const MODELS: &[ModelProfile] = &[
     ModelProfile { device_name: "SM-S9180", logical: (1440, 3088), dpi: 500, os_versions: &["13", "14"], brand: "samsung" },
 ];
 
+/// 一台真实 iPhone 的屏幕与系统组合。
+///
+/// `deviceName` 在 iOS 上就是 `UIDevice.current.model`，真机固定返回 `"iPhone"`，
+/// 所以自洽要落在**逻辑分辨率 × 缩放倍数 = 物理分辨率**上，而不是机型名。
+#[derive(Debug, Clone, Copy)]
+pub struct IosModelProfile {
+    /// 逻辑分辨率（宽, 高），`UIScreen.bounds`。
+    pub logical: (u32, u32),
+    /// 物理分辨率（宽, 高），`nativeBounds`。
+    pub physical: (u32, u32),
+    /// 该机型可能搭载的 iOS 主版本。
+    pub os_versions: &'static [&'static str],
+}
+
+/// iOS 机型库：都是公开规格里能双向核对的组合（逻辑×2 或 ×3 = 物理）。
+pub const IOS_MODELS: &[IosModelProfile] = &[
+    // iPhone 16 Pro：402x874 @3x
+    IosModelProfile { logical: (402, 874), physical: (1206, 2622), os_versions: &["18.1", "18.2"] },
+    // iPhone 15 Pro / 14 Pro：393x852 @3x
+    IosModelProfile { logical: (393, 852), physical: (1179, 2556), os_versions: &["17.6", "18.1"] },
+    // iPhone 14 / 13 / 12：390x844 @3x
+    IosModelProfile { logical: (390, 844), physical: (1170, 2532), os_versions: &["17.6", "18.1"] },
+    // iPhone 11 / XR：414x896 @2x
+    IosModelProfile { logical: (414, 896), physical: (828, 1792), os_versions: &["16.7", "17.4"] },
+    // iPhone SE 3：375x667 @2x
+    IosModelProfile { logical: (375, 667), physical: (750, 1334), os_versions: &["16.7", "17.5"] },
+];
+
+/// 一套自洽的 iOS 屏幕档案（`deviceName` 恒为 `iPhone`，见上）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IosProfile {
+    pub device_name: String,
+    pub os_version: String,
+    pub logic: String,
+    pub physic: String,
+}
+
+impl IosProfile {
+    /// 由 seed 确定性选一台机型 + 一个该系统版本。
+    pub fn mint(seed: u64) -> Self {
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let model = IOS_MODELS[(next() % IOS_MODELS.len() as u64) as usize];
+        let os_version =
+            model.os_versions[(next() % model.os_versions.len() as u64) as usize];
+        Self {
+            device_name: "iPhone".into(),
+            os_version: os_version.to_string(),
+            logic: format!("{}x{}", model.logical.0, model.logical.1),
+            physic: format!("{}x{}", model.physical.0, model.physical.1),
+        }
+    }
+
+    /// 自检：物理分辨率必须是逻辑分辨率的整数倍（2x / 3x）。
+    pub fn audit(logic: &str, physic: &str) -> Vec<String> {
+        let parse = |s: &str| -> Option<(u32, u32)> {
+            let (w, h) = s.trim().split_once(['x', 'X', '*'])?;
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        };
+        let mut issues = Vec::new();
+        match (parse(logic), parse(physic)) {
+            (Some((lw, lh)), Some((pw, ph))) => {
+                if lw == 0 || lh == 0 || pw % lw != 0 || ph % lh != 0 || pw / lw != ph / lh {
+                    issues.push(format!(
+                        "iOS 分辨率不自洽：physicPixel {physic} 不是 logicPixel {logic} 的整数倍"
+                    ));
+                }
+            }
+            _ => issues.push(format!("iOS 分辨率格式无效：{logic} / {physic}")),
+        }
+        issues
+    }
+}
+
 /// 一套完整、内部自洽的设备档案。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceProfile {

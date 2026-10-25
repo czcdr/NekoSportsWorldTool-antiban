@@ -151,7 +151,9 @@ impl EgressPool {
         }
         let want = norm(want);
         if want.is_empty() {
-            return true;
+            // 没配置轨迹城市时不能"随便挑一个"：那等于静默跨城，
+            // 与模块的核心约束（出口城市必须与轨迹城市一致）直接冲突。
+            return false;
         }
         let got = norm(entry_city);
         // 空城市的出口视为"未标注"，不参与同城匹配（宁可不发，也不发错城）。
@@ -175,6 +177,10 @@ impl EgressPool {
 
     pub fn acquire_at(&mut self, city: &str, now_ms: i64) -> Result<ProxyEntry, PoolError> {
         if self.entries.is_empty() {
+            return Err(PoolError::NoCandidate);
+        }
+        if city.trim().is_empty() {
+            // fail-closed：没有城市就没有"同城"可言，宁可不发也不跨城。
             return Err(PoolError::NoCandidate);
         }
         let candidates: Vec<&ProxyEntry> = self
@@ -279,8 +285,10 @@ mod tests {
     fn unlabelled_city_is_not_a_match() {
         let mut p = pool(&[("socks5://1.1.1.1:1080", "")]);
         assert_eq!(p.acquire_at("大连", 1000), Err(PoolError::NoCandidate));
-        // 请求侧不指定城市时，任何出口都可用
-        assert!(p.acquire_at("", 1000).is_ok());
+        // 请求侧没有城市时同样拒绝：空城市 = 无法确认同城，
+        // 此时"任何出口都可用"就是静默跨城（旧行为，已按 fail-closed 改掉）。
+        assert_eq!(p.acquire_at("", 1000), Err(PoolError::NoCandidate));
+        assert_eq!(p.acquire_at("   ", 1000), Err(PoolError::NoCandidate));
     }
 
     #[test]

@@ -48,6 +48,13 @@ pub struct SafetyPolicy {
     pub night_to: u8,
     /// 每个自然日允许的跑步记录条数。
     pub daily_runs: u32,
+    /// 每个自然日允许**实际发起提交**的次数。
+    ///
+    /// `daily_runs` 按「记录所属日」记账（补跑昨天不会堵住今天），代价是
+    /// 「今天/昨天/前天」各提一条时，三条都落在不同桶里、一条不拦。而这三条
+    /// 记录的 `createTime` 只差几十秒、`startTime` 差好几天 —— 补签的教科书特征，
+    /// 比同日多跑更显眼。所以额外按**提交日**限一个总次数。
+    pub daily_submits: u32,
     /// 每个自然日允许的 AI 运动记录条数。
     pub daily_ai: u32,
     /// 批量补签最多能回溯多少天。
@@ -66,6 +73,8 @@ impl Default for SafetyPolicy {
             night_to: 6,
             daily_runs: 1,
             daily_ai: 2,
+            // 默认 2：一次补两天还算「补」，一次补三天起就是刷量画像。
+            daily_submits: 2,
             backfill_days: 3,
             batch_per_day: 2,
             batch_max_records: 6,
@@ -91,6 +100,7 @@ impl SafetyPolicy {
         for (name, value) in [
             ("daily_runs", self.daily_runs),
             ("daily_ai", self.daily_ai),
+            ("daily_submits", self.daily_submits),
             ("batch_per_day", self.batch_per_day),
             ("batch_max_records", self.batch_max_records),
         ] {
@@ -113,6 +123,9 @@ struct DayCount {
     runs: u32,
     #[serde(default)]
     ai: u32,
+    /// 当天实际发起过多少次跑步提交（与 `runs` 的区别见 `daily_submits`）。
+    #[serde(default)]
+    submits: u32,
 }
 
 /// 按自然日（北京时间 `YYYY-MM-DD`）分桶的计数。
@@ -264,6 +277,8 @@ fn with_lock<T>(root: &Path, action: impl FnOnce(&mut State) -> Result<T, String
 pub struct RunReservation {
     root: PathBuf,
     day: String,
+    /// 提交动作所在的自然日（用于 `daily_submits` 的归还）。
+    now_day: String,
     committed: bool,
     enabled: bool,
 }
@@ -284,6 +299,9 @@ impl Drop for RunReservation {
         let _ = with_lock(&self.root, |state| {
             if let Some(day) = state.days.get_mut(&self.day) {
                 day.runs = day.runs.saturating_sub(1);
+            }
+            if let Some(day) = state.days.get_mut(&self.now_day) {
+                day.submits = day.submits.saturating_sub(1);
             }
             Ok(())
         });
@@ -311,6 +329,7 @@ fn reserve_run_at(
         return Ok(RunReservation {
             root: root.to_path_buf(),
             day: String::new(),
+            now_day: String::new(),
             committed: false,
             enabled: false,
         });
@@ -330,7 +349,18 @@ fn reserve_run_at(
     // 若按提交日计数，补跑第一天就会把后面三天全部堵死。
     let (day, _) = cst_parts(start_ms);
     let key = day.clone();
+    let (now_day, _) = cst_parts(now_ms);
     with_lock(root, |state| {
+        let submits = state.get(&now_day).submits;
+        if submits >= policy.daily_submits {
+            return Err(format!(
+                "安全护栏：{now_day} 已经发起过 {submits} 次跑步提交（每日上限 {}）。\n\
+                 一次补跑多天同样计入这里 —— 同一时刻连着提交几条、日期却各不相同，\
+                 是最容易被识别成补签的形态。\n\
+                 确需提交：把 config.json 的 safety.enabled 改成 false。",
+                policy.daily_submits
+            ));
+        }
         let runs = state.get(&key).runs;
         if runs >= policy.daily_runs {
             return Err(format!(
@@ -340,11 +370,13 @@ fn reserve_run_at(
             ));
         }
         state.bump(&key, |c| c.runs = c.runs.saturating_add(1));
+        state.bump(&now_day, |c| c.submits = c.submits.saturating_add(1));
         Ok(())
     })?;
     Ok(RunReservation {
         root: root.to_path_buf(),
         day,
+        now_day,
         committed: false,
         enabled: true,
     })
@@ -518,21 +550,38 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 核心回归：跑步页支持「今天 / 昨天 / 1-3 天前」补跑，
-    /// 计数必须按**记录所属的那一天**，否则补第一天就把后面三天全堵死。
+    /// 计数按**记录所属日**：补昨天不会堵住今天（否则补第一天就把后面三天全堵死）。
+    /// 但「同一次坐下来连续提交」另有 `daily_submits` 上限 —— 几分钟内补四天
+    /// 正是补签特征，所以记录日与提交日两套计数必须一起看。
     #[test]
-    fn backfill_across_different_dates_is_not_blocked() {
+    fn backfill_counts_per_record_day_but_caps_one_sitting() {
         let p = SafetyPolicy::default();
         let dir = tmp();
         let now = at(12);
-        for days_ago in [3i64, 2, 1, 0] {
-            let start = day(days_ago, 12);
-            let reservation = reserve_run_at(&dir, &p, start, now)
-                .unwrap_or_else(|e| panic!("{days_ago} 天前应放行: {e}"));
-            reservation.commit();
+        for days_ago in [3i64, 2] {
+            reserve_run_at(&dir, &p, day(days_ago, 12), now)
+                .unwrap_or_else(|e| panic!("{days_ago} 天前应放行: {e}"))
+                .commit();
         }
+        // 第三条记录日不重复（daily_runs 放行），但今天的提交次数已到上限。
+        let err = reserve_run_at(&dir, &p, day(1, 12), now).unwrap_err();
+        assert!(err.contains("次跑步提交"), "{err}");
+        // 换到第二天：提交日额度按自然日清零。
+        reserve_run_at(&dir, &p, day(-1, 12), day(-1, 12))
+            .expect("次日应重新获得提交额度")
+            .commit();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 同一记录日的第二条仍受 `daily_runs` 约束（两条上限各管一层）。
+    #[test]
+    fn same_record_day_still_capped_by_daily_runs() {
+        let p = SafetyPolicy { daily_submits: 9, ..SafetyPolicy::default() };
+        let dir = tmp();
+        let now = at(12);
+        reserve_run_at(&dir, &p, day(0, 12), now).unwrap().commit();
         let err = reserve_run_at(&dir, &p, day(0, 13), now).unwrap_err();
-        assert!(err.contains("上限 1"), "{err}");
+        assert!(err.contains("每日上限 1"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -665,7 +714,8 @@ mod tests {
 
     #[test]
     fn state_keeps_only_recent_days() {
-        let p = SafetyPolicy::default();
+        // 这里只验证保留窗口，不受提交日配额影响。
+        let p = SafetyPolicy { daily_submits: 100, ..SafetyPolicy::default() };
         let dir = tmp();
         for days_ago in 0..25i64 {
             let reservation = reserve_run_at(&dir, &p, day(days_ago, 12), day(0, 12)).unwrap();

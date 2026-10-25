@@ -48,9 +48,14 @@ pub struct HeaderIdentity {
     /// 官方客户端一定能取到该值，留空是"非官方请求"的强特征。
     #[serde(default)]
     pub android_id: String,
-    /// 机型对应的逻辑分辨率（如 `"1220x2712"`）；空则按机型库推断。
+    /// 机型对应的物理分辨率（如 `"1220x2712"`）；空则按机型库推断。
+    /// iOS 侧这是 `physicPixel`，Android 侧同时用作 `logicPixel`（历史口径）。
     #[serde(default)]
     pub pixel: String,
+    /// iOS 的逻辑分辨率（如 `"393x852"`）。Android 侧不使用。
+    /// 官方 iOS 客户端上报 logicPixel×scale = physicPixel，两者必须整除自洽。
+    #[serde(default)]
+    pub logic_pixel: String,
     /// `pixel` / `android_id` 是否**读自本机真机**（而不是按机型库推算）。
     /// 真机读数是权威值：机型表里没有他这台机是正常的，本地自检不该因此告警。
     #[serde(default)]
@@ -124,6 +129,7 @@ impl Default for HeaderIdentity {
             mac_address: String::new(),
             android_id: String::new(),
             pixel: String::new(),
+            logic_pixel: String::new(),
             fingerprint_from_device: false,
             city: default_city(),
         }
@@ -133,13 +139,11 @@ impl Default for HeaderIdentity {
 impl HeaderIdentity {
     /// 补齐指纹字段：androidId / 分辨率缺失时按机型库推导，保证一套身份内部自洽。
     /// 返回 true 表示有字段被补上（调用方负责落盘）。
+    ///
+    /// iOS 与 Android 都要补：官方 iOS 客户端上报的 `logicPixel`×`scale` 必须等于
+    /// `physicPixel`，而原来这两个值是写死的 `360x640` / `1080x1920`（配 `cpuModel:
+    /// x86_64`），那是模拟器签名，不是任何一台真机的组合。
     pub fn ensure_fingerprint(&mut self) -> bool {
-        if self.platform != "android" {
-            return false;
-        }
-        if !self.android_id.is_empty() && !self.pixel.is_empty() {
-            return false;
-        }
         // device_id 为空时**不派生**指纹：MD5("") 是常量，会让所有空 ID 的设备
         // 拿到同一个机型 + 同一个 androidId（ANDROID_ID 跨设备重复在真机不可能）。
         // 调用方（load_identity_for_platform）会先把 device_id 补好再进来。
@@ -147,23 +151,74 @@ impl HeaderIdentity {
             return false;
         }
         let seed = fingerprint_seed(&self.device_id);
-        let profile = crate::api::fingerprint::DeviceProfile::from_parts(
-            &self.device_name,
-            &self.os_version,
-            &self.pixel,
-            &self.android_id,
-            seed,
-        );
+        if self.platform == "android" {
+            if !self.android_id.is_empty() && !self.pixel.is_empty() {
+                return false;
+            }
+            let profile = crate::api::fingerprint::DeviceProfile::from_parts(
+                &self.device_name,
+                &self.os_version,
+                &self.pixel,
+                &self.android_id,
+                seed,
+            );
+            let mut changed = false;
+            if self.android_id.is_empty() {
+                self.android_id = profile.android_id;
+                changed = true;
+            }
+            if self.pixel.is_empty() {
+                self.pixel = profile.pixel;
+                changed = true;
+            }
+            return changed;
+        }
+        // iOS：只在两个分辨率**都为空**时补一套自洽档案（新身份）。
+        // 已有手填值一律不动 —— 打开旧配置不该改写用户手动设过的字段，
+        // 缺的那一半在请求头里按 @3x 反推补上（见 `derive_ios_logic`）。
+        if !self.logic_pixel.is_empty() || !self.pixel.is_empty() {
+            return false;
+        }
+        let profile = crate::api::fingerprint::IosProfile::mint(seed);
         let mut changed = false;
-        if self.android_id.is_empty() {
-            self.android_id = profile.android_id;
+        if self.logic_pixel.is_empty() {
+            self.logic_pixel = profile.logic;
             changed = true;
         }
         if self.pixel.is_empty() {
-            self.pixel = profile.pixel;
+            self.pixel = profile.physic;
             changed = true;
         }
         changed
+    }
+}
+
+/// 只给了物理分辨率时，按 iPhone 的主流 @3x 反推逻辑分辨率。
+///
+/// 官方客户端上报的 `logicPixel × scale = physicPixel`，所以这两个值不能各写各的：
+/// 逻辑值缺失时用常量兜底、物理值却来自用户，就会出现「不是整数倍」的矛盾组合。
+/// 除不尽（说明填的不是 iPhone 参数）时退回常见真机值，由自检去提示。
+fn derive_ios_logic(physic: &str) -> String {
+    let parse = |s: &str| -> Option<(u32, u32)> {
+        let (w, h) = s.trim().split_once(['x', 'X', '*'])?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    };
+    match parse(physic) {
+        Some((w, h)) if w % 3 == 0 && h % 3 == 0 => format!("{}x{}", w / 3, h / 3),
+        _ => "393x852".to_string(),
+    }
+}
+
+/// 按身份平台拼出该请求应使用的 User-Agent。
+///
+/// UA 与信封里的 `appVersion`、外层 `appVersion` 必须同源：身份是 Android
+/// 却发 iOS 的 UA，会在同一条请求里同时出现 `osType=0` + `androidId` 有值 +
+/// `SWCampus/7.3.40 (iPhone…)`，这是比轨迹分析便宜得多的矛盾特征。
+pub fn ua_for(identity: &HeaderIdentity) -> String {
+    if identity.platform == "android" {
+        ua_android(identity)
+    } else {
+        UA_IOS.to_string()
     }
 }
 
@@ -247,9 +302,17 @@ pub fn build_native_ios_header(
     if !identity.idfa.is_empty() {
         m.insert("IDFA".into(), serde_json::Value::String(identity.idfa.clone()));
     }
-    m.insert("logicPixel".into(), serde_json::Value::String("360x640".into()));
-    m.insert("physicPixel".into(), serde_json::Value::String("1080x1920".into()));
-    m.insert("cpuModel".into(), serde_json::Value::String("x86_64".into()));
+    // 逻辑/物理分辨率必须整数倍自洽，且与 cpuModel 一起构成"真机"特征。
+    // 写死 360x640 / 1080x1920 再配 x86_64，等于把自己标成 iOS 模拟器。
+    let (logic_pixel, physic_pixel) = match (identity.logic_pixel.trim(), identity.pixel.trim()) {
+        ("", "") => ("393x852".to_string(), "1179x2556".to_string()),
+        ("", physic) => (derive_ios_logic(physic), physic.to_string()),
+        (logic, "") => (logic.to_string(), "1179x2556".to_string()),
+        (logic, physic) => (logic.to_string(), physic.to_string()),
+    };
+    m.insert("logicPixel".into(), serde_json::Value::String(logic_pixel));
+    m.insert("physicPixel".into(), serde_json::Value::String(physic_pixel));
+    m.insert("cpuModel".into(), serde_json::Value::String("arm64".into()));
     m.insert("appVersion".into(), serde_json::Value::String(IOS_APP_VERSION.into()));
     m.insert("isRoot".into(), serde_json::Value::Bool(false));
     m.insert("appInstallTime".into(), serde_json::Value::from(install));

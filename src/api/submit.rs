@@ -78,6 +78,9 @@ pub fn submit_record(
     p: &SubmitParams,
     log: &mut dyn FnMut(&str),
 ) -> Result<SubmitResult, String> {
+    // 出口闸门必须在写 pending 回执之前：绑不上出口是**本地拒绝、请求没发出**，
+    // 若走下面的 Unknown 分支就会留下一条 pending，把后续提交全部锁死。
+    client.egress_guard()?;
     client.ensure_session_valid()?;
     let session = client.login.as_ref().ok_or("未登录")?;
     if session.uid != p.uid || session.unid.parse::<i64>().ok() != Some(p.selected_unid) {
@@ -158,7 +161,11 @@ fn send_record(
     let unid = p.selected_unid;
 
     let speed = pace_speed_value(total_time, total_dis);
-    let avg_step_freq = 1i64.max(round_to(total_steps as f64 / total_time as f64 * 60.0, 0) as i64);
+    // 汇总步频必须与 `stepsPerTenSec` 的口径一致：后者已按 220 步/分夹过
+    // （wire.rs 的 max_steps），汇总却用原始值，短时长就会出现「窗口最大 220、
+    // 汇总 250」——服务端做一次除法交叉核对就是矛盾。
+    let avg_step_freq = round_to(total_steps as f64 / total_time as f64 * 60.0, 0)
+        .clamp(1.0, crate::track::wire::MAX_STEP_FREQ_PER_MIN) as i64;
 
     let mut body = Map::new();
     body.insert("allLocJson".into(), Value::String(String::new()));

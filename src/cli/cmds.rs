@@ -25,6 +25,7 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         "semester" => cmd_semester(),
         "cheat" => cmd_cheat(&rest),
         "rank" => cmd_rank(&rest),
+        "unlock" => cmd_unlock(&rest),
         "update" => cmd_update(&rest),
         "help" | "--help" | "-h" => {
             usage();
@@ -328,6 +329,59 @@ fn cmd_ai_list() -> i32 {
         }
         Err(e) => {
             eprintln!("拉取失败: {e}");
+            1
+        }
+    }
+}
+
+/// 手动释放卡住的提交回执。
+///
+/// 提交响应解不开（WAF 拦截页、gzip、超时）时会被记为「结果未知」，此后每次提交
+/// 都被挡住，只能等记录页核对到那条记录。核对不到就永久卡死 —— 这里给一个
+/// 显式的、需要人确认的出口。
+fn cmd_unlock(rest: &[&str]) -> i32 {
+    let flags = parse_flags(rest);
+    let sess = model::load_session();
+    if !sess.is_logged_in() {
+        eprintln!("未登录：先 login，或让 GUI 登录后再执行");
+        return 1;
+    }
+    let unid: i64 = match sess.unid.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("学校编号无效，无法定位提交回执");
+            return 1;
+        }
+    };
+    let mut guard = match crate::api::submission_guard::Guard::open(sess.uid, unid) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let pending = guard.pending_count();
+    if get(&flags, "yes").is_none() {
+        if pending == 0 {
+            println!("没有卡住的提交回执");
+        } else {
+            println!("有 {pending} 条未确认的提交回执（上次提交结果未知）。");
+            println!("请先到官方运动记录页核对：确认确实没有入账，再执行 `unlock --yes` 释放。");
+            println!("未查到不代表未入账 —— 释放后重复提交可能产生两条记录。");
+        }
+        return 0;
+    }
+    match guard.clear_pending() {
+        Ok(0) => {
+            println!("没有卡住的提交回执");
+            0
+        }
+        Ok(n) => {
+            println!("已释放 {n} 条未确认回执，现在可以重新提交");
+            0
+        }
+        Err(e) => {
+            eprintln!("释放失败: {e}");
             1
         }
     }

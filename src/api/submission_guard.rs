@@ -176,6 +176,31 @@ impl Guard {
         self.append(Event::Rejected { uuid: uuid.into() })
     }
 
+    /// 当前未决（结果未知）的提交条数。
+    pub fn pending_count(&self) -> usize {
+        self.attempts
+            .iter()
+            .filter(|a| a.outcome.is_none())
+            .count()
+    }
+
+    /// 用户核对过官方记录、确认这些提交没有入账后的**手动释放**。
+    ///
+    /// journal 只能追加，所以"释放"不是删除，而是给每个未决请求补一条 Rejected
+    /// 事件 —— 记录仍然完整可追溯，同时解开对后续提交的封锁。
+    pub fn clear_pending(&mut self) -> Result<usize, String> {
+        let uuids: Vec<String> = self
+            .attempts
+            .iter()
+            .filter(|a| a.outcome.is_none())
+            .map(|a| a.uuid.clone())
+            .collect();
+        for uuid in &uuids {
+            self.append(Event::Rejected { uuid: uuid.clone() })?;
+        }
+        Ok(uuids.len())
+    }
+
     pub fn reconcile(&mut self, rows: &[RecordRow]) -> Result<Vec<i64>, String> {
         let mut found = Vec::new();
         for attempt in self.attempts.iter().filter(|a| a.outcome.is_none()) {
