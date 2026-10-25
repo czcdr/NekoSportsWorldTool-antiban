@@ -236,26 +236,27 @@ fn send_record(
     let body_plain = Value::Object(body).to_string();
 
     let device_id = if client.identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
+        crate::crypto::header::stable_fallback_device_id()
     } else {
         client.identity.device_id.clone()
     };
     // 提交接口固定走 Android 身份（osType=0 + androidId）。
-    // 关键：机型/分辨率/androidId 必须来自同一套自洽指纹。
-    // 原实现硬编码 22081212C + Android 14，一旦设备页配的是别的机型，
-    // 就会上报"机型 A + 分辨率 B"这种矛盾组合。
+    // 关键：机型/分辨率/androidId 必须来自同一套自洽指纹，**并且与非提交链路一致**
+    // （策略/围栏/点位/OBS/详情都用 `android_model_os`）。以前这里自己派生一套，
+    // 同一个账号一次运行会报两种机型。
     let mut android_identity = client.identity.clone();
+    // iOS 身份切到 Android 时，分辨率/IDFA 必须一起清掉：`ensure_fingerprint`
+    // 只补空字段，留着 iOS 的 physicPixel 就会报「Android 机型 + iPhone 分辨率」。
+    if android_identity.platform != "android" {
+        android_identity.pixel.clear();
+        android_identity.logic_pixel.clear();
+        android_identity.idfa.clear();
+    }
     android_identity.platform = "android".into();
     android_identity.device_id = device_id.clone();
-    if matches!(android_identity.device_name.as_str(), "" | "iPhone" | "Android") {
-        // iOS 身份或占位机型：按 device_id 派生一整套 Android 指纹。
-        let seed = crate::crypto::header::fingerprint_seed(&device_id);
-        let profile = crate::api::fingerprint::DeviceProfile::from_parts("", "", "", "", seed);
-        android_identity.device_name = profile.device_name;
-        android_identity.os_version = profile.os_version;
-        android_identity.pixel = profile.pixel;
-        android_identity.android_id = profile.android_id;
-    }
+    let (model, os) = android_identity.android_model_os();
+    android_identity.device_name = model;
+    android_identity.os_version = os;
     android_identity.ensure_fingerprint();
     let (hp, hp_extra) =
         build_android_header(&android_identity, p.uid, &client_token(client), None);
@@ -276,10 +277,10 @@ fn send_record(
     let mut req = agent.post(&client.record_url());
     req = req
         .set("Content-Type", "application/json; charset=utf-8")
-        // UA 由身份拼出：机型/系统版本必须与 header 的 deviceName/osVersion 一致。
-        .set("User-Agent", &crate::crypto::header::ua_android(&android_identity))
-        // appVersion 与 UA / 信封保持同源：UA 写着 SWCampus/7.3.70、
-        // 信封 appVersion 也是 7.3.70，外层头部却报 iOS 的 7.3.40 是最廉价的矛盾特征。
+        // UA 由身份拼出，且与其余链路同源（`ua_for` 是全链唯一来源）。
+        .set("User-Agent", &crate::crypto::header::ua_for(&android_identity))
+        // appVersion 与信封同源：提交固定走 Android 身份（`build_android_header`），
+        // 信封里的 appVersion 就是 ANDROID_APP_VERSION，外层必须报同一个值。
         .set("appVersion", crate::crypto::header::ANDROID_APP_VERSION)
         .set("headerSign", &header_env.json)
         .set("runes", &runes)
@@ -288,9 +289,9 @@ fn send_record(
         req = req.set(k, v);
     }
     let resp = req.send_string(&body_env.json).map_err(|error| {
-        let transport = matches!(&error, ureq::Error::Transport(_));
+        let transport = matches!(&error, crate::http::Error::Transport(_));
         client.report_egress(!transport);
-        let rejected = matches!(&error, ureq::Error::Status(401, _));
+        let rejected = matches!(&error, crate::http::Error::Status(401, _));
         let message = client.handle_request_error(error);
         if rejected { SubmitFailure::Rejected(message) } else { SubmitFailure::Unknown(message) }
     })?;

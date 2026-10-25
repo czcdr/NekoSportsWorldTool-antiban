@@ -8,7 +8,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::client::{make_agent, ureq_err};
+use super::client::http_err;
 use super::gt4image::get_distance_original;
 
 const GEE_HOST: &str = "https://gcaptcha4.geetest.com";
@@ -149,12 +149,12 @@ fn jsonp_value(text: &str) -> Result<Value, String> {
 /// 完整 GT4 求解（带重试）。返回 {lotNumber, captchaOutput, passToken, genTime}。
 pub fn solve_gt4(
     captcha_id: &str,
-    _client: &mut super::client::ApiClient,
+    client: &mut super::client::ApiClient,
     log: &mut dyn FnMut(&str),
 ) -> Result<Value, String> {
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        match solve_once(captcha_id, _client, log) {
+        match solve_once(captcha_id, client, log) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 log(&format!("× [gt4] 第 {attempt} 次失败: {e}"));
@@ -168,10 +168,12 @@ pub fn solve_gt4(
 
 fn solve_once(
     captcha_id: &str,
-    _client: &mut super::client::ApiClient,
+    client: &mut super::client::ApiClient,
     log: &mut dyn FnMut(&str),
 ) -> Result<Value, String> {
-    let agent = make_agent();
+    // 复用调用方那只 agent（带同城出口）。极验侧能同时看到「验证码来自 IP A」
+    // 和「App 业务请求来自 IP B」，两次出口不一致本身就是一条免费的关联信号。
+    let agent = client.agent.clone();
     let challenge = uuid::Uuid::new_v4().to_string().replace('-', "");
     let callback = format!("geetest_{}", crate::crypto::envelope::now_ms());
     let load_url = format!(
@@ -180,7 +182,7 @@ fn solve_once(
         cid = captcha_id,
         ch = challenge
     );
-    let resp = agent.get(&load_url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent.get(&load_url).set("User-Agent", UA_WEB).call().map_err(http_err)?;
     let text = resp.into_string().map_err(|e| e.to_string())?;
     let data = jsonp_value(&text)?["data"]
         .as_object()
@@ -214,7 +216,7 @@ fn solve_once(
         pt = urlencode(&process_token),
         w = urlencode(&w),
     );
-    let resp = agent.get(&verify_url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent.get(&verify_url).set("User-Agent", UA_WEB).call().map_err(http_err)?;
     let text = resp.into_string().map_err(|e| e.to_string())?;
     let root = jsonp_value(&text)?;
     if root["status"].as_str() != Some("success") {
@@ -229,8 +231,8 @@ fn solve_once(
     }))
 }
 
-fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
-    let resp = agent.get(url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+fn download(agent: &crate::http::Agent, url: &str) -> Result<Vec<u8>, String> {
+    let resp = agent.get(url).set("User-Agent", UA_WEB).call().map_err(http_err)?;
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|e| e.to_string())?;
     Ok(buf)

@@ -51,6 +51,15 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// 带小数部分的毫秒时间戳。
+///
+/// keyDataFour 是 native 侧 `CFAbsoluteTime*1000`（double）格式化来的，天生带小数。
+/// 以前这里传整数毫秒，`format!("{:.6}")` 的结果恒以 `.000000` 结尾 ——
+/// 服务端一个正则就能把这批请求分桶。
+pub fn now_ms_fractional() -> f64 {
+    chrono::Utc::now().timestamp_micros() as f64 / 1000.0
+}
+
 pub fn md5_hex(data: &[u8]) -> String {
     let mut h = Md5::new();
     h.update(data);
@@ -154,7 +163,7 @@ impl EnvelopeSession {
 
         pub fn key_data(&mut self) -> [String; 4] {
         if self.four.is_none() {
-            self.four = Some(key_data_four_from_ms(now_ms() as f64));
+            self.four = Some(key_data_four_from_ms(now_ms_fractional()));
         }
         [
             KEYDATA_ONE.to_string(),

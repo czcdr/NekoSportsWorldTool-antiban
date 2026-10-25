@@ -10,7 +10,7 @@ use crate::crypto::envelope::{
 };
 use crate::crypto::header::{build_header_for, HeaderIdentity};
 
-pub fn make_agent() -> ureq::Agent {
+pub fn make_agent() -> crate::http::Agent {
     make_agent_with_proxy(None)
 }
 
@@ -20,20 +20,21 @@ pub fn make_agent() -> ureq::Agent {
 /// 不会走到这里的兜底分支。这里的 `Err` 分支只是防御性处理 —— 一旦真的触发，
 /// 说明"以为在走代理、其实直连"，比不配代理更糟，所以必须留日志。
 /// 直连与走代理的出口 IP 不同，两者绝不能在同一次跑步任务里混用。
-pub fn make_agent_with_proxy(proxy_url: Option<&str>) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30));
-    if let Some(url) = proxy_url {
-        match ureq::Proxy::new(url) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            // 代理地址可能带 user:pass，日志里只留打码后的地址。
-            Err(error) => eprintln!(
-                "[net] 代理 {} 配置无效，本次改为直连：{}",
-                crate::textlog::redact_url(url),
-                crate::textlog::redact_text(&error.to_string())
-            ),
+pub fn make_agent_with_proxy(proxy_url: Option<&str>) -> crate::http::Agent {
+    match crate::http::Agent::new(std::time::Duration::from_secs(30), proxy_url) {
+        Ok(agent) => agent,
+        Err(error) => {
+            // 代理串可能带 user:pass：日志里只留打码后的地址。
+            if let Some(url) = proxy_url {
+                eprintln!(
+                    "[net] 代理 {} 配置无效，本次改为直连：{}",
+                    crate::textlog::redact_url(url),
+                    crate::textlog::redact_text(&error)
+                );
+            }
+            crate::http::Agent::with_timeout(std::time::Duration::from_secs(30))
         }
     }
-    builder.build()
 }
 
 /// 从数据目录读取 `proxies.json`。文件不存在 = 直连（与改造前一致）。
@@ -70,7 +71,7 @@ pub struct ApiClient {
     auth_rejected: bool,
     #[cfg(test)]
     test_host: Option<String>,
-    pub agent: ureq::Agent,
+    pub agent: crate::http::Agent,
     pub session: EnvelopeSession,
     pub identity: HeaderIdentity,
     pub login: Option<Session>,
@@ -152,7 +153,7 @@ impl ApiClient {
                 // 先验证代理串：配置写错时宁可报错，也不要"以为在走代理、其实直连"。
                 // 直连等于把真实 IP 直接交给服务端 —— 这比不配代理更糟，因为用户
                 // 以为自己已经被保护了。
-                ureq::Proxy::new(&entry.url).map_err(|error| {
+                reqwest::Proxy::all(&entry.url).map_err(|error| {
                     let message = format!(
                         "出口 {} 的代理地址不可用：{}",
                         crate::textlog::redact_url(&entry.url),
@@ -222,7 +223,7 @@ impl ApiClient {
         self.test_host = Some(host);
     }
 
-    pub(crate) fn handle_request_error(&mut self, error: ureq::Error) -> String {
+    pub(crate) fn handle_request_error(&mut self, error: crate::http::Error) -> String {
         let authenticated = self.login.as_ref().is_some_and(Session::is_logged_in);
         let error = request_error(error, authenticated);
         if is_session_expired(&error) {
@@ -274,13 +275,30 @@ impl ApiClient {
     ) -> Result<RequestOutcome, String> {
         self.egress_guard()?;
         self.ensure_session_valid()?;
+        // UA 只有一个来源。留一个调试期断言，防止以后有人传进来"看起来像"的串，
+        // 让外层 appVersion（按 platform 取）与 UA（按参数取）静默错配。
+        debug_assert_eq!(
+            ua,
+            crate::crypto::header::ua_for(&self.identity),
+            "envelope_request 的 UA 必须来自 ua_for(&self.identity)"
+        );
         let uid = self.uid();
         let token = self.token();
-        let (header_plain, _) = build_header_for(&self.identity, uid, &token, None);
+        // headerSign 的附加头（nonce/timeStamp/tokenSign）以前被丢弃，只有提交那一条
+        // 请求带出去 —— 同 token 的六七个请求做一次头集合 diff，提交会突兀地多三个
+        // 防重放字段。已登录请求统一带上，口径与提交一致。
+        let (header_plain, header_extra) = build_header_for(&self.identity, uid, &token, None);
+        let authenticated = self.login.as_ref().is_some_and(Session::is_logged_in);
         let header_env = build_envelope(&mut self.session, &header_plain, OuterOrder::Observed);
-        // body 时间戳 = header ts + 1（原生两次独立读取毫秒）
-        let body_env =
-            build_envelope_ts(&mut self.session, body_plain, OuterOrder::Insert, header_env.ts_ms + 1);
+        // body 与 header 各读一次时钟。以前写死 `header + 1`，服务端把两层都解密、
+        // 做一次减法就得到恒定的 1 —— 真机两次读毫秒是「多数相等、偶尔差 1~2」的分布，
+        // 恒定 1 反而是人为常量。这里让它们自然相等或相差 1，不做补偿。
+        let body_env = build_envelope_ts(
+            &mut self.session,
+            body_plain,
+            OuterOrder::Insert,
+            crate::crypto::envelope::now_ms(),
+        );
 
         #[cfg(test)]
         let test_url = self.test_host.as_ref().map(|host| {
@@ -295,23 +313,29 @@ impl ApiClient {
         let mut req = agent.request(method, url);
         req = req.set("Content-Type", "application/json; charset=utf-8");
         req = req.set("User-Agent", ua);
-        // appVersion 必须与 UA 同源：Android 请求却报 iOS 的 7.3.40，
-        // 和 UA 里的 SWCampus/7.3.70、信封里的 appVersion 三方矛盾。
+        // appVersion 取自身份平台，**不能靠 UA 字符串里有没有 "Android" 判断**：
+        // Android 侧的 UA 现在是 OkHttp 默认值（`okhttp/4.12.0`），
+        // 里面根本没有 "Android" 字样，按字符串判断会退回 iOS 的 7.3.40。
         req = req.set(
             "appVersion",
-            if ua.contains("Android") {
+            if self.identity.platform == "android" {
                 crate::crypto::header::ANDROID_APP_VERSION
             } else {
                 crate::crypto::header::IOS_APP_VERSION
             },
         );
         req = req.set("headerSign", &header_env.json);
+        if authenticated {
+            for (k, v) in &header_extra {
+                req = req.set(k, v);
+            }
+        }
         for (k, v) in extra_headers {
             req = req.set(k, v);
         }
         let resp = req.send_string(&body_env.json).map_err(|e| {
             // 只有传输层失败才算"出口坏了"；拿到 HTTP 响应说明代理是通的。
-            let transport = matches!(&e, ureq::Error::Transport(_));
+            let transport = matches!(&e, crate::http::Error::Transport(_));
             self.report_egress(!transport);
             self.handle_request_error(e)
         })?;
@@ -355,7 +379,7 @@ impl ApiClient {
         let url = format!("{}{}", host, path);
         // UA 必须与信封同源：信封按 identity.platform 生成（android 是 osType=0 +
         // androidId），UA 却恒为 iOS 时，同一条请求会同时出现「Android 指纹 +
-        // iPhone UA + 外层 appVersion 7.3.40 / 信封 7.3.70」三方矛盾。
+        // iPhone UA + 外层 appVersion 7.3.40 / 信封 7.4.0」三方矛盾。
         let ua = crate::crypto::header::ua_for(&self.identity);
         let out = self.envelope_request(method, &url, body_plain, &ua, extra_headers)?;
         let dec = out.decrypted.ok_or_else(|| {
@@ -452,9 +476,9 @@ pub fn parse_data_field(biz: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-pub fn ureq_err(e: ureq::Error) -> String {
+pub fn http_err(e: crate::http::Error) -> String {
     match e {
-        ureq::Error::Status(code, resp) => {
+        crate::http::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
             // 服务端错误体同样可能回带 token/手机号；能解析就按键打码，再按字符截断。
             let safe = match serde_json::from_str::<serde_json::Value>(&body) {
@@ -468,7 +492,7 @@ pub fn ureq_err(e: ureq::Error) -> String {
             )
         }
         // Transport 的 Display 会把完整 URL 拼进去，带认证的代理地址会泄露口令。
-        ureq::Error::Transport(t) => {
+        crate::http::Error::Transport(t) => {
             format!("网络错误: {}", crate::textlog::redact_text(&t.to_string()))
         }
     }
@@ -483,11 +507,11 @@ pub fn is_session_expired(error: &str) -> bool {
 
 // Only authenticated school API requests may invalidate a school session.
 // Public map services and unauthenticated login failures use their own errors.
-fn request_error(error: ureq::Error, authenticated: bool) -> String {
-    if authenticated && matches!(&error, ureq::Error::Status(401, _)) {
+fn request_error(error: crate::http::Error, authenticated: bool) -> String {
+    if authenticated && matches!(&error, crate::http::Error::Status(401, _)) {
         SESSION_EXPIRED.into()
     } else {
-        ureq_err(error)
+        http_err(error)
     }
 }
 
@@ -523,8 +547,8 @@ mod business_data_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    fn response_error(code: u16, body: &str) -> ureq::Error {
-        ureq::Error::Status(code, ureq::Response::new(code, "fixture", body).unwrap())
+    fn response_error(code: u16, body: &str) -> crate::http::Error {
+        crate::http::Error::Status(code, crate::http::Response::new(code, "fixture", body).unwrap())
     }
     #[test]
     fn authenticated_401_requires_login_without_exposing_raw_response() {
@@ -543,7 +567,7 @@ mod auth_tests {
     #[test]
     fn chinese_http_errors_are_truncated_on_character_boundaries() {
         let body = format!("a{}", "错误".repeat(100));
-        let error = ureq_err(response_error(500, &body));
+        let error = http_err(response_error(500, &body));
         assert!(error.starts_with("HTTP 500: a错误"));
     }
 }

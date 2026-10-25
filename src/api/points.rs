@@ -96,7 +96,9 @@ pub fn fetch_points_ext(
     }
     let body = body.to_string();
 
-    let out = client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
+    // 点位与策略/围栏同属"这条轨迹"：UA 也必须来自同一套身份。
+    let ua = crate::crypto::header::ua_for(&client.identity);
+    let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
     let dec = out.decrypted.ok_or("点位接口响应无法解密")?;
     let pts = parse_points(&dec.business)?;
     let _ = model::save_points_cache(anchor, &scope, &pts);

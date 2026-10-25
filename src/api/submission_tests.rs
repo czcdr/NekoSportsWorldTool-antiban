@@ -142,9 +142,7 @@ fn client(host: &str) -> ApiClient {
         }),
     );
     c.set_test_host(host.into());
-    c.agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(2))
-        .build();
+    c.agent = crate::http::Agent::with_timeout(Duration::from_secs(2));
     c
 }
 fn params() -> SubmitParams {

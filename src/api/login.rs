@@ -75,14 +75,18 @@ pub fn login(
                 "passToken": creds["passToken"],
                 "genTime": creds["genTime"],
                 "isOffline": false,
-                "osType": 1,
+                // 必须跟身份走：写死 1（iOS）时，Android 身份的同一条请求会出现
+                // 「body 说 iOS、headerSign 说 Android」的跨来源矛盾。
+                "osType": if client.identity.platform == "android" { 0 } else { 1 },
                 "businessType": 0,
                 "uuid": uuid_value,
                 "username": username,
             })
             .to_string();
             let url = format!("{HOST}{GEEVALIDATE_PATH}");
-            let out = client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
+            // UA 必须由身份拼出：写死 iOS UA 会让同一账号的登录与其余请求分属两台设备。
+            let ua = crate::crypto::header::ua_for(&client.identity);
+            let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
             let gv_err = out.decrypted.as_ref().and_then(|d| d.business.get("error").cloned());
             match gv_err.as_ref().and_then(|e| e.as_i64()) {
                 Some(10000) => {
@@ -126,13 +130,16 @@ pub fn login(
         "username": username,
         "password": password,
         "uuid": uuid_value,
-        "osType": "0",
+        // 与 headerSign 里的 osType 同源：iOS 身份却报 "0"（Android）是同一条请求内的自相矛盾。
+        "osType": if client.identity.platform == "android" { "0" } else { "1" },
     })
     .to_string();
     let credential = B64.encode(format!("{username}:{password}"));
     let extra = vec![("Authorization".to_string(), format!("Basic {credential}"))];
     let url = format!("{HOST}{LOGIN_PATH}");
-    let out = client.envelope_request("POST", &url, &login_body, crate::crypto::header::UA_IOS, &extra)?;
+    // 与 geevalidate 同一套 UA：登录本身也是这条设备身份的一部分。
+    let ua = crate::crypto::header::ua_for(&client.identity);
+    let out = client.envelope_request("POST", &url, &login_body, &ua, &extra)?;
     let dec = out
         .decrypted
         .ok_or_else(|| format!("HTTP {} 且响应解密失败", out.http_status))?;

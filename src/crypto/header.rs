@@ -8,16 +8,27 @@ use super::envelope::{md5_hex, now_ms};
 pub const TOKEN_SIGN_SUFFIX: &str = "2slhe02lsfiwowlcixisla_sls-_slaor";
 
 pub const IOS_APP_VERSION: &str = "7.3.40";
-pub const ANDROID_APP_VERSION: &str = "7.3.70";
+pub const ANDROID_APP_VERSION: &str = "7.4.0";
 
 pub const UA_IOS: &str = "SWCampus/7.3.40 (iPhone; iOS 18.1; Scale/3.00)";
-/// 上游写死的 Android UA 模板（机型/系统版本固定成 22081212C + Android 14）。
+
+/// Android 侧实际发出的 User-Agent。
 ///
-/// **不要再直接用它发请求**：身份里的机型被换成别的机型时，UA 会与 header 的
-/// `deviceName`/`osVersion` 自相矛盾。需要 Android UA 时调用 [`ua_android`]，
-/// 由身份拼出来。这里保留只为记录原始模板。
-#[cfg_attr(not(test), allow(dead_code))]
-pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.3.70";
+/// 证据来自官方 **Android** 包（7.4.0）：`classes.dex` 68 MB、54 个 arm64 原生库、
+/// Dart AOT 全量扫描三处，`SWCampus` 命中共 **0** 次；dex 里能找到的 UA 只有 WebView
+/// 模板和 `okhttp/3.14.9`、`okhttp/4.12.0` 这两条 OkHttp 自身的默认值。
+///
+/// 结论的边界要说清：这只能证明**官方 Android 客户端没有设置自定义 UA**，
+/// 发出去的就是 OkHttp 默认值。它**不能**证明 iOS 客户端不发 `SWCampus` ——
+/// 我们手上没有 iOS 包，Android 包里本来就不该出现 iOS 的 UA 字符串（`Scale/`、
+/// `CFNetwork` 为 0 是这个原因，不是证据）。所以 [`UA_IOS`] 保持原样、仍待验证。
+///
+/// Android 侧自己拼一个「看起来像官方」的串，反而是把一个「用 OkHttp 的 App」
+/// 变成一个「谁都没见过的客户端」。这里直接用 OkHttp 的默认串。
+///
+/// 若日后抓包证明服务端确实要 `SWCampus/...`，改这一个常量即可 ——
+/// 所有链路（登录/策略/围栏/点位/提交/OBS/详情）都从 `ua_for` 取值。
+pub const UA_ANDROID: &str = "okhttp/4.12.0";
 
 /// 设备身份。app_install_time <= 0 表示尚未生成。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,6 +74,11 @@ pub struct HeaderIdentity {
     /// 提交 body 的城市名
     #[serde(default = "default_city")]
     pub city: String,
+    /// 「默认平台改为 Android」的一次性迁移标记（见 `model::load_identity_for_platform`）。
+    /// 老版本桌面端写下的身份是 iOS + 旧默认机型，与"用户主动选了 iOS"在磁盘上无法区分；
+    /// 迁移过一次就置位，避免反复改写用户的选择。
+    #[serde(default)]
+    pub platform_migrated: bool,
 }
 
 pub fn random_mac() -> String {
@@ -77,8 +93,12 @@ pub fn random_mac() -> String {
 }
 
 fn default_platform() -> String { "ios".into() }
-fn default_os_version() -> String { "26.5.2".into() }
-fn default_device_name() -> String { "iPhone".into() }
+fn default_os_version() -> String { LEGACY_DEFAULT_OS_VERSION.into() }
+fn default_device_name() -> String { LEGACY_DEFAULT_DEVICE_NAME.into() }
+/// 与 [`default_device_name`] / [`default_os_version`] 组成「从没被动过的旧默认身份」，
+/// 供一次性平台迁移识别；用户手动改过任一项就不再算旧默认。
+pub(crate) const LEGACY_DEFAULT_DEVICE_NAME: &str = "iPhone";
+pub(crate) const LEGACY_DEFAULT_OS_VERSION: &str = "26.5.2";
 fn default_anchor_lat() -> f64 { 38.901678 }
 fn default_anchor_lon() -> f64 { 121.540241 }
 fn default_city() -> String { "大连市".into() }
@@ -132,11 +152,54 @@ impl Default for HeaderIdentity {
             logic_pixel: String::new(),
             fingerprint_from_device: false,
             city: default_city(),
+            // `false` = 「磁盘上还没有这个标记」，与老版本写下的 identity.json 一致；
+            // 加载时由 `model::load_identity_for_platform` 判断是否需要迁移并置位。
+            platform_migrated: false,
         }
     }
 }
 
 impl HeaderIdentity {
+    /// 上报用的 Android 机型与系统版本。
+    ///
+    /// 提交接口与非提交接口（策略/围栏/点位/OBS/详情）必须拿到同一对值。
+    /// 以前提交按 `device_id` 派生真机档案、其余链路走写死兜底，于是同一个账号
+    /// 在一次运行里报出两种机型（`ALN-AL80/12` 与 `22081212C/14`），
+    /// 这是比"机型不像真机"更容易被关联的矛盾。
+    pub fn android_model_os(&self) -> (String, String) {
+        let is_placeholder_model = |m: &str| matches!(m.trim(), "" | "iPhone" | "iPad" | "Android");
+        // Android 版本号是纯整数（"13"/"14"）；带点的都是 iOS 版本号（"26.5.2"）。
+        let os_text = self.os_version.trim();
+        let os_is_android = !os_text.is_empty()
+            && os_text != "0"
+            && os_text.chars().all(|c| c.is_ascii_digit());
+        // 两边都是用户自己填的真值：原样保留，不拿机型库去覆盖手填数据。
+        if !is_placeholder_model(&self.device_name) && os_is_android {
+            return (self.device_name.trim().to_string(), os_text.to_string());
+        }
+        let device_id = if self.device_id.is_empty() {
+            stable_fallback_device_id()
+        } else {
+            self.device_id.clone()
+        };
+        // 机型和系统版本必须**成对**从同一台设备取：占位机型 + 保留一个数字版本
+        // （老默认的 "16"，或用户从 iOS 切过来留下的 "18.1"）会拼出机型库里不存在
+        // 的组合，本地自检和机型库对照都会判它非法。
+        let keep_model = if is_placeholder_model(&self.device_name) {
+            ""
+        } else {
+            self.device_name.trim()
+        };
+        let profile = crate::api::fingerprint::DeviceProfile::from_parts(
+            keep_model,
+            "",
+            "",
+            "",
+            fingerprint_seed(&device_id),
+        );
+        (profile.device_name, profile.os_version)
+    }
+
     /// 补齐指纹字段：androidId / 分辨率缺失时按机型库推导，保证一套身份内部自洽。
     /// 返回 true 表示有字段被补上（调用方负责落盘）。
     ///
@@ -209,37 +272,17 @@ fn derive_ios_logic(physic: &str) -> String {
     }
 }
 
-/// 按身份平台拼出该请求应使用的 User-Agent。
+/// 按身份平台给出该请求应使用的 User-Agent。
 ///
-/// UA 与信封里的 `appVersion`、外层 `appVersion` 必须同源：身份是 Android
-/// 却发 iOS 的 UA，会在同一条请求里同时出现 `osType=0` + `androidId` 有值 +
-/// `SWCampus/7.3.40 (iPhone…)`，这是比轨迹分析便宜得多的矛盾特征。
+/// **全链路唯一来源**：登录、策略、围栏、点位、提交、OBS 直传、详情都从这里取。
+/// 曾经登录/点位写死 iOS UA、OBS 直传漏设（发出 `ureq/2.12.1`）、提交另拼一套，
+/// 同一次运行四条不同 UA —— 那才是最廉价可关联的特征。
 pub fn ua_for(identity: &HeaderIdentity) -> String {
     if identity.platform == "android" {
-        ua_android(identity)
+        UA_ANDROID.to_string()
     } else {
         UA_IOS.to_string()
     }
-}
-
-/// Android UA 必须由**身份本身**拼出来。
-///
-/// 写死 `Android 14; 22081212C` 而 header 里 `deviceName`/`osVersion` 是别的机型时，
-/// 同一条请求里 UA 与头部自相矛盾 —— 比轨迹分析便宜得多就能对出来。
-pub fn ua_android(identity: &HeaderIdentity) -> String {
-    let model = if identity.device_name.trim().is_empty() {
-        "22081212C"
-    } else {
-        identity.device_name.trim()
-    };
-    let os = if identity.os_version.trim().is_empty() {
-        "14"
-    } else {
-        identity.os_version.trim()
-    };
-    format!(
-        "Mozilla/5.0 (Linux; Android {os}; {model} Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/{ANDROID_APP_VERSION}"
-    )
 }
 
 /// 由稳定 device_id 派生指纹 seed：同一设备反复启动得到同一套补齐值。
@@ -251,8 +294,8 @@ pub(crate) fn fingerprint_seed(device_id: &str) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// 空 device_id 的兜底值：进程内固定。
-fn stable_fallback_device_id() -> String {
+/// 空 device_id 的兜底值：进程内固定。提交与其余链路共用，避免派生两种指纹。
+pub(crate) fn stable_fallback_device_id() -> String {
     use std::sync::OnceLock;
     static FALLBACK: OnceLock<String> = OnceLock::new();
     FALLBACK
@@ -486,7 +529,7 @@ mod tests {
         let (json, _) = build_android_header(&identity, 42, "TK", Some(1788958186123));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["osType"], "0");
-        assert_eq!(v["appVersion"], "7.3.70");
+        assert_eq!(v["appVersion"], "7.4.0");
         assert_eq!(v["studentId"], 42);
         assert!(v.get("tokenSign").is_some());
         assert!(json.starts_with("{\"Accept\":\"application/json\""));

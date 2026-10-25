@@ -26,13 +26,25 @@ pub fn sign_url(client: &mut ApiClient, method: &str, key: &str) -> Result<Strin
 }
 
 /// PUT 上传 OBS 对象。
-pub fn put_object(signed_url: &str, payload: &[u8], log: &mut dyn FnMut(&str)) -> Result<(), String> {
-    let agent = super::client::make_agent();
+///
+/// 两个参数都是**必须显式传入**的，因为它们各自堵住过一类真实缺陷：
+/// - `agent`：必须用调用方那只（带同城出口代理）。以前这里自己 `make_agent()`，
+///   配了出口池时 OBS 直传会从家宽直连 —— 唯一携带轨迹数据的那一步换了出口 IP，
+///   正好是「同一账号几分钟内 IP 跳变」里最难解释的一次。
+/// - `ua`：不设就是底层 HTTP 库的默认 UA（曾实测发出 `ureq/2.12.1`），等于自报"我是脚本"。
+pub fn put_object(
+    agent: &crate::http::Agent,
+    signed_url: &str,
+    ua: &str,
+    payload: &[u8],
+    log: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     let resp = agent
         .put(signed_url)
         .set("Content-Type", "application/json")
+        .set("User-Agent", ua)
         .send_bytes(payload)
-        .map_err(super::client::ureq_err)?;
+        .map_err(super::client::http_err)?;
     log(&format!("[obs] PUT {} -> {}", shorten(signed_url), resp.status()));
     Ok(())
 }
@@ -45,8 +57,14 @@ pub fn upload_both_keys(
     log: &mut dyn FnMut(&str),
 ) -> usize {
     let mut ok = 0;
+    // OBS 直传是这条链上唯一上传轨迹数据的步骤：UA 与**出口**都必须与业务请求同源。
+    // 这里克隆 client 那只 agent（内部 Arc，克隆很便宜），它已经带上同城出口代理。
+    let ua = crate::crypto::header::ua_for(&client.identity);
+    let agent = client.agent.clone();
     for key in keys {
-        match sign_url(client, "Put", key).and_then(|url| put_object(&url, payload, log)) {
+        match sign_url(client, "Put", key)
+            .and_then(|url| put_object(&agent, &url, &ua, payload, log))
+        {
             Ok(()) => ok += 1,
             Err(e) => log(&format!("[obs] PUT {key} 失败: {e}")),
         }
@@ -65,8 +83,13 @@ fn shorten(url: &str) -> &str {
 #[allow(dead_code)]
 pub fn fetch_object(client: &mut ApiClient, key: &str, log: &mut dyn FnMut(&str)) -> Result<Value, String> {
     let signed = sign_url(client, "Get", key)?;
+    let ua = crate::crypto::header::ua_for(&client.identity);
     let agent = super::client::make_agent();
-    let resp = agent.get(&signed).call().map_err(super::client::ureq_err)?;
+    let resp = agent
+        .get(&signed)
+        .set("User-Agent", &ua)
+        .call()
+        .map_err(super::client::http_err)?;
     let text = resp.into_string().unwrap_or_default();
     log(&format!("[obs] GET 回读 {} 字节", text.len()));
     serde_json::from_str(&text).map_err(|e| format!("OBS 对象解析失败: {e}"))

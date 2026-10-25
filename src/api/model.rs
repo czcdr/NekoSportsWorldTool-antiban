@@ -210,11 +210,12 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
 /// 加载设备身份；device_id / app_install_time 缺失时生成一次并立即落盘，
 /// 此后同一设备全生命周期复用（逐请求漂移会影响设备一致性）。
 pub fn load_identity() -> HeaderIdentity {
-    load_identity_for_platform(if cfg!(target_os = "android") {
-        "android"
-    } else {
-        "ios"
-    })
+    // 官方只发布 Android 包：7.4.0 的 `native-code` 只有 arm64-v8a / armeabi-v7a /
+    // armeabi，dex 里也没有任何 iOS 客户端痕迹（`Scale/`、`CFNetwork` 均 0 命中）。
+    // 桌面端过去按 `cfg!(target_os="android")` 退到 iOS，结果是同一个账号
+    // 「提交走 Android、其余链路走 iOS」——一次运行两套身份，比机型不像真机更容易被关联。
+    // 现在统一按 Android 身份走；用户在设备页显式切成 iOS 仍然尊重其选择。
+    load_identity_for_platform("android")
 }
 
 fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
@@ -222,9 +223,11 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
         let mut identity = HeaderIdentity::default();
         if platform == "android" {
             identity.platform = "android".into();
-            // Generic fallback until the user opts in or fills the fields manually.
-            identity.device_name = "Android".into();
-            identity.os_version = "16".into();
+            // 机型/系统版本留空，交给下面的统一派生填成机型库里的真机组合。
+            // 写死 "Android"/"16" 这类占位值会让 header 的 deviceName/osVersion
+            // 与 UA 各说各话（占位值本身也不是任何一台真机的 Build.MODEL）。
+            identity.device_name.clear();
+            identity.os_version.clear();
         }
         identity
     });
@@ -241,6 +244,37 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
     if id.mac_address.is_empty() {
         id.mac_address = crate::crypto::header::random_mac();
         dirty = true;
+    }
+    // 一次性迁移：老版本桌面端的默认身份是 iOS（`iPhone` + `26.5.2`），
+    // 与"用户主动选了 iOS"在磁盘上无法区分，所以只迁移**完全没被动过**的旧默认值，
+    // 迁完打标记，不再反复改写用户的选择。
+    if !id.platform_migrated {
+        let pristine_legacy_ios = id.platform != "android"
+            && id.device_name == crate::crypto::header::LEGACY_DEFAULT_DEVICE_NAME
+            && id.os_version == crate::crypto::header::LEGACY_DEFAULT_OS_VERSION;
+        if pristine_legacy_ios {
+            id.platform = "android".into();
+            id.device_name.clear();
+            id.os_version.clear();
+            id.pixel.clear();
+            id.logic_pixel.clear();
+            id.idfa.clear();
+        }
+        id.platform_migrated = true;
+        dirty = true;
+    }
+    // Android 身份的机型/系统版本必须是机型库里的真实组合（机型与版本成对）：
+    // "Android"/"Android 16" 这类占位值会让 header 报 A、UA 报 B，也会被本地自检判非法。
+    if id.platform == "android" {
+        let (model, os) = id.android_model_os();
+        if id.device_name != model {
+            id.device_name = model;
+            dirty = true;
+        }
+        if id.os_version != os {
+            id.os_version = os;
+            dirty = true;
+        }
     }
     // 指纹自洽：老配置补齐 androidId / 分辨率（同一 device_id 结果恒定）。
     if id.ensure_fingerprint() {
@@ -700,5 +734,106 @@ mod points_cache_tests {
             crate::location::Coordinate::new(38.9, 121.5, 0.0).unwrap(),
             0.0001
         ));
+    }
+
+    /// 老配置里的 Android 占位档（`device_name: "Android"`）必须在加载时纠正成
+    /// 机型库里的真机组合，否则 header 的 deviceName/osVersion 与 UA 各说各话。
+    #[test]
+    fn legacy_android_placeholders_are_normalized_and_persisted() {
+        let directory =
+            std::env::temp_dir().join(format!("neko-identity-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory);
+
+        let mut legacy = serde_json::to_value(HeaderIdentity::default()).unwrap();
+        legacy["platform"] = "android".into();
+        legacy["device_name"] = "Android".into();
+        legacy["os_version"] = "16".into();
+        legacy["device_id"] = "11111111-1111-4111-8111-111111111111".into();
+        write_json("identity.json", &legacy).unwrap();
+
+        let fixed = load_identity_for_platform("android");
+        assert_eq!(fixed.platform, "android");
+        assert_ne!(
+            fixed.device_name, "Android",
+            "占位机型必须被纠正成机型库里的真机"
+        );
+        assert!(
+            fixed.os_version.chars().all(|c| c.is_ascii_digit()),
+            "系统版本必须是纯整数（iOS 的 26.5.2 不能出现在 Android 身份里）：{}",
+            fixed.os_version
+        );
+        assert_eq!(
+            fixed.device_id, "11111111-1111-4111-8111-111111111111",
+            "纠正不得改动 device_id"
+        );
+
+        // 纠正结果必须落盘，且再次加载稳定 —— 否则每次启动都换一台"手机"。
+        let again = load_identity_for_platform("android");
+        assert_eq!(
+            serde_json::to_value(&fixed).unwrap(),
+            serde_json::to_value(&again).unwrap()
+        );
+    }
+
+    /// 老版本桌面端写下的「从没动过的 iOS 默认身份」要一次性迁到 Android；
+    /// 用户自己改过的 iOS 身份必须原样保留。
+    #[test]
+    fn pristine_legacy_ios_identity_migrates_once_but_edited_ios_does_not() {
+        let directory =
+            std::env::temp_dir().join(format!("neko-identity-plat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory);
+
+        // ① 从没动过的旧默认：iOS + iPhone + 26.5.2
+        let mut pristine = serde_json::to_value(HeaderIdentity::default()).unwrap();
+        pristine["platform"] = "ios".into();
+        pristine["device_name"] = "iPhone".into();
+        pristine["os_version"] = "26.5.2".into();
+        pristine["device_id"] = "22222222-2222-4222-8222-222222222222".into();
+        write_json("identity.json", &pristine).unwrap();
+
+        let migrated = load_identity_for_platform("android");
+        assert_eq!(migrated.platform, "android", "旧默认身份应一次性迁到 Android");
+        assert!(migrated.platform_migrated);
+        assert_ne!(
+            migrated.device_name, "iPhone",
+            "迁移后必须是 Android 机型，不能留着 iPhone"
+        );
+        assert!(migrated.idfa.is_empty(), "iOS 的 idfa 必须清空");
+        let reload = load_identity_for_platform("android");
+        assert_eq!(
+            serde_json::to_value(&migrated).unwrap(),
+            serde_json::to_value(&reload).unwrap(),
+            "迁移只能发生一次"
+        );
+
+        // ② 用户自己改过的 iOS 身份：保持不动
+        let mut edited = serde_json::to_value(HeaderIdentity::default()).unwrap();
+        edited["platform"] = "ios".into();
+        edited["device_name"] = "iPhone".into();
+        edited["os_version"] = "17.6".into();
+        edited["platform_migrated"] = true.into();
+        edited["device_id"] = "33333333-3333-4333-8333-333333333333".into();
+        write_json("identity.json", &edited).unwrap();
+        let kept = load_identity_for_platform("android");
+        assert_eq!(kept.platform, "ios", "用户显式选的 iOS 不该被改写");
+        assert_eq!(kept.os_version, "17.6");
     }
 }

@@ -4,6 +4,7 @@ mod api;
 pub mod cli;
 mod crypto;
 mod diagnostics;
+pub mod http;
 pub mod location;
 pub mod platform;
 mod relaunch;

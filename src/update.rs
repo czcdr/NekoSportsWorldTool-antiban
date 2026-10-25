@@ -6,7 +6,7 @@
 //! `NSWT_UPDATE_REPO` 环境变量可强制指定仓库（测试/自建发布用）。
 //! 版本号 / 重启 / 安装的平台差异见 platform.rs。
 
-use crate::api::client::{make_agent, ureq_err};
+use crate::api::client::{make_agent, http_err};
 
 /// 本项目的发布仓库（唯一默认更新源）。
 pub const REPO_OWN: &str = "czcdr/NekoSportsWorldTool-antiban";
@@ -118,7 +118,7 @@ fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Op
         .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(ureq_err)?;
+        .map_err(http_err)?;
     let text = resp.into_string().map_err(|e| format!("读取 Release 失败: {e}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("解析 Release 失败: {e}"))?;
@@ -214,10 +214,8 @@ fn download_with_limit(
     max: u64,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Vec<u8>, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(300))
-        .build();
-    let resp = agent.get(url).set("User-Agent", UA).call().map_err(ureq_err)?;
+    let agent = crate::http::Agent::with_timeout(std::time::Duration::from_secs(300));
+    let resp = agent.get(url).set("User-Agent", UA).call().map_err(http_err)?;
     let total = resp.header("Content-Length").and_then(|h| h.parse::<u64>().ok());
     if let Some(declared) = total {
         if declared > max {

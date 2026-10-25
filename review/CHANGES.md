@@ -120,4 +120,91 @@
 
 **验证**：`cargo test --lib` 227 passed / 0 failed；`cargo clippy --lib --all-features` 退出码 0（本次新增代码零告警）；Android release 交叉编译 + `apksigner verify`（v2+v3）+ `zipalign -c -P 16 4` 通过。
 
+---
+
+## J. 0.3.7-antiban 续：一次运行只能是一台设备（假跑驱动）
+
+这一节的问题不是读代码读出来的，是**假跑**跑出来的：把整条链（策略 → 围栏 → 点位 →
+轨迹 → 提交 → OBS → 详情）跑在 loopback mock 上，再逐条看客户端真正发出的报文。
+结果是同一次运行出现了**四套 User-Agent**。
+
+| # | 问题 | 改法 | 文件 |
+|---|---|---|---|
+| 1 | OBS 直传没设 UA，发出去的是 `ureq/2.12.1` —— 唯一携带轨迹数据的那一步在自报「我是 Rust 脚本」 | `put_object` 显式收 `ua` 并设置；`upload_both_keys` / `fetch_object` 传 `ua_for(&client.identity)` | `src/api/obs.rs` |
+| 2 | 登录与点位写死 iOS UA（`SWCampus/7.3.40 (iPhone; …)`），其余链路是 Android UA | 全部改走 `ua_for(&client.identity)`；`ua_for` 成为全链唯一 UA 来源 | `src/api/login.rs`、`src/api/points.rs` |
+| 3 | Android UA 曾由 `ua_android()` 拼出，把 iOS 的 `osVersion`/`deviceName` 塞进 Android 模板，得到 `Android 26.5.2; iPhone` | 删除 `ua_android()`；新增 `HeaderIdentity::android_model_os()` —— 机型与系统版本**成对**从同一台设备取，占位值按 `device_id` 从机型库派生 | `src/crypto/header.rs` |
+| 4 | 提交与非提交链路各自派生 Android 档案 → 同一账号报两种机型（`ALN-AL80/12` 与 `22081212C/14`）；空 `device_id` 时提交随机生成、其余链路另算 | 删除 `submit.rs` 的私有派生，统一调 `android_model_os()`；空 `device_id` 共用 `stable_fallback_device_id()` | `src/api/submit.rs`、`src/crypto/header.rs` |
+| 5 | Android UA 用的是自造标识 `SWCampus/7.x`。官方 7.4.0 **Android** 包里 `SWCampus` **0 命中**，dex 只有 `okhttp/3.14.9`、`okhttp/4.12.0` 两条默认值 —— 官方 Android 客户端没有设自定义 UA | Android UA 改为 `okhttp/4.12.0`。注意结论边界：这只证明 Android 客户端没设 UA，**不能**据此否定 iOS 侧的 `SWCampus`（`UA_IOS` 保持原样、仍待验证） | `src/crypto/header.rs` |
+| 6 | 外层 `appVersion` 靠 `ua.contains("Android")` 判断平台 —— UA 一改成 `okhttp/4.12.0` 就会退回 iOS 的 7.3.40 | 改为按 `identity.platform` 取版本 | `src/api/client.rs` |
+| 7 | 桌面端默认身份是 iOS（`cfg!(target_os="android")` 才给 Android），于是「提交走 Android、其余链路走 iOS」，一次运行两套身份 | `load_identity()` 统一按 Android 加载；新增 `platform_migrated` 标记做一次性迁移：**只迁移从没被动过的旧默认身份**（`iPhone` + `26.5.2`），用户自己选过的 iOS 原样保留 | `src/api/model.rs`、`src/crypto/header.rs` |
+| 8 | **OBS 直传不走出口代理**：`put_object` 自建 `make_agent()`，配了同城出口时这一步从家宽直连 —— 唯一带轨迹数据的那一步换了 IP | `put_object` 改为接收调用方的 `agent`（`client.agent.clone()`，带同城代理）；极验 `gt4::solve_once` 同样改用它 | `src/api/obs.rs`、`src/api/gt4.rs` |
+| 9 | 提交体 `body.timeStamp` 恒等于 `header.timeStamp + 1`，服务端两层解密做一次减法就得到常量 1 | 改为独立读一次时钟（允许相等），去掉恒定偏移 | `src/api/client.rs`、`src/api/submit.rs` |
+| 10 | 同一条 `geevalidate` 请求里 body `osType=1`（iOS 写死）而 `headerSign` 是 Android | `osType` 按 `identity.platform` 派生 | `src/api/login.rs` |
+| 11 | iOS 身份切到 Android 提交时没清 `pixel`，`ensure_fingerprint` 只补空字段 → 报「Android 机型 + iPhone 分辨率」 | 跨平台时先清 `pixel`/`logic_pixel`/`idfa` 再派生 | `src/api/submit.rs` |
+
+**回归防护**：`src/api/fake_run_tests.rs` 在 loopback mock 上跑完整条链，断言
+（1）请求集合完整（含 2 次 OBS 签名 + 2 次 PUT，少一条即红）、
+（2）`ua_for(identity)` 的**具体值**逐条匹配（不是"去重后只有一种"）、
+（3）`appVersion` 与信封同源、OBS 直传不带 `appVersion`、
+（4）`obs_ok == 2` 且详情验证 `complete == Some(true)`（这两处 `flow` 只写日志、不改返回值，
+`outcome.is_ok()` 盖不住）、
+（5）iOS 身份的「提交 Android / 其余 iOS」双身份被显式断言，改动即提醒同步结论。
+mock 对未知路径返回业务错误，避免"什么都说成功"掩盖意外请求。
+
+**仍然未定（需要真机/抓包）**：
+- iOS 侧的 `UA_IOS` 没有任何证据支撑 —— 手上的官方包只有 Android 版。
+- 提交固定走 Android 信封（`osType=0` + `androidId` 结构），显式选 iOS 的用户提交那条仍是 Android。
+
+### J.2 第二轮：按「被识别成本」再收一遍
+
+| # | 问题 | 改法 | 文件 |
+|---|---|---|---|
+| 12 | `nonce`/`timeStamp`/`tokenSign` 三个防重放头只在提交请求上出现，其余六七个请求都没有 —— 同 token 做一次头集合 diff 就能挑出提交那条 | 已登录请求统一带上（未登录的登录请求不发，避免空 token 签名） | `src/api/client.rs` |
+| 13 | `keyDataFour` 恒以 `.000000` 结尾：整数毫秒当 double 格式化，服务端一个正则分桶 | 改用带小数的毫秒（`timestamp_micros/1000`），与 native `CFAbsoluteTime*1000` 的形态一致 | `src/crypto/envelope.rs` |
+| 14 | `appVersion` 报 7.3.70，而现网是 7.4.0 —— 全部账号共用一个旧版本号，容易成簇、也可能被强更拦 | Android 上报版本改为 `7.4.0`（本次逆向的正是这个包，端点与 7.3.70 完全一致） | `src/crypto/header.rs` |
+| 15 | 点位拉取与提交落在同一秒：真机这两件事隔着整段跑步时间 | 提交前加 2.5~5s 抖动，至少把两者拆开 | `src/api/flow.rs` |
+| 16 | 所有记录的 `bdA` 都围绕恒定 82m 回归，海拔均值成了聚类特征 | 基准海拔每次跑随机抽 20~260m，围绕它做回归 | `src/track/generator.rs` |
+
+**明确没改的（改了可能对代跑不利，或需要证据）**：
+
+| 项 | 为什么不动 |
+|---|---|
+| HTTP/TLS 指纹（ureq+rustls、HTTP/1.1、无 ALPN h2、无 `Accept-Encoding`/`Connection`） | 要对齐 OkHttp+Conscrypt 得换 BoringSSL 栈并启用 h2，属独立一轮的工程；半对齐（只加 `Accept-Encoding: gzip` 而不解压）反而会把响应解坏。**这是当前最大的单一特征，优先级最高。** |
+| `complete: true` / `unCompleteReason: 0` | 服务端若做交叉核对会露馅，但改成 false 等于主动让记录不算数 —— 直接损害代跑目的 |
+| `validDistance == totalDis` 恒等（100% 有效里程） | 扣一点里程更像真机，但一旦扣到 `minDistance` 以下记录直接不算数；在没有服务端口径证据前不动 |
+| `faceCheck=1` 而 `runFaceCheck` 为空 | 同样是「像真机」与「能算数」的取舍：置 0 可能让需要人脸核验的学校判无效 |
+| 提交窗口 `id = 60000+i` 与 OBS 的 `id` 口径不同 | 代码注释表明这是两种格式的既有差异（`submit_windows` 的注释），没有抓包证据前不擅自统一 |
+| 机型库仅 13 款、`androidId` 由 `device_id` 派生 | 属数据工程（补机型长尾）与「别整份复制 identity.json」的使用约束，不是代码 bug |
+
+**验证**：`cargo test --lib` 231 passed / 0 failed（含假跑双身份回归）；`cargo clippy --lib --all-features` 退出码 0；`cargo check --all-targets --all-features` 与 `--target aarch64-linux-android --features android` 均通过。假跑抓包已核对：`policy` 请求头含 `nonce/timeStamp/tokenSign`，`appVersion: 7.4.0`，全链 UA 统一。
+
+### J.3 HTTP 栈整体更换：ureq(HTTP/1.1) → reqwest(ALPN h2 + gzip)
+
+这是「被识别成本最低」的那一条：官方客户端是 OkHttp + Conscrypt，TLS 握手里 ALPN 带 `h2`、
+之后走 h2 帧；而原来的 `ureq` 只能 HTTP/1.1，ALPN 里也只报 `http/1.1`。网关取一次
+JA3/JA4 + ALPN 就能把两类客户端分开，零误伤、零成本。
+
+**做法：在调用面之下换栈**，而不是改 35 个调用点。新增 `src/http.rs` 作为门面，对外保持
+`Agent` / `Request::set/call/send_string/send_bytes/send_form` /
+`Response::status/header/into_string/into_reader` / `Error::Status|Transport`，内部是 reqwest。
+这样 8 个文件的改动只是把 `ureq::` 换成 `crate::http::`。
+
+| 项 | 变化 |
+|---|---|
+| ALPN | 协商 `h2` / `http/1.1`（`http2` feature 打开后 rustls 自动带上） |
+| 协议 | 服务端支持时真正走 h2 帧 |
+| 压缩 | `Accept-Encoding: gzip` 并自动解压（OkHttp 默认就发这个头） |
+| 代理 | 保留 `socks5://` / `http://`（出口池依赖），非法代理串仍然报错而不是静默直连 |
+| 响应体 | **保持惰性**。一开始写成一次读全，`update` 的「先看 Content-Length 再决定要不要下」就失效了（测试直接抓到）；改成 `Body::Live` 流式后才与 ureq 语义一致 |
+| 桌面链接 | reqwest 的符号量让 MinGW 报 `export ordinal too large: 69390`。新增 `build.rs`，只在 `windows + gnu` 下加 `-Wl,--exclude-all-symbols`（只保留 .def 显式导出）；ELF/Android 不受影响 |
+
+**仍然不同（无法靠换 crate 解决）**：密码套件顺序仍是 rustls 而非 Conscrypt 的 BoringSSL，
+JA3 的 cipher 列表依旧对不上。要完全一致得换 BoringSSL 绑定，属另一量级工程。
+
+**验证**：231 passed；clippy 退出码 0；`--all-targets` 与 `--target aarch64-linux-android` 均通过；
+`cargo build`（桌面）通过；CLI 实跑 `update --check` 走通真实 TLS（GitHub API 支持 h2，
+返回"没有可用的发布资产"属正常 —— 该仓库没有 Release）。
+
+
+
 

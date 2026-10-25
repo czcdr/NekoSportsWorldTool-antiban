@@ -165,7 +165,11 @@ pub fn build(
     let mut steps_acc = 0.0f64;
     let mut jx = 0.0f64;
     let mut jy = 0.0f64;
-    let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
+    // 基准海拔按每次跑步抽一次：常量 82m 会让所有记录的 bdA 都围绕同一个值，
+    // 而真实海拔随城市/校区变化（同一片区域是几十米到几百米）。这里只做区间抽样，
+    // 不假装知道具体城市高程 —— 目的是消掉「所有账号海拔都是 82m」这个聚类特征。
+    let base_alt = rng.uniform(20.0, 260.0);
+    let mut alt = base_alt + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
     let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
     for i in 0..n {
@@ -229,7 +233,7 @@ pub fn build(
             dist_acc += d_step; // 异常点漂移不计入累计距离
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
+        alt += 0.04 * (base_alt - alt) + rng.gauss(0.0, alt_sigma);
         let v_now = dist / dur_f;
         let stride_target = 0.62
             + 0.17 * v_now

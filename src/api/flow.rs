@@ -350,6 +350,9 @@ pub fn run_full_flow_cancellable(
 
     // ⑤ 提交（sportType=1）
     control.begin_submit()?;
+    // 点位拉取与提交落在同一秒是纯机器节奏：真机「拉点位」发生在记录开始前后，
+    // 提交在跑完之后，两者不可能相隔零秒。这里给一段抖动，至少把它们拆开。
+    sleep_jitter(2500);
     log("[record] 提交跑步记录（已进入提交，不能撤回）…");
     let sp = SubmitParams {
         track,
@@ -523,3 +526,7 @@ mod verification_tests {
         assert_eq!(second.error.as_deref(), Some("offline"));
     }
 }
+
+#[cfg(test)]
+#[path = "fake_run_tests.rs"]
+mod fake_run_tests;
