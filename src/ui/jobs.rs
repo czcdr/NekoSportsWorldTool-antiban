@@ -61,6 +61,8 @@ impl App {
                         .ok();
                 };
                 let bytes = crate::update::download(&rel.asset_url, &mut report)?;
+                // 下载完先按 Release 元数据校验，再落盘/替换：内容不对就绝不写进程序目录。
+                crate::update::verify(&rel, &bytes)?;
                 #[cfg(target_os = "android")]
                 {
                     let path = crate::platform::data_dir().join(crate::update::APK_NAME);

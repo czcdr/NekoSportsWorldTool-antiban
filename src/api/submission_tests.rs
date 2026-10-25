@@ -104,7 +104,9 @@ fn server(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>)
                         .find_map(|line| {
                             let (key, value) = line.split_once(':')?;
                             key.eq_ignore_ascii_case("runef")
-                                .then(|| value.trim()[..36].to_string())
+                                // 按字符取前 36 位：header 值目前是 ASCII UUID，但按字节
+                                // 切片一旦遇到非 ASCII 就会 panic。
+                                .then(|| value.trim().chars().take(36).collect::<String>())
                         })
                         .unwrap();
                     paths.push(path);

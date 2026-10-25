@@ -25,7 +25,12 @@ pub fn make_agent_with_proxy(proxy_url: Option<&str>) -> ureq::Agent {
     if let Some(url) = proxy_url {
         match ureq::Proxy::new(url) {
             Ok(proxy) => builder = builder.proxy(proxy),
-            Err(error) => eprintln!("[net] 代理 {url} 配置无效，本次改为直连：{error}"),
+            // 代理地址可能带 user:pass，日志里只留打码后的地址。
+            Err(error) => eprintln!(
+                "[net] 代理 {} 配置无效，本次改为直连：{}",
+                crate::textlog::redact_url(url),
+                crate::textlog::redact_text(&error.to_string())
+            ),
         }
     }
     builder.build()
@@ -38,7 +43,10 @@ fn load_egress_from_disk() -> Option<crate::api::egress::EgressPool> {
         Ok(pool) if !pool.is_empty() => Some(pool),
         Ok(_) => None,
         Err(error) => {
-            eprintln!("[net] 出口配置被忽略（本次直连）：{error:?}");
+            eprintln!(
+                "[net] 出口配置被忽略（本次直连）：{}",
+                crate::textlog::redact_text(&format!("{error:?}"))
+            );
             None
         }
     }
@@ -114,8 +122,13 @@ impl ApiClient {
                 // 先验证代理串：配置写错时宁可报错，也不要"以为在走代理、其实直连"。
                 // 直连等于把真实 IP 直接交给服务端 —— 这比不配代理更糟，因为用户
                 // 以为自己已经被保护了。
-                ureq::Proxy::new(&entry.url)
-                    .map_err(|error| format!("出口 {} 的代理地址不可用：{error}", entry.url))?;
+                ureq::Proxy::new(&entry.url).map_err(|error| {
+                    format!(
+                        "出口 {} 的代理地址不可用：{}",
+                        crate::textlog::redact_url(&entry.url),
+                        crate::textlog::redact_text(&error.to_string())
+                    )
+                })?;
                 self.agent = make_agent_with_proxy(Some(&entry.url));
                 self.egress_entry = Some(entry.clone());
                 Ok(Some(entry))
@@ -303,9 +316,33 @@ impl ApiClient {
             }
         };
         let biz_str = serde_json::to_string(&crate::textlog::redact_json(&business)).unwrap_or_default();
-        eprintln!("[resp] {} -> {} ({}B) {}", path, out.http_status, out.raw_len, biz_str);
+        // 日志是排障用的，不是账号数据的第二份副本：默认只留一小段摘要。
+        // 名字、坐标、学号这类字段不在脱敏键表里，整段打印等于把它们写进
+        // 终端回滚区、截图和 CI 日志。需要完整报文时用 NSWT_LOG_VERBOSE=1 显式打开。
+        if log_verbose() {
+            eprintln!("[resp] {} -> {} ({}B) {}", path, out.http_status, out.raw_len, biz_str);
+        } else {
+            eprintln!(
+                "[resp] {} -> {} ({}B) {}",
+                path,
+                out.http_status,
+                out.raw_len,
+                crate::textlog::truncate(&biz_str, RESP_LOG_CHARS)
+            );
+        }
         Ok(business)
     }
+}
+
+/// 响应正文摘要的默认字符上限。
+const RESP_LOG_CHARS: usize = 200;
+
+/// 完整报文日志开关（默认关闭）。只认显式设置的值，避免误继承。
+fn log_verbose() -> bool {
+    matches!(
+        std::env::var("NSWT_LOG_VERBOSE").map(|v| v.trim().to_ascii_lowercase()),
+        Ok(v) if v == "1" || v == "true" || v == "yes"
+    )
 }
 
 /// 业务结果检查：error == 10000 → Ok(business)；否则 Err(描述)。
@@ -363,9 +400,21 @@ pub fn ureq_err(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
-            format!("HTTP {code}: {}", crate::textlog::truncate(&body, 300))
+            // 服务端错误体同样可能回带 token/手机号；能解析就按键打码，再按字符截断。
+            let safe = match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(json) => serde_json::to_string(&crate::textlog::redact_json(&json))
+                    .unwrap_or_else(|_| body.clone()),
+                Err(_) => body.clone(),
+            };
+            format!(
+                "HTTP {code}: {}",
+                crate::textlog::redact_text(&crate::textlog::truncate(&safe, 300))
+            )
         }
-        ureq::Error::Transport(t) => format!("网络错误: {t}"),
+        // Transport 的 Display 会把完整 URL 拼进去，带认证的代理地址会泄露口令。
+        ureq::Error::Transport(t) => {
+            format!("网络错误: {}", crate::textlog::redact_text(&t.to_string()))
+        }
     }
 }
 

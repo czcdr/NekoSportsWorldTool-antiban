@@ -142,15 +142,69 @@ fn exe_dir() -> std::path::PathBuf {
 
 fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
     let path = exe_dir().join(name);
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            // 静默回退默认值会让用户以为"账号/设置被重置了"。把坏文件留档再告警，
+            // 至少在控制台说清发生了什么、备份在哪里。
+            let bad = path.with_extension("json.corrupt");
+            let _ = std::fs::rename(&path, &bad);
+            eprintln!(
+                "[data] {name} 解析失败（{error}），已备份为 {} 并使用默认值",
+                bad.display()
+            );
+            None
+        }
+    }
 }
 
+/// 本程序的本地数据文件都含账号、口令或会话令牌，写入时只给当前用户读写。
 fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
     let path = exe_dir().join(name);
     let json =
         serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    write_secret_file(&path, json.as_bytes())
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+}
+
+/// 原子写：先写同目录临时文件并落盘，再 rename 覆盖。
+///
+/// 直接 `fs::write` 会在崩溃/断电时留下半截 JSON，而读取端只能解析失败；
+/// 凭据与身份文件一旦这样坏掉，用户看到的是"设置被清空"。
+/// Unix 上把权限收紧到 0600（默认 umask 往往给同机其他用户留了读权限）。
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("neko-data");
+    let tmp = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 已存在的临时文件可能带着旧权限，显式收紧一次。
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    };
+    let result = write();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 加载设备身份；device_id / app_install_time 缺失时生成一次并立即落盘，
@@ -469,6 +523,55 @@ mod storage_tests {
         clear_session();
         assert!(!directory.join("session.json").exists());
         assert_eq!(load_session().uid, 0);
+    }
+
+    #[test]
+    fn saved_data_is_atomic_private_and_corruption_is_quarantined() {
+        let directory = std::env::temp_dir().join(format!("neko-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+
+        let config = Config {
+            username: "alice".into(),
+            password: "s3cret".into(),
+            remember: true,
+            ..Config::default()
+        };
+        save_config(&config).unwrap();
+        let path = directory.join("config.json");
+        assert_eq!(load_config().password, "s3cret");
+        // 原子写不得留下临时文件（否则崩溃点上会有一份半截 JSON）
+        let leftovers: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "凭据文件必须仅当前用户可读写，实际 {mode:o}");
+        }
+
+        // 损坏的 JSON：回默认值，但原文件被留档而不是被静默丢弃
+        std::fs::write(&path, "{ 这不是 JSON").unwrap();
+        let recovered = load_config();
+        assert!(recovered.password.is_empty());
+        assert!(
+            directory.join("config.json.corrupt").is_file(),
+            "解析失败的文件必须另存留证"
+        );
+        assert!(!path.exists(), "坏文件应被移走");
     }
 }
 

@@ -18,8 +18,9 @@ fn usage() {
     println!(
         r#"NekoSportsWorldTool CLI（full 构建无参数启动 GUI）
 
-  login   --user <手机号> --pass <密码> [--remember]
-                                           登录并保存会话；--remember 同时保存凭据供自动重登
+  login   --user <手机号> --pass <密码|-> [--remember]
+                                           登录并保存会话；--pass - 从标准输入读密码（避免留在 shell 历史与进程列表）
+                                           --remember 同时保存凭据供自动重登；也可用环境变量 NSWT_PASS
   logout                                   登出并清理本地会话
   run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）

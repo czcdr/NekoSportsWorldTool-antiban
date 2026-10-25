@@ -118,11 +118,14 @@ impl EgressPool {
             if !matches!(scheme, "socks5" | "socks5h" | "http" | "https") {
                 return Err(PoolError::Config(format!(
                     "不支持的代理协议 {scheme:?}（{}），只支持 socks5/http",
-                    entry.url
+                    crate::textlog::redact_url(&entry.url)
                 )));
             }
             if entry.url.contains(char::is_whitespace) {
-                return Err(PoolError::Config(format!("代理地址含空白字符: {:?}", entry.url)));
+                return Err(PoolError::Config(format!(
+                    "代理地址含空白字符: {}",
+                    crate::textlog::redact_url(&entry.url)
+                )));
             }
         }
         let key = pool_key(&entries);

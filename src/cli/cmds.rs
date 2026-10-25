@@ -44,21 +44,30 @@ fn usage() {
 
 fn cmd_login(rest: &[&str]) -> i32 {
     let flags = parse_flags(rest);
-    let (Some(user), Some(pw)) = (get(&flags, "user"), get(&flags, "pass")) else {
-        eprintln!("缺少 --user / --pass");
+    let Some(user) = get(&flags, "user") else {
+        eprintln!("缺少 --user");
+        return 1;
+    };
+    let Some(pw) = read_password(&flags) else {
+        eprintln!("缺少 --pass：可直接给值，或用 `--pass -` 从标准输入读取，或设置环境变量 NSWT_PASS");
         return 1;
     };
     let identity = model::load_identity();
     let mut client = ApiClient::new(identity, None);
     let mut log = logger();
-    match crate::api::login::login(&mut client, user, pw, &mut log) {
+    match crate::api::login::login(&mut client, user, &pw, &mut log) {
         Ok(s) => {
             if get(&flags, "remember").is_some() {
                 let mut cfg = model::load_config();
                 cfg.username = user.to_string();
-                cfg.password = pw.to_string();
+                cfg.password = pw.clone();
                 cfg.remember = true;
-                let _ = model::save_config(&cfg);
+                // 保存失败必须报出来：磁盘满/只读目录下说"已保存"是谎报，
+                // 用户下次定时任务会以"未登录"失败，却找不到原因。
+                if let Err(e) = model::save_config(&cfg) {
+                    eprintln!("× 登录成功，但凭据未能保存：{e}（本次会话有效，下次需重新登录）");
+                    return 1;
+                }
                 println!("凭据已保存（会话失效时自动重登）");
             }
             println!("登录成功 uid={} unid={} name={}", s.uid, s.unid, s.name);
@@ -69,6 +78,29 @@ fn cmd_login(rest: &[&str]) -> i32 {
             1
         }
     }
+}
+
+/// 取登录口令。
+///
+/// `--pass <值>` 会进 shell 历史、进程列表（`ps` 对所有用户可见）和计划任务日志，
+/// 所以额外支持 `--pass -` 从标准输入读一行，以及 `NSWT_PASS` 环境变量
+/// （青龙这类改不了参数的调度场景兜底）。优先级：`--pass` > `NSWT_PASS`。
+fn read_password(flags: &[(String, String)]) -> Option<String> {
+    if let Some(value) = get(flags, "pass") {
+        if value == "-" {
+            use std::io::Write;
+            eprint!("密码（从标准输入读取，输入内容会回显在终端）：");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            return match std::io::stdin().read_line(&mut line) {
+                Ok(0) => None,
+                Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+                Err(_) => None,
+            };
+        }
+        return Some(value.to_string());
+    }
+    std::env::var("NSWT_PASS").ok().filter(|v| !v.is_empty())
 }
 
 fn cmd_logout() -> i32 {
@@ -340,24 +372,23 @@ fn cmd_records_raw(rest: &[&str]) -> i32 {
             let n = arr.len();
             println!("条数: {n}");
             if let Some(out) = get(&flags, "out") {
-                std::fs::write(out, serde_json::to_string_pretty(&arr).unwrap_or_default())
-                    .map_err(|e| eprintln!("写入失败: {e}"))
-                    .ok();
+                let text = match serde_json::to_string_pretty(&arr) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("× 序列化失败: {e}");
+                        return 1;
+                    }
+                };
+                if let Err(e) = std::fs::write(out, text) {
+                    eprintln!("× 写入 {out} 失败: {e}");
+                    return 1;
+                }
                 println!("已保存 {out}");
             } else if n > 0 {
-                println!(
-                    "首条: {}",
-                    &arr[0].to_string()[..arr[0].to_string().len().min(300)]
-                );
-                println!(
-                    "末条: {}",
-                    &arr[n - 1].to_string()[..arr[n - 1].to_string().len().min(300)]
-                );
+                println!("首条: {}", preview(&arr[0], 300));
+                println!("末条: {}", preview(&arr[n - 1], 300));
             } else {
-                println!(
-                    "data: {}",
-                    data.to_string()[..data.to_string().len().min(500)].to_string()
-                );
+                println!("data: {}", preview(&data, 500));
             }
             0
         }
@@ -388,12 +419,17 @@ fn cmd_obs_get(rest: &[&str]) -> i32 {
             let out = get(&flags, "out").unwrap_or("obs_real.json");
             // 解码 gzip+base64 值便于直接阅读
             let decoded = decode_gz_fields(&v);
-            std::fs::write(
-                out,
-                serde_json::to_string_pretty(&decoded).unwrap_or_default(),
-            )
-            .map_err(|e| eprintln!("写入失败: {e}"))
-            .ok();
+            let text = match serde_json::to_string_pretty(&decoded) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("× 序列化失败: {e}");
+                    return 1;
+                }
+            };
+            if let Err(e) = std::fs::write(out, text) {
+                eprintln!("× 写入 {out} 失败: {e}");
+                return 1;
+            }
             println!("已保存 {out}");
             0
         }
@@ -491,12 +527,17 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
     );
     let out = get(&flags, "out").unwrap_or("obs_ours.json");
     let decoded = decode_gz_fields(&obj);
-    std::fs::write(
-        out,
-        serde_json::to_string_pretty(&decoded).unwrap_or_default(),
-    )
-    .map_err(|e| eprintln!("写入失败: {e}"))
-    .ok();
+    let text = match serde_json::to_string_pretty(&decoded) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("× 序列化失败: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = std::fs::write(out, text) {
+        eprintln!("× 写入 {out} 失败: {e}");
+        return 1;
+    }
     println!("已保存 {out}");
     0
 }
@@ -772,7 +813,11 @@ fn cmd_update(rest: &[&str]) -> i32 {
                 return 1;
             }
         };
-        println!("下载完成（{} 字节），解包替换…", bytes.len());
+        println!("下载完成（{} 字节），校验完整性…", bytes.len());
+        if let Err(e) = crate::update::verify(&rel, &bytes) {
+            println!("× {e}");
+            return 1;
+        }
         let bin = match crate::update::extract(&rel.asset_name, &bytes) {
             Ok(b) => b,
             Err(e) => {
@@ -790,5 +835,35 @@ fn cmd_update(rest: &[&str]) -> i32 {
                 1
             }
         }
+    }
+}
+
+/// 控制台预览：按**字符**截断。按字节切片会在多字节字符中间截断并 panic
+/// （服务端一旦返回中文或 emoji 就会触发，且发生在"只是看一眼"的调试命令里）。
+fn preview(value: &serde_json::Value, chars: usize) -> String {
+    crate::textlog::truncate(&value.to_string(), chars)
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn preview_truncates_multibyte_payloads_without_panicking() {
+        let value = json!({"name": "张三".repeat(200), "emoji": "🏃".repeat(50)});
+        for chars in [0usize, 1, 3, 300, 5000] {
+            let out = preview(&value, chars);
+            assert!(
+                out.chars().count() <= chars,
+                "chars={chars} 时越界：{}",
+                out.chars().count()
+            );
+        }
+        // 旧实现按 300 字节切中文串必然 panic；现在按字符切。
+        let text = json!("校".repeat(400));
+        let out = preview(&text, 300);
+        assert_eq!(out.chars().count(), 300);
+        assert!(out.starts_with('"'));
     }
 }

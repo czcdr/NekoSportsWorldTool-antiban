@@ -49,6 +49,55 @@ pub fn mask(v: &str) -> String {
     format!("{head}****{tail}")
 }
 
+/// 把 URL 里的 userinfo（`user:pass@`）替换为 `***`，其余部分原样保留。
+///
+/// 出口代理地址常带认证段（`socks5://user:pass@host:port`），任何把它打印到
+/// 日志/错误框的路径都等于把代理口令写进终端历史与截图。
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest_start = scheme_end + 3;
+    let rest = &url[rest_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..rest_start]);
+    out.push_str("***@");
+    out.push_str(&authority[at + 1..]);
+    out.push_str(&rest[authority_end..]);
+    out
+}
+
+/// 在一段任意文本里把内嵌 URL 的凭据打码（网络错误信息常把完整 URL 拼进去）。
+pub fn redact_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(pos) = rest.find("://") else {
+            out.push_str(rest);
+            break;
+        };
+        // 回溯到 scheme 起点：把前面连续的 scheme 字符（字母数字/+-.）算进来。
+        let scheme_start = rest[..pos]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        out.push_str(&rest[..scheme_start]);
+        let tail = &rest[scheme_start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>'))
+            .unwrap_or(tail.len());
+        let candidate = &tail[..end];
+        out.push_str(&redact_url(candidate));
+        rest = &tail[end..];
+    }
+    out
+}
+
 /// 递归掩码敏感键的字符串值，键名忽略大小写；保留原业务数据。
 pub fn redact_json(v: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
@@ -148,5 +197,40 @@ mod tests {
             assert!(out.chars().count() <= n.max(0));
         }
         assert_eq!(truncate("中文abc", 4), "中文ab");
+    }
+
+    #[test]
+    fn test_redact_url_drops_userinfo() {
+        assert_eq!(
+            redact_url("socks5://alice:s3cret@10.0.0.1:1080"),
+            "socks5://***@10.0.0.1:1080"
+        );
+        assert_eq!(
+            redact_url("http://alice:s3cret@proxy.local:3128/path?x=1"),
+            "http://***@proxy.local:3128/path?x=1"
+        );
+        // 无凭据、无 scheme、超长嵌套 @ 的分支
+        assert_eq!(redact_url("socks5://10.0.0.1:1080"), "socks5://10.0.0.1:1080");
+        assert_eq!(redact_url("10.0.0.1:1080"), "10.0.0.1:1080");
+        assert_eq!(redact_url("http://a@b@c:1080"), "http://***@c:1080");
+        assert_eq!(redact_url("http://@host"), "http://***@host");
+    }
+
+    #[test]
+    fn test_redact_text_masks_embedded_credentials() {
+        let raw = "网络错误: http://alice:s3cret@proxy.local:3128/ (proxy) 拒绝连接";
+        let out = redact_text(raw);
+        assert!(!out.contains("s3cret"), "代理口令必须被打码：{out}");
+        assert!(out.contains("http://***@proxy.local:3128/"));
+        assert!(out.contains("拒绝连接"));
+        // 普通文本与无凭据 URL 保持不变
+        assert_eq!(redact_text("普通错误信息"), "普通错误信息");
+        assert_eq!(
+            redact_text("下载 https://example.test/a.apk 失败"),
+            "下载 https://example.test/a.apk 失败"
+        );
+        // 多个 URL 的文本全部处理
+        let two = redact_text("a http://u:p@h1/ b http://u:p@h2/");
+        assert!(!two.contains("u:p"), "{two}");
     }
 }
