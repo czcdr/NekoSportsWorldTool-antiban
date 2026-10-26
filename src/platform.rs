@@ -57,7 +57,10 @@ fn desktop_data_dir() -> std::path::PathBuf {
             // 连用户目录都建不出来（无 HOME 的精简容器）：退回旧行为。
             return exe;
         }
-        migrate_legacy_data(&exe, &target);
+        // 搬运只在**进程内第一次**走：`data_dir()` 是热路径（每条配置/状态读写都会调），
+        // 每次重新扫 exe 目录既费 IO，又意味着「谁往安装目录丢一个 json，下次就被搬走」。
+        static MIGRATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        MIGRATED.get_or_init(|| migrate_legacy_data(&exe, &target));
         target
     }
 }
@@ -97,38 +100,38 @@ fn user_data_root() -> Option<std::path::PathBuf> {
 /// 不搬 `identity.json` 的代价最大：它一丢，`device_id` 重新生成，服务端会把
 /// 同一部手机当成新设备（10121 风控）。所以这里按「缺什么补什么」复制，
 /// 且不删除原文件（回退旧版本仍能用）。
+///
+/// 只搬**本程序自己的**数据文件（白名单）：安装目录里放着的其它 json（用户自己的
+/// 配置、测试夹具、别的工具的数据）一律不碰 —— 之前按 `*.json` 通配搬，
+/// 只要有人往安装目录丢一个 json，下次启动就被复制进用户数据目录。
 #[cfg(not(any(windows, target_os = "android")))]
 fn migrate_legacy_data(from: &std::path::Path, to: &std::path::Path) {
     if from == to {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let source = entry.path();
-        let Some(name) = source.file_name() else {
-            continue;
-        };
-        // 只搬本程序的数据文件，别把整个安装目录复制一遍。
-        let is_data = source
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("json"))
-            .unwrap_or(false)
-            || name == "school_roads";
-        if !is_data {
-            continue;
-        }
+    const DATA_FILES: &[&str] = &[
+        "config.json",
+        "session.json",
+        "identity.json",
+        "proxies.json",
+        "points_cache.json",
+        "ai_sports.json",
+        "captcha_state.json",
+        "update_pins.json",
+    ];
+    for name in DATA_FILES {
+        let source = from.join(name);
         let target = to.join(name);
-        if target.exists() {
+        if !source.is_file() || target.exists() {
             continue;
         }
-        if source.is_dir() {
-            let _ = copy_tree(&source, &target);
-        } else {
-            let _ = std::fs::copy(&source, &target);
-        }
+        let _ = std::fs::copy(&source, &target);
+    }
+    // 学校路网缓存是目录
+    let source = from.join("school_roads");
+    let target = to.join("school_roads");
+    if source.is_dir() && !target.exists() {
+        let _ = copy_tree(&source, &target);
     }
 }
 
