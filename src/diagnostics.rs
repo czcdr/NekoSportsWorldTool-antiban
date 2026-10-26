@@ -31,6 +31,8 @@ pub fn report(
     serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
  "error_category":category(status),"road_status_category":category(road_status),"road_source":if manual{"manual"}else{"school"},
  "offline_preview":offline,"road_nodes":nodes,"road_edges":edges,"saved_maps":cache_count,
+ // TLS 客户端参数（构建期常量，不含随机值/设备标识）：用来确认握手配置是否真的生效。
+ "tls_fingerprint":crate::tls::describe(),
  "privacy":"不含账号、姓名、Token、设备标识、原始日志/响应、文件路径、学校编号或轨迹坐标"})
 }
 #[cfg(test)]

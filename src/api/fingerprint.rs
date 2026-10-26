@@ -85,7 +85,9 @@ pub const MODELS: &[ModelProfile] = &[
     // vivo X100 Pro（V2324A）：2800x1260
     ModelProfile { device_name: "V2324A", logical: (1260, 2800), dpi: 453, os_versions: &["14"], brand: "vivo", weight: 2 },
 
-    // ── 华为 / 荣耀 ────────────────────────────────────────────────
+    // ── 华为 ──────────────────────────────────────────────────────
+    // （荣耀没有收录：独立后的机型代号规则与华为不同，手上没有可双向核对的样本，
+    //   按本文件的口径「宁可少收录」不猜）
     // Huawei Mate 60 Pro（ALN-AL80）：2720x1260
     ModelProfile { device_name: "ALN-AL80", logical: (1260, 2720), dpi: 460, os_versions: &["12", "13"], brand: "HUAWEI", weight: 3 },
     // Huawei Mate 40 Pro（NOH-AN00）：2772x1344

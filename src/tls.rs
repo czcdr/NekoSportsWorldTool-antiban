@@ -113,7 +113,8 @@ pub fn client_config() -> Result<rustls::ClientConfig, String> {
     Ok(config)
 }
 
-/// 指纹的一行摘要（日志 / 设备页自检用）。只描述本模块**真的设置过**的东西。
+/// 指纹的一行摘要（诊断导出用：`ui::road_tools` 导出诊断文件时带上）。
+/// 只描述本模块**真的设置过**的东西，且全部是构建期常量，不含随机值或设备标识。
 pub fn describe() -> String {
     let ciphers = CONSCRYPT_CIPHER_ORDER.len();
     let groups: Vec<String> = CONSCRYPT_GROUP_ORDER
