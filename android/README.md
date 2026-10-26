@@ -23,7 +23,7 @@ Android 移植保留 Rust 业务逻辑、桌面 GUI/CLI 与七个功能页面。
 ./android/release.ps1 -AndroidRev 5 -Repo YanamiNeko/NekoSportsWorldTool -Notes "..."
 ```
 
-脚本会读 Cargo.toml 版本、盖章 AndroidManifest（versionName=`<版本>-android.<N>`）、构建 arm64 并以固定资产名 `NekoSportsWorldTool-android-arm64.apk` 上传。**必须一直用同一个签名密钥**（`android/.signing/local-test.keystore`）：签名变化后手机无法覆盖安装，卸载重装还会丢 identity/session。
+脚本会读 Cargo.toml 版本、盖章 AndroidManifest（versionName=`<版本>-android.<N>`）、构建 arm64 并以固定资产名 `NekoSportsWorldTool-android-arm64.apk` 上传。**必须一直用同一把发布密钥**（`android/make-signing-key.ps1` 生成，放在仓库外）：签名变化后手机无法覆盖安装，卸载重装还会丢 identity/session。`release.ps1` 会拒绝发布 `CN=Android Debug` 签名的包。
 
 ## CI 自动构建（`.github/workflows/apk.yml`）
 
@@ -74,7 +74,7 @@ SDK 默认使用 `ANDROID_HOME`，未设置时使用 `%LOCALAPPDATA%\Android\Sdk
 
 脚本执行 Rust 编译、Java/Dex 编译、资源打包、ELF 16 KB 对齐检查、zipalign 和 APK 签名验证。最终 APK 放回 `android/build/`。
 
-首次构建生成 `android/.signing/local-test.keystore`，仅用于本地测试，不是应用商店发布密钥。该文件和构建产物已被 Git 忽略；保留密钥才能覆盖安装此前由它签名的版本。
+首次构建会在 `android/.signing/local-test.keystore` 生成调试密钥，仅用于冒烟安装，**不是发布密钥**。正式发布请用 `android/make-signing-key.ps1` 生成密钥，并通过 `NSWT_ANDROID_KEYSTORE` / `NSWT_ANDROID_KEYSTORE_PASSWORD` / `NSWT_ANDROID_KEY_ALIAS` / `NSWT_ANDROID_KEY_PASSWORD` 指定；该目录和构建产物已被 Git 忽略。
 
 ## 离线验证
 
