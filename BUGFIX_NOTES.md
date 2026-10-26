@@ -110,5 +110,6 @@ Android 沿用 `android/README.md` 中的构建与 smoke 测试流程，需要 J
 2. **Android 发布密钥从调试证书换成专用密钥**：`android/make-signing-key.ps1` 生成 RSA 4096 + 随机强口令；CI 缺任一 Secret 即失败，签完断言证书不是 `CN=Android Debug` 且指纹等于仓库变量 `ANDROID_CERT_SHA256`；本地 `release.ps1` 拒绝发布 debug 签名的包。**代价**：0.4.1 及更早版本无法覆盖安装到 0.5.0，需卸载重装一次（`identity.json` / `session.json` 会清空）。
 3. **桌面产物补齐可验证性**：Release 附带分平台的校验和（`SHA256SUMS-android.txt` / `SHA256SUMS-desktop.txt`）与 GitHub 构建来源证明（`gh attestation verify`）。Authenticode / Apple 公证仍未做（需要证书），Release 说明里明确写出这一残余风险。
 4. **行尾**：新增 `.gitattributes`（`* text=auto eol=lf`，`.ps1/.bat/.cmd` 检出 CRLF，二进制显式标记），并 `git add --renormalize`；Windows 工作区 `git status` 不再整树报"已修改"。
+5. **`android/release.ps1` 解析失败**：双引号里用 `\"` 转义（PowerShell 不认，那是 cmd 的写法）导致整个脚本语法错误，Windows 手工发版链路此前从未真正可用；改用 `-f` 拼接，并在 apk.yml 增加所有 `.ps1` 的语法预检。
 
 未变：服务端禁跑/覆盖提交/`freezeRunTime` 归零仍未验证（无账号、未发业务请求）。

@@ -56,9 +56,12 @@ Write-Output "版本：$versionName（versionCode $versionCode，基线 $base）
 
 # ── 盖章 AndroidManifest ─────────────────────────────────────
 $manifestText = Get-Content $manifest -Raw
-$updated = $manifestText -replace 'android:versionCode="\d+"', "android:versionCode=\"$versionCode\""
-$updated = $updated -replace 'android:versionName="[^"]*"', "android:versionName=\"$versionName\""
-if ($updated -eq $manifestText -and $manifestText -notmatch [regex]::Escape("android:versionName=\"$versionName\"")) {
+# 双引号里的 `\"` 不是 PowerShell 的转义（那是 cmd/原生命令的写法），
+# 原稿这两行会直接把字符串截断导致整个脚本解析失败。用 -f 拼，别用反斜杠转义。
+$updated = $manifestText -replace 'android:versionCode="\d+"', ('android:versionCode="{0}"' -f $versionCode)
+$updated = $updated -replace 'android:versionName="[^"]*"', ('android:versionName="{0}"' -f $versionName)
+$stamped = 'android:versionName="{0}"' -f $versionName
+if ($updated -eq $manifestText -and $manifestText -notmatch [regex]::Escape($stamped)) {
     throw 'AndroidManifest.xml 盖章失败（未匹配到 versionCode/versionName）'
 }
 [IO.File]::WriteAllText($manifest, $updated)
