@@ -1,0 +1,37 @@
+# 行尾与二进制属性
+#
+# 目的：仓库此前没有 .gitattributes，工作区整树是 CRLF、索引是 LF，导致
+# `git status` 常年把 200+ 个文件报成"已修改"（内容 diff 为 0），真正的改动
+# 淹没在噪声里。统一为：索引/仓库一律 LF，Windows 脚本按 CRLF 检出。
+* text=auto eol=lf
+
+# Windows 工具链文件保持 CRLF（PowerShell 5.1 与 cmd 都能读 LF，但保持原生习惯）。
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制：禁止行尾转换与文本 diff。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.apk binary
+*.aab binary
+*.idsig binary
+*.keystore binary
+*.jks binary
+*.zip binary
+*.gz binary
+*.7z binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pdf binary
+*.pyc binary
