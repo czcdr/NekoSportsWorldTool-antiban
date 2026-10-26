@@ -85,6 +85,11 @@ pub struct RunPage {
     pub hour: i64,
     pub minute: i64,
     pub face_check: bool,
+    /// 本页参数有待落盘（`RunSettings` 快照变化后置真，写完清零）。
+    ///
+    /// 这些控件原来只在「开始跑步」时写 config.json：勾了 faceCheck 却直接退出，
+    /// 重启就回到默认值。现在改动即标记，松手/输入提交后立刻落盘。
+    pub settings_dirty: bool,
     /// 预计算方案：参数变更时重抽样，提交直接使用
     pub plan: Option<RunPlan>,
     /// 路线算法模式
@@ -107,6 +112,66 @@ pub struct RunPage {
     pub map_fitted: bool,
     /// Request whose WGS84 base map currently owns the viewport; None means BD09 preview.
     pub base_map_request: Option<u64>,
+}
+
+/// 跑步页里会持久化进 `config.json` 的那部分参数。
+///
+/// 这些控件原先只在「开始跑步」时才写盘：勾了 faceCheck 不提交直接退出，
+/// 下次启动仍是默认值（用户实测复现）。改为每帧比对快照，真正变化就标脏，
+/// 松手或输入提交后立刻落盘——Android 的数字/文本输入走原生对话框，
+/// 拿不到 `Response::changed()`，所以只能靠快照比对。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunSettings {
+    pub dist_min: f32,
+    pub dist_max: f32,
+    pub pace_min: f32,
+    pub pace_max: f32,
+    pub face_check: bool,
+    pub route_mode: RouteMode,
+    pub manual_altitude: String,
+}
+
+impl RunSettings {
+    pub fn from_page(page: &RunPage) -> Self {
+        Self {
+            dist_min: page.dist_min,
+            dist_max: page.dist_max,
+            pace_min: page.pace_min,
+            pace_max: page.pace_max,
+            face_check: page.face_check,
+            route_mode: page.route_mode,
+            manual_altitude: page.manual_altitude.clone(),
+        }
+    }
+
+    /// 写进配置。手动海拔解析失败时其余字段照写、海拔保留原值并回传错误，
+    /// 避免「填错一个字符 → 整页设置都没保存」。
+    pub fn apply_to(&self, config: &mut crate::api::model::Config) -> Result<(), String> {
+        config.dist_min = self.dist_min;
+        config.dist_max = self.dist_max;
+        config.pace_min = self.pace_min;
+        config.pace_max = self.pace_max;
+        config.face_check = self.face_check;
+        config.route_mode = self.route_mode.as_str().into();
+        match crate::track::altitude::parse_spec(&self.manual_altitude) {
+            Ok(None) => {
+                config.manual_altitude = None;
+                config.manual_altitude_range = None;
+                Ok(())
+            }
+            Ok(Some(crate::track::altitude::AltitudeSpec::Single(value))) => {
+                config.manual_altitude = Some(value);
+                config.manual_altitude_range = None;
+                Ok(())
+            }
+            Ok(Some(crate::track::altitude::AltitudeSpec::Range(range))) => {
+                config.manual_altitude = None;
+                config.manual_altitude_range = Some(range);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// 一次提交的确定方案（进入页面/参数变更时抽样生成）。
@@ -288,6 +353,8 @@ impl App {
 
     fn draw_run_content(&mut self, ui: &mut egui::Ui) {
         let prev_route = self.run_page.route_mode;
+        // 进入本帧前的参数快照：画完比对，变了就标脏（见 draw_run_content 末尾）。
+        let settings_before = RunSettings::from_page(&self.run_page);
         {
             let page = &mut self.run_page;
             let compact = mobile::compact_ui(ui);
@@ -493,6 +560,28 @@ impl App {
                 ui.label("（请先登录）");
             }
         });
+
+        // 改动即落盘：拖拽期间指针仍按着，先标脏；松手/输入提交后写一次。
+        // 不再依赖「开始跑步」——那正是 faceCheck 勾了却丢失的原因。
+        if RunSettings::from_page(&self.run_page) != settings_before {
+            self.run_page.settings_dirty = true;
+        }
+        if self.run_page.settings_dirty && !ui.ctx().is_using_pointer() {
+            self.persist_run_settings();
+        }
+    }
+
+    /// 把跑步页参数写进 config.json；写盘失败与海拔格式错误都走状态栏。
+    fn persist_run_settings(&mut self) {
+        let settings = RunSettings::from_page(&self.run_page);
+        let outcome = settings.apply_to(&mut self.config);
+        // 失败也清脏：否则磁盘满/目录只读时每帧重试，界面卡在报错上。
+        self.run_page.settings_dirty = false;
+        if let Err(e) = crate::ui::save_config(&self.config) {
+            self.status = e;
+        } else if let Err(e) = outcome {
+            self.status = e;
+        }
     }
 
     /// 开始时间相关的提示。须在 `ensure_plan()` 之后调用，才对得上本次提交时刻。
@@ -1032,6 +1121,70 @@ mod tests {
     fn assert_start_not_future(p: &RunPlan) {
         let now = crate::crypto::envelope::now_ms();
         assert!(p.start_ms <= now, "开始时刻 {} 落在未来", p.start_ms);
+    }
+
+    /// 用户实测：勾了 faceCheck 但没点「开始跑步」就退出，重启后又变回默认。
+    /// 现在页面参数有独立快照，改动即写盘，与提交解耦。
+    #[test]
+    fn run_settings_persist_without_submitting() {
+        let mut p = page(0, 0);
+        let mut config = crate::api::model::Config::default();
+        // Config::default 里 face_check=true，先翻掉才能证明是被页面写回来的。
+        config.face_check = false;
+        config.route_mode = "legacy".into();
+
+        p.face_check = true;
+        p.route_mode = RouteMode::Road;
+        p.dist_min = 3.0;
+        p.pace_max = 400.0;
+        p.manual_altitude = "17.2".into();
+        RunSettings::from_page(&p).apply_to(&mut config).unwrap();
+
+        assert!(config.face_check, "faceCheck 没写进配置");
+        assert_eq!(config.route_mode, "road");
+        assert_eq!(config.dist_min, 3.0);
+        assert_eq!(config.pace_max, 400.0);
+        assert_eq!(config.manual_altitude, Some(17.2));
+        assert!(config.manual_altitude_range.is_none());
+    }
+
+    /// 快照只认这几个字段：换方案（距离/时刻）不算参数变化，不该触发写盘。
+    #[test]
+    fn run_settings_snapshot_ignores_plan_state() {
+        let mut a = page(0, 0);
+        a.ensure_plan();
+        let mut b = page(0, 0);
+        b.plan = None;
+        assert_eq!(RunSettings::from_page(&a), RunSettings::from_page(&b));
+
+        b.face_check = !a.face_check;
+        assert_ne!(RunSettings::from_page(&a), RunSettings::from_page(&b));
+    }
+
+    /// 海拔三种写法：单值、区间、留空清除；写错时保留原值但仍写其余字段。
+    #[test]
+    fn run_settings_manual_altitude_forms() {
+        let mut p = page(0, 0);
+        let mut config = crate::api::model::Config::default();
+
+        p.manual_altitude = "11.6-22.8".into();
+        RunSettings::from_page(&p).apply_to(&mut config).unwrap();
+        assert!(config.manual_altitude.is_none());
+        let range = config.manual_altitude_range.expect("区间海拔未写入");
+        assert_eq!((range.min_m, range.max_m), (11.6, 22.8));
+
+        p.manual_altitude = String::new();
+        RunSettings::from_page(&p).apply_to(&mut config).unwrap();
+        assert!(config.manual_altitude.is_none());
+        assert!(config.manual_altitude_range.is_none(), "留空未清除海拔区间");
+
+        config.manual_altitude = Some(12.0);
+        p.manual_altitude = "abc".into();
+        p.face_check = true;
+        let error = RunSettings::from_page(&p).apply_to(&mut config);
+        assert!(error.is_err(), "非法海拔应回传错误");
+        assert_eq!(config.manual_altitude, Some(12.0), "非法输入覆盖了原海拔");
+        assert!(config.face_check, "海拔写错连带其它字段没保存");
     }
 
     /// 随机模式：整段跑步（含 flow.rs 的 0-4s 抖动）都不得越过当前时刻。
