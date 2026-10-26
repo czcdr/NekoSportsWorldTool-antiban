@@ -15,6 +15,11 @@ import android.widget.FrameLayout;
 /** Android UI thread owns the real text editor; Rust owns application state. */
 public final class MainActivity extends NativeActivity {
     static { System.loadLibrary("nekosportsworldtool"); }
+    /** verifyUpdatePackage 的哨兵返回值：签名与已安装版本不一致（需要卸载重装）。 */
+    private static final String UPDATE_SIGNER_MISMATCH = "SIGNER_MISMATCH";
+    /** 与 Rust 侧 src/update.rs 的 REPO_OWN 保持一致（自更新下载源）。 */
+    private static final String RELEASES_URL =
+        "https://github.com/czcdr/NekoSportsWorldTool-antiban/releases/latest";
     private AlertDialog editorDialog;
     private AlertDialog deviceInfoDialog;
     private boolean taskActive;
@@ -201,6 +206,14 @@ public final class MainActivity extends NativeActivity {
                 // 而摘要缺失/接口异常时 Rust 侧的 fail-open 分支曾经放行过未校验的包。
                 String problem = verifyUpdatePackage(apk);
                 if (problem != null) {
+                    // 签名不一致要说清"为什么装不上、接下来怎么做"。旧逻辑只提示
+                    // "校验失败，请重新下载"，换钥之后会变成下载→失败→再下载的死循环。
+                    if (UPDATE_SIGNER_MISMATCH.equals(problem)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        apk.delete();
+                        showSignatureChangedDialog();
+                        return;
+                    }
                     android.widget.Toast.makeText(this,
                         "更新包校验失败：" + problem + "（已删除，请重新下载）",
                         android.widget.Toast.LENGTH_LONG).show();
@@ -222,8 +235,7 @@ public final class MainActivity extends NativeActivity {
     }
 
     /** 校验待安装包：包名一致、签名一致、versionCode 不低于当前。返回 null 表示通过。 */
-    private String verifyUpdatePackage(java.io.File apk) {
-        android.content.pm.PackageManager pm = getPackageManager();
+    private String verifyUpdatePackage(java.io.File apk) {        android.content.pm.PackageManager pm = getPackageManager();
         int flags = android.os.Build.VERSION.SDK_INT >= 28
             ? android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
             : android.content.pm.PackageManager.GET_SIGNATURES;
@@ -248,9 +260,37 @@ public final class MainActivity extends NativeActivity {
             return "版本号低于已安装版本（" + incoming + " < " + current + "）";
         }
         if (!sameSigner(archive, installed)) {
-            return "签名与已安装版本不一致，系统会拒绝覆盖安装";
+            return UPDATE_SIGNER_MISMATCH;
         }
         return null;
+    }
+
+    /**
+     * 签名不一致：不是"文件坏了"，而是这个更新包与已安装版本不是同一把钥匙签的
+     * （换钥发布，或有人塞了伪造包）。系统必然拒绝覆盖安装，必须换一条路径。
+     */
+    private void showSignatureChangedDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+            .setTitle("需要先卸载旧版")
+            .setMessage(
+                "这次更新换了 Android 签名密钥，系统不允许直接覆盖安装。\n\n"
+                    + "请按顺序操作：\n"
+                    + "1. 点「打开下载页」，把新版 APK 下载到手机的“下载”目录；\n"
+                    + "2. 在系统设置里卸载本应用；\n"
+                    + "3. 从“下载”目录安装刚下载的 APK。\n\n"
+                    + "卸载会删除本地保存的账号与会话，需要重新登录。")
+            .setPositiveButton("知道了", null)
+            .setNegativeButton("打开下载页", (dialog, which) -> {
+                try {
+                    startActivity(new android.content.Intent(
+                        android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse(RELEASES_URL)));
+                } catch (Exception ignored) {
+                    // 没有浏览器时保持对话框关闭即可，用户可自行访问 Release 页。
+                }
+            })
+            .show();
     }
 
     private static boolean sameSigner(

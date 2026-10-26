@@ -32,10 +32,24 @@ Android 移植保留 Rust 业务逻辑、桌面 GUI/CLI 与七个功能页面。
 - **main / 手动触发**：仅产出 Actions 构建产物（不发布），用于验证 Android 链路可编译；无签名 Secret 时用一次性调试密钥，仅供冒烟安装。
 - **tag 触发**（如 `v0.2.6` 或 `v0.2.6-android.2`）：自动盖章版本（以 tag 为准，`<版本>-android.<rev>`，versionCode 编码与 release.ps1 相同），并把 `NekoSportsWorldTool-android-arm64.apk` 挂到该 tag 的 Release——Android 端自更新按此资产名精确匹配。
 
-**发布前必须配置仓库 Secret `ANDROID_KEYSTORE_BASE64`**（签名 keystore 文件的 base64，建议直接用 `android/.signing/local-test.keystore` 以保持与历史 APK 签名连续；可选 `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`，默认 `android` / `androiddebugkey` / `android`）。tag 构建缺失该 Secret 会直接失败——换密钥静默发布会让所有已装用户无法覆盖安装。生成 base64：
+**发布前必须配置仓库 Secret**（用 `android/make-signing-key.ps1` 生成专用发布密钥，脚本会打印 `gh secret set` 命令）：
+
+| 名称 | 类型 | 说明 |
+|---|---|---|
+| `ANDROID_KEYSTORE_BASE64` | Secret | keystore 文件的 base64 |
+| `ANDROID_KEYSTORE_PASSWORD` | Secret | keystore 口令（**不再**回落到公开的 `android`） |
+| `ANDROID_KEY_ALIAS` | Secret | 密钥别名 |
+| `ANDROID_KEY_PASSWORD` | Secret | 密钥口令（缺省同 keystore 口令） |
+| `ANDROID_CERT_SHA256` | Variable | 证书指纹（小写、无冒号），CI 用它保证本次发布密钥与上次一致 |
+
+tag 构建缺任一 Secret 直接失败；签完还会断言证书不是 `CN=Android Debug`、指纹与 `ANDROID_CERT_SHA256` 一致——换钥会让所有已装用户无法覆盖安装，所以这件事必须显式发生，不能靠手滑。
+
+> 0.4.1 及更早的 APK 由调试证书（`CN=Android Debug`）签名，0.5.0 起换成专用发布密钥；跨这个版本升级需要先卸载一次。详见仓库根的 [`RELEASE_SIGNING.md`](../RELEASE_SIGNING.md)。
+
+生成 base64（脚本已代做）：
 
 ```bash
-base64 -w0 android/.signing/local-test.keystore   # Windows: certutil -encode ... 后去掉头尾换行
+base64 -w0 ~/.nswt-signing/nekosports-release.keystore
 ```
 
 ## Windows 构建

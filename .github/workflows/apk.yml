@@ -177,14 +177,20 @@ jobs:
           # 接触发布密钥（脚本被改一处就能把密钥写进日志或产物）。
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             if [ -z "$KS_B64" ]; then
-              echo "::error::tag 构建必须配置 Secret ANDROID_KEYSTORE_BASE64（keystore 的 base64）。签名不一致会导致所有已装用户无法覆盖安装；本地历史密钥为 android/.signing/local-test.keystore，请将其 base64 后配置。"
+              echo "::error::tag 构建必须配置 Secret ANDROID_KEYSTORE_BASE64（keystore 的 base64）。签名不一致会导致所有已装用户无法覆盖安装；用 android/make-signing-key.ps1 生成密钥后按其输出配置。"
+              exit 1
+            fi
+            # 口令/别名不再回落到公开默认值（android / androiddebugkey）：
+            # 缺一个就停，避免"密钥换了、口令还是默认"的静默发布。
+            if [ -z "$KS_PASS_SECR" ] || [ -z "$KS_ALIAS_SECR" ]; then
+              echo "::error::tag 构建必须同时配置 ANDROID_KEYSTORE_PASSWORD 与 ANDROID_KEY_ALIAS（缺省值是公开的调试口令，不能用于发布）。"
               exit 1
             fi
             printf '%s' "$KS_B64" | base64 -d > "$ks"
             [ -s "$ks" ] || { echo "ANDROID_KEYSTORE_BASE64 解码为空"; exit 1; }
-            echo "KS_PASS=${KS_PASS_SECR:-android}" >> "$GITHUB_ENV"
-            echo "KS_ALIAS=${KS_ALIAS_SECR:-androiddebugkey}" >> "$GITHUB_ENV"
-            echo "KEY_PASS=${KEY_PASS_SECR:-android}" >> "$GITHUB_ENV"
+            echo "KS_PASS=$KS_PASS_SECR" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=$KS_ALIAS_SECR" >> "$GITHUB_ENV"
+            echo "KEY_PASS=${KEY_PASS_SECR:-$KS_PASS_SECR}" >> "$GITHUB_ENV"
             echo "使用仓库 Secret 签名密钥（tag 构建）"
           else
             keytool -genkeypair -keystore "$ks" -storepass android -keypass android \
@@ -208,7 +214,31 @@ jobs:
           "$BT/apksigner" verify --verbose "$apk"
           "$BT/zipalign" -c -P 16 4 "$apk"
           "$BT/aapt2" dump badging "$apk" | grep -E 'package:|sdkVersion:|targetSdkVersion:|native-code:'
-          sha256sum "$apk"
+
+          # 发布门禁：debug 证书与"密钥被换掉"都必须在这里停住，而不是发出去
+          # 让所有已装用户装不上。
+          certs="$("$BT/apksigner" verify --print-certs "$apk")"
+          echo "$certs"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if echo "$certs" | grep -qi 'CN=Android Debug'; then
+              echo "::error::发布包用的是 debug 证书（CN=Android Debug），任何人拿到该密钥都能伪造同签名更新包。"
+              exit 1
+            fi
+            expected="${{ vars.ANDROID_CERT_SHA256 }}"
+            if [ -n "$expected" ]; then
+              actual="$(echo "$certs" | sed -n 's/.*certificate SHA-256 digest: *//p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')"
+              want="$(echo "$expected" | tr -d ':' | tr 'A-F' 'a-f')"
+              if [ "$actual" != "$want" ]; then
+                echo "::error::签名证书指纹与 ANDROID_CERT_SHA256 不一致（实际 $actual / 期望 $want）。换钥会让已装用户无法覆盖安装；确认要换请同时更新仓库变量并写进 Release 说明。"
+                exit 1
+              fi
+              echo "证书指纹与仓库变量一致 ✓"
+            else
+              echo "::warning::未配置仓库变量 ANDROID_CERT_SHA256，无法断言本次密钥与上次相同"
+            fi
+          fi
+          sha256sum "$apk" | sed 's#[^ ]*/##' > "dist/SHA256SUMS.txt"
+          cat "dist/SHA256SUMS.txt"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -221,15 +251,40 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     # 只有这个 job 需要写权限；构建 job 拿不到它。
+    # id-token / attestations 用于给产物生成可验证的来源证明（gh attestation verify）。
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: NekoSportsWorldTool-android-arm64
           path: dist
 
+      - name: 生成校验和
+        run: |
+          cd dist
+          rm -f SHA256SUMS.txt
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -exec sha256sum {} + | sed 's#\./##' | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 生成构建来源证明
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*
+
       - name: 发布
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
+          append_body: true
+          body: |
+            Android APK：`NekoSportsWorldTool-android-arm64.apk`
+
+            校验：
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            gh attestation verify NekoSportsWorldTool-android-arm64.apk --repo czcdr/NekoSportsWorldTool-antiban
+            ```
+            签名密钥变更的版本会在说明里单独标注；签名不同则无法覆盖安装，需要先卸载旧版。

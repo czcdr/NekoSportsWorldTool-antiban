@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 构建并发布 Android APK 到 GitHub Release（自更新下载源）。
 
@@ -6,8 +6,10 @@
 流程：读 Cargo.toml 版本 → 盖章 AndroidManifest（versionName / versionCode）
 → build.ps1 构建 arm64-v8a → 固定资产名上传 Release。
 
-签名提醒：必须一直使用 android/.signing/local-test.keystore 签名。
-签名变化后手机上无法覆盖安装，卸载重装还会丢 identity.json / session.json。
+签名提醒：正式发布必须用 android/make-signing-key.ps1 生成的发布密钥
+（环境变量 NSWT_ANDROID_KEYSTORE/_PASSWORD、NSWT_ANDROID_KEY_ALIAS/_PASSWORD）。
+脚本会拒绝发布 debug 证书（CN=Android Debug）签名的包；签名变化后手机上
+无法覆盖安装，卸载重装还会丢 identity.json / session.json。
 
 .EXAMPLE
 ./android/release.ps1 -AndroidRev 4                        # 发到默认仓库（客户端更新源）
@@ -21,7 +23,9 @@ param(
     [string]$Repo = 'czcdr/NekoSportsWorldTool-antiban',
     [string]$Notes = '',
     [switch]$Draft,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # 明确允许发布 debug 证书签名的包（只用于本地演示；正式 Release 不要开）。
+    [switch]$AllowDebugKey
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -68,6 +72,32 @@ if (-not $SkipBuild) {
 $builtApk = Join-Path $PSScriptRoot 'build\arm64-v8a-release\NekoSportsWorldTool-arm64-v8a.apk'
 if (-not (Test-Path -LiteralPath $builtApk)) { throw "找不到构建产物：$builtApk" }
 
+# ── 签名门禁：debug 证书签出来的包不能进 Release ─────────────
+# CN=Android Debug + 默认口令的密钥一旦泄露，别人能签出"签名一致"的更新包，
+# 系统安装器和 App 内的签名自检都会放行。正式发布必须用 make-signing-key.ps1
+# 生成的密钥（CI 侧另有 ANDROID_CERT_SHA256 固定校验）。
+$sdkPath = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
+$apksigner = Join-Path $sdkPath 'build-tools\36.0.0\apksigner.bat'
+if (Test-Path -LiteralPath $apksigner) {
+    # 5.1 下 `2>&1` 会把 stderr 包成 RemoteException（与 build.ps1 同样的坑），
+    # 这里改成落临时文件再读，避免"证书检查自己把发布打断"。
+    $certFile = Join-Path $env:TEMP ("nswt-certs-" + [guid]::NewGuid().ToString('N') + ".txt")
+    & $apksigner verify --print-certs $builtApk *> $certFile
+    $certExit = $LASTEXITCODE
+    $certs = Get-Content -LiteralPath $certFile
+    Remove-Item -LiteralPath $certFile -Force -ErrorAction SilentlyContinue
+    if ($certExit -ne 0) { throw 'apksigner verify 失败，产物不可发布' }
+    $certs | Write-Output
+    if (($certs -join "`n") -match 'CN=Android Debug') {
+        if (-not $AllowDebugKey) {
+            throw '构建产物用的是 debug 证书（CN=Android Debug），拒绝发布。请用 android/make-signing-key.ps1 生成的密钥，或显式加 -AllowDebugKey 只做本地演示。'
+        }
+        Write-Warning '产物由 debug 证书签名（-AllowDebugKey）：任何人都能伪造同签名更新包，不要对外分发。'
+    }
+} else {
+    Write-Warning "未找到 apksigner（$apksigner），跳过发布前证书检查。"
+}
+
 # 固定资产名（更新器按此匹配；也兼容任意 *.apk 资产）
 $asset = Join-Path $PSScriptRoot 'build\NekoSportsWorldTool-android-arm64.apk'
 Copy-Item -LiteralPath $builtApk -Destination $asset -Force
@@ -77,7 +107,9 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "未安装 gh CLI。手动发布：`ngh release create v$versionName --repo $Repo --latest `"$asset`""
 }
 if ([string]::IsNullOrWhiteSpace($Notes)) {
-    $Notes = "NekoSportsWorldTool $versionName`n`n签名密钥未变，可直接覆盖安装。"
+    # 不要在这里写"签名未变可直接覆盖安装"：签名是否变化只有部署密钥的人知道，
+    # 猜错一次就是全体用户装不上。需要时用 -Notes 显式说明。
+    $Notes = "NekoSportsWorldTool $versionName`n`n签名与校验步骤见 RELEASE_SIGNING.md。"
 }
 $tag = "v$versionName"
 $arguments = @('release', 'create', $tag, '--repo', $Repo, '--latest',

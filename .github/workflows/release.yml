@@ -105,16 +105,44 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    # 只有这个 job 需要写权限；四个平台的构建 job 都拿不到它。
+    # 只有这个 job 需要写权限：四个平台的构建 job 都拿不到它。
+    # id-token / attestations 用于生成可验证的构建来源证明。
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: 生成校验和
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -exec sha256sum {} + | sed 's#\./##' | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 生成构建来源证明
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*
+
       - name: Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
+          append_body: true
+          body: |
+            ### 桌面产物（Windows x64 / macOS arm64 / Linux x64 / Linux arm64）
+
+            桌面二进制**没有** Authenticode 或 Apple 代码签名（未购买证书）：
+            Windows 会提示"未知发布者"，macOS 首次打开会提示"无法验证开发者"。
+            请用产物来源证明与校验和确认真实性：
+
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            gh attestation verify <下载的文件> --repo ${{ github.repository }}
+            ```
+
+            官方 Linux 产物是 CLI-only（不含 GUI）。

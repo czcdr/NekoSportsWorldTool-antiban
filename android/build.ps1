@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('arm64-v8a', 'x86_64')][string]$Abi = 'arm64-v8a',
     [ValidateSet('debug', 'release')][string]$Profile = 'release',
@@ -131,13 +131,24 @@ Invoke-Checked $jar @(
 )
 $alignedApk = Join-Path $outputDir 'aligned.apk'
 Invoke-Checked (Join-Path $buildTools 'zipalign.exe') @('-f','-P','16','4',$unsignedApk,$alignedApk)
-$keyStore = Join-Path $signingDir 'local-test.keystore'
+# 签名材料：正式发布应由 CI 的 ANDROID_KEYSTORE_BASE64 提供（见 make-signing-key.ps1）。
+# 本地不配环境变量时退回 android/.signing/local-test.keystore —— 那是 debug 证书，
+# 仅供冒烟安装；release.ps1 会拒绝把 debug 签名的包发出去。
+$keyStore = if ($env:NSWT_ANDROID_KEYSTORE) { $env:NSWT_ANDROID_KEYSTORE } else { Join-Path $signingDir 'local-test.keystore' }
+$keyAlias = if ($env:NSWT_ANDROID_KEY_ALIAS) { $env:NSWT_ANDROID_KEY_ALIAS } else { 'androiddebugkey' }
+$keyStorePassword = if ($env:NSWT_ANDROID_KEYSTORE_PASSWORD) { $env:NSWT_ANDROID_KEYSTORE_PASSWORD } else { 'android' }
+$keyPassword = if ($env:NSWT_ANDROID_KEY_PASSWORD) { $env:NSWT_ANDROID_KEY_PASSWORD } else { $keyStorePassword }
 if (-not (Test-Path -LiteralPath $keyStore)) {
+    if ($keyStore -ne (Join-Path $signingDir 'local-test.keystore')) {
+        throw "Missing keystore: $keyStore（NSWT_ANDROID_KEYSTORE 指向的文件不存在）"
+    }
     Invoke-Checked (Join-Path $javaBin 'keytool.exe') @('-genkeypair','-keystore',$keyStore,'-storepass','android','-keypass','android','-alias','androiddebugkey','-keyalg','RSA','-keysize','2048','-validity','10000','-dname','CN=Android Debug,O=Android,C=US')
 }
 $finalApk = Join-Path $outputDir "NekoSportsWorldTool-$Abi.apk"
-Invoke-Checked (Join-Path $buildTools 'apksigner.bat') @('sign','--ks',$keyStore,'--ks-key-alias','androiddebugkey','--ks-pass','pass:android','--key-pass','pass:android','--out',$finalApk,$alignedApk)
+Invoke-Checked (Join-Path $buildTools 'apksigner.bat') @('sign','--ks',$keyStore,'--ks-key-alias',$keyAlias,'--ks-pass',"pass:$keyStorePassword",'--key-pass',"pass:$keyPassword",'--out',$finalApk,$alignedApk)
 Invoke-Checked (Join-Path $buildTools 'apksigner.bat') @('verify','--verbose',$finalApk)
+# 证书指纹随包打印：发布脚本/CI 用 `CN=Android Debug` 判定是不是误用了 debug 钥匙。
+Invoke-Checked (Join-Path $buildTools 'apksigner.bat') @('verify','--print-certs',$finalApk)
 Invoke-Checked (Join-Path $buildTools 'zipalign.exe') @('-c','-P','16','4',$finalApk)
 $manifestInfo = & (Join-Path $buildTools 'aapt2.exe') 'dump' 'badging' $finalApk
 if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect packaged manifest' }

@@ -101,3 +101,14 @@ Android 沿用 `android/README.md` 中的构建与 smoke 测试流程，需要 J
 跑步页在缺少或过期的路线输入时，继续绘制已经导入的原始 OSM 道路和建筑，并保留拖拽、滚轮缩放。界面明确区分基础地图与尚未生成的路线。路网页与跑步页复用同一基础地图绘制方法；基础地图（WGS84）与路线预览（BD09）双向切换时重新适配视野，普通帧保留用户的缩放和平移。
 
 新增回归覆盖无登录、策略时段失败、离线无路线输入三种状态，320/360/412 与桌面尺寸的实际道路和建筑图形可见性、滚动导航、拖拽缩放、重载及坐标系切换。这项修复只保证已有地图可见，不生成缺少校验数据的正式路线。
+
+## 2026-10-26：0.5.0（真机测试反馈的三处修复）
+
+用户真机测试确认：覆盖安装、数据保留、更新检查设置在重启与再次覆盖安装后保留均通过；同时记录了三个问题。本轮处理：
+
+1. **跑步页参数改动即落盘（真 bug）**：`faceCheck`、距离/配速、手动海拔、路线算法原先只在点「开始跑步」时写 `config.json`，勾选后直接退出会丢。现在页面每帧比对 `RunSettings` 快照，变化即标脏，松手/输入提交后写盘；海拔格式错误只保留旧值并提示，不连累其它字段。回归测试：`run_settings_persist_without_submitting`、`run_settings_snapshot_ignores_plan_state`、`run_settings_manual_altitude_forms`。
+2. **Android 发布密钥从调试证书换成专用密钥**：`android/make-signing-key.ps1` 生成 RSA 4096 + 随机强口令；CI 缺任一 Secret 即失败，签完断言证书不是 `CN=Android Debug` 且指纹等于仓库变量 `ANDROID_CERT_SHA256`；本地 `release.ps1` 拒绝发布 debug 签名的包。**代价**：0.4.1 及更早版本无法覆盖安装到 0.5.0，需卸载重装一次（`identity.json` / `session.json` 会清空）。
+3. **桌面产物补齐可验证性**：Release 附带 `SHA256SUMS.txt` 与 GitHub 构建来源证明（`gh attestation verify`）。Authenticode / Apple 公证仍未做（需要证书），Release 说明里明确写出这一残余风险。
+4. **行尾**：新增 `.gitattributes`（`* text=auto eol=lf`，`.ps1/.bat/.cmd` 检出 CRLF，二进制显式标记），并 `git add --renormalize`；Windows 工作区 `git status` 不再整树报"已修改"。
+
+未变：服务端禁跑/覆盖提交/`freezeRunTime` 归零仍未验证（无账号、未发业务请求）。

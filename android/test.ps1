@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][ValidatePattern('^emulator-[0-9]+$')][string]$Serial,
     [string]$SdkPath = (Join-Path $env:LOCALAPPDATA 'Android\Sdk')
