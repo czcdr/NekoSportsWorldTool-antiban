@@ -120,8 +120,8 @@ jobs:
       - name: 生成校验和
         run: |
           cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -exec sha256sum {} + | sed 's#\./##' | sort > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          find . -maxdepth 1 -type f ! -name SHA256SUMS-desktop.txt -exec sha256sum {} + | sed 's#\./##' | sort > SHA256SUMS-desktop.txt
+          cat SHA256SUMS-desktop.txt
 
       - name: 生成构建来源证明
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -141,7 +141,7 @@ jobs:
             请用产物来源证明与校验和确认真实性：
 
             ```bash
-            sha256sum -c SHA256SUMS.txt
+            sha256sum -c SHA256SUMS-desktop.txt
             gh attestation verify <下载的文件> --repo ${{ github.repository }}
             ```
 

@@ -32,7 +32,7 @@ tag 构建必须同时具备：
 1. `apksigner verify --print-certs` 断言证书不是 `CN=Android Debug`；
 2. 断言证书指纹与 `ANDROID_CERT_SHA256` 一致——**手滑换钥会直接失败**，
    而不是发一个所有用户都装不上的包；
-3. 产出 `SHA256SUMS.txt` 并生成构建来源证明。
+3. 产出 `SHA256SUMS-android.txt` 并生成构建来源证明。
 
 ### 本地发布
 
@@ -50,7 +50,7 @@ $env:NSWT_ANDROID_KEY_PASSWORD = $env:NSWT_ANDROID_KEYSTORE_PASSWORD
 ### 校验下载的 APK
 
 ```bash
-sha256sum -c SHA256SUMS.txt
+sha256sum -c SHA256SUMS-android.txt
 gh attestation verify NekoSportsWorldTool-android-arm64.apk \
   --repo czcdr/NekoSportsWorldTool-antiban
 apksigner verify --print-certs NekoSportsWorldTool-android-arm64.apk
@@ -67,7 +67,7 @@ apksigner verify --print-certs NekoSportsWorldTool-android-arm64.apk
 
 现有的完整性保障是：
 
-1. **SHA256SUMS.txt**：随 Release 发布，`sha256sum -c` 可逐项核对；
+1. **SHA256SUMS-desktop.txt**：随 Release 发布，`sha256sum -c` 可逐项核对；
 2. **GitHub 构建来源证明**：`gh attestation verify <文件> --repo <仓库>`，
    证明该文件确由本仓库对应 workflow 在 GitHub Actions 上构建；
 3. **App 内更新**：只认固定仓库 + Release API 的 `sha256:<hex>` 摘要，并对

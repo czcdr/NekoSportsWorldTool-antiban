@@ -108,7 +108,7 @@ Android 沿用 `android/README.md` 中的构建与 smoke 测试流程，需要 J
 
 1. **跑步页参数改动即落盘（真 bug）**：`faceCheck`、距离/配速、手动海拔、路线算法原先只在点「开始跑步」时写 `config.json`，勾选后直接退出会丢。现在页面每帧比对 `RunSettings` 快照，变化即标脏，松手/输入提交后写盘；海拔格式错误只保留旧值并提示，不连累其它字段。回归测试：`run_settings_persist_without_submitting`、`run_settings_snapshot_ignores_plan_state`、`run_settings_manual_altitude_forms`。
 2. **Android 发布密钥从调试证书换成专用密钥**：`android/make-signing-key.ps1` 生成 RSA 4096 + 随机强口令；CI 缺任一 Secret 即失败，签完断言证书不是 `CN=Android Debug` 且指纹等于仓库变量 `ANDROID_CERT_SHA256`；本地 `release.ps1` 拒绝发布 debug 签名的包。**代价**：0.4.1 及更早版本无法覆盖安装到 0.5.0，需卸载重装一次（`identity.json` / `session.json` 会清空）。
-3. **桌面产物补齐可验证性**：Release 附带 `SHA256SUMS.txt` 与 GitHub 构建来源证明（`gh attestation verify`）。Authenticode / Apple 公证仍未做（需要证书），Release 说明里明确写出这一残余风险。
+3. **桌面产物补齐可验证性**：Release 附带分平台的校验和（`SHA256SUMS-android.txt` / `SHA256SUMS-desktop.txt`）与 GitHub 构建来源证明（`gh attestation verify`）。Authenticode / Apple 公证仍未做（需要证书），Release 说明里明确写出这一残余风险。
 4. **行尾**：新增 `.gitattributes`（`* text=auto eol=lf`，`.ps1/.bat/.cmd` 检出 CRLF，二进制显式标记），并 `git add --renormalize`；Windows 工作区 `git status` 不再整树报"已修改"。
 
 未变：服务端禁跑/覆盖提交/`freezeRunTime` 归零仍未验证（无账号、未发业务请求）。
