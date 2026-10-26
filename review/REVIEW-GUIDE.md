@@ -86,3 +86,23 @@ pwsh -File E:\rea\tools\build-android.ps1
 | `src/api/fingerprint.rs` | 未知机型 + 空分辨率时会按 seed 编造一个分辨率并上报（自检只说「无法核对」） |
 | `src/api/points.rs` | 距离取整口径（`round().max(1)`）+ 预览/提交各拉一次点位 |
 | `src/safety.rs` | `check_*` 读取不加锁；占用窗口被提交互斥挡住，但理论上仍可并发 |
+| `src/safety.rs:739` | 测试里写死了 `2026-10-24` 作为「今天」的锚点，机器日期走到 2026-10-22 那天会挂（时间炸弹，非本轮引入） |
+
+---
+
+## 6. 联网探针（不是测试）
+
+`src/api/gt4.rs::live_gt4_probe` 是一个**诊断挂具**，不是回归测试：
+
+- 默认 `#[ignore]`，且**必须显式设置 `GT4_PROBE_CAPTCHA_ID`** 才会跑（否则直接 return）；
+- 全程只有 `println!`，**没有任何断言** —— 它跑完永远是 ok，只用来人工看成功率；
+- 会真实请求极验 `/load`、`static.geetest.com` 两图与 `/verify`。密集使用会让该出口
+  被降级，所以：轮次默认 3、轮间隔 5–10s，**不要拿生产 captcha_id 反复刷**；
+- CI 的两个 workflow 都没有 `cargo test` 步骤，因此不会被误触发。
+
+```powershell
+$env:GT4_PROBE_CAPTCHA_ID = "<captcha id>"
+$env:GT4_PROBE_ROUNDS = "3"
+$env:GT4_PROBE_DUMP = "D:\captcha-samples"   # 可选：落盘 bg/slice 与标注图
+cargo test --lib live_gt4_probe -- --ignored --nocapture
+```

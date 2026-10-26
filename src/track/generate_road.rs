@@ -44,6 +44,17 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
     if path.trim().is_empty() {
         return Err("未配置 OSM 路网，请先导入路网或主动切换经典模式".into());
     }
+    // 手机上的路网是从系统文件选择器挑的，可能是任意大小；先按体积挡住，
+    // 否则一个几百 MB 的 .osm 会在解析阶段把内存吃光（手机上就是闪退）。
+    const MAX_OSM_BYTES: u64 = 64 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_OSM_BYTES {
+            return Err(format!(
+                "路网文件过大（{:.1} MiB，上限 64 MiB）；请导出更小的范围",
+                meta.len() as f64 / (1024.0 * 1024.0)
+            ));
+        }
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("读取 {path} 失败: {e}"))?;
     let xml = std::str::from_utf8(&bytes)
         .map_err(|_| "文件不是 OSM XML；PBF 等二进制格式请先转换为 .osm XML")?;

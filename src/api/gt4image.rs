@@ -139,17 +139,30 @@ pub fn canny(src: &[f32], w: usize, h: usize, low: f32, high: f32) -> Vec<u8> {
 
 /// 零均值归一化互相关模板匹配（TM_CCOEFF_NORMED 等价），返回最佳 x。
 pub fn match_x(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize) -> usize {
+    match_at(bg, bw, bh, tpl, tw, th).0
+}
+
+/// 同 `match_x`，额外返回最佳 y 与得分（探针用来核对 ypos 语义）。
+pub fn match_at(
+    bg: &[u8],
+    bw: usize,
+    bh: usize,
+    tpl: &[u8],
+    tw: usize,
+    th: usize,
+) -> (usize, usize, f64) {
     if tw == 0 || th == 0 || tw > bw || th > bh {
-        return 0;
+        return (0, 0, f64::NEG_INFINITY);
     }
     // 模板零均值
     let t_mean = tpl.iter().map(|&v| v as f64).sum::<f64>() / (tw * th) as f64;
     let t: Vec<f64> = tpl.iter().map(|&v| v as f64 - t_mean).collect();
     let t_norm: f64 = t.iter().map(|v| v * v).sum::<f64>().sqrt();
     if t_norm == 0.0 {
-        return 0;
+        return (0, 0, f64::NEG_INFINITY);
     }
     let mut best_x = 0usize;
+    let mut best_y = 0usize;
     let mut best_score = f64::NEG_INFINITY;
     for oy in 0..=(bh - th) {
         for ox in 0..=(bw - tw) {
@@ -157,12 +170,10 @@ pub fn match_x(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize
             let mut st_sum = 0f64;
             for ty in 0..th {
                 let row = (oy + ty) * bw + ox;
-                let trow = ty * tw;
                 for tx in 0..tw {
                     let v = bg[row + tx] as f64;
                     s_sum += v;
                 }
-                let _ = trow;
             }
             let s_mean = s_sum / (tw * th) as f64;
             let mut num = 0f64;
@@ -187,13 +198,18 @@ pub fn match_x(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize
             if score > best_score {
                 best_score = score;
                 best_x = ox;
+                best_y = oy;
             }
         }
     }
-    best_x
+    (best_x, best_y, best_score)
 }
 
 /// getDistance_original：bg/slice 两张 PNG → 缺口 x。
+///
+/// 保留作为无 ypos 时的兜底与测试基线；生产路径走 `get_distance_checked`
+/// （同一条管线 + ypos 一致性校验）。
+#[allow(dead_code)]
 pub fn get_distance_original(bg_png: &[u8], slice_png: &[u8]) -> Result<usize, String> {
     let (bg_gray, bw, bh) = decode_gray(bg_png)?;
     let (slice_gray, sw, sh) = decode_gray(slice_png)?;
@@ -207,6 +223,41 @@ pub fn get_distance_original(bg_png: &[u8], slice_png: &[u8]) -> Result<usize, S
     Ok(match_x(&bg_edges, bw, bh, &slice_edges, sw, sh))
 }
 
+// ───────────────── GT4 生产用识别（ypos 一致性校验）─────────────────
+//
+// 旧管线（Canny 边缘图全图 NCC）在干净出口上实测 12 轮对 11 轮，唯一一次错配
+// 是把模板配到背景里同纹理的别处。试过用 alpha 掩码 + 灰度 NCC、梯度方向一致性
+// 重写识别器：在样本图上人工核对反而不如旧管线（缺口左缘 190 时它给 121），
+// 而验证码一旦被降级，verify 恒 fail，无法再用来评估，于是不再赌新算法 ——
+// 保留旧管线，只加一层**校验**。
+//
+// 坐标系（这一条搞错就会 100% 误杀，所以写清楚）：
+//   · `match_at` 返回的 y 是**整张切片图**（80x80，含透明边距）左上角在背景中的 y；
+//   · `/load` 的 `ypos` 实测与这个 y 逐轮吻合 ±2px（8 轮对照，见 review/CHANGES K.1），
+//     也就是说 ypos 同样是「整张切片图顶部」，不是「缺口顶部」。
+//   两者同源，所以可以直接比较；若将来有人把模板裁到实体再匹配，就必须改成
+//   `ypos + 边距`，否则每张图都会偏离一个透明边距的厚度。
+pub fn get_distance_checked(
+    bg_png: &[u8],
+    slice_png: &[u8],
+    ypos: Option<usize>,
+) -> Result<(usize, f64), String> {
+    let (bg_gray, bw, bh) = decode_gray(bg_png)?;
+    let (slice_gray, sw, sh) = decode_gray(slice_png)?;
+    let bg_edges = canny(&gaussian_blur(&bg_gray, bw, bh), bw, bh, 100.0, 200.0);
+    let slice_edges = canny(&gaussian_blur(&slice_gray, sw, sh), sw, sh, 100.0, 200.0);
+    if slice_edges.iter().filter(|&&v| v == 255).count() < 10 {
+        return Err("切片图无边缘特征（识别失败）".into());
+    }
+    let (x, y, score) = match_at(&bg_edges, bw, bh, &slice_edges, sw, sh);
+    if let Some(yp) = ypos {
+        // 8px 余量：实测偏差在 ±2px，留 4 倍余量以吸收不同分辨率下的取整差异。
+        if (y as i64 - yp as i64).abs() > 8 {
+            return Err(format!("识别不可靠：y={y} 与 ypos={yp} 偏离过大（换图重试）"));
+        }
+    }
+    Ok((x, score))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +293,69 @@ mod tests {
         let t_edges = canny(&gaussian_blur(&tpl, tw2, th2), tw2, th2, 50.0, 120.0);
         let found = match_x(&bg_edges, w, h, &t_edges, tw2, th2);
         assert!((found as i32 - 30).abs() <= 2, "匹配 x={found} 期望≈30");
+    }
+
+    /// 合成一对 GT4 图：背景 300x200，在 (150, 60) 放一个 50x50 高对比方块；
+    /// 切片 80x80，方块居中（透明边距 15px）。返回 (bg_png, slice_png)。
+    fn synth_gt4_pair() -> (Vec<u8>, Vec<u8>) {
+        use image::{ImageBuffer, Rgba};
+        let (bw, bh) = (300u32, 200u32);
+        let mut bg = ImageBuffer::from_pixel(bw, bh, Rgba([40u8, 60, 90, 255]));
+        for y in 60..110u32 {
+            for x in 150..200u32 {
+                bg.put_pixel(x, y, Rgba([230, 230, 230, 255]));
+            }
+        }
+        let (sw, sh) = (80u32, 80u32);
+        let mut slice = ImageBuffer::from_pixel(sw, sh, Rgba([0u8, 0, 0, 0]));
+        for y in 15..65u32 {
+            for x in 15..65u32 {
+                // 切片内容与背景方块同色，但整体压暗（GT4 缺口被遮罩压暗的近似）
+                let v = if x < 16 || y < 16 || x > 63 || y > 63 { 230 } else { 150 };
+                slice.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        let mut bg_png = Vec::new();
+        bg.write_to(&mut std::io::Cursor::new(&mut bg_png), image::ImageFormat::Png)
+            .expect("encode bg");
+        let mut slice_png = Vec::new();
+        slice
+            .write_to(&mut std::io::Cursor::new(&mut slice_png), image::ImageFormat::Png)
+            .expect("encode slice");
+        (bg_png, slice_png)
+    }
+
+    /// ypos 门控的完整契约（正向 + 边界 + 拒绝）。
+    ///
+    /// 断言不写死"我猜的像素"，而是先用 `match_at` 求出这张合成图上模板的真实
+    /// 最优位置，再围绕它做边界断言 —— 否则断言很容易变成恒真式（比如只写
+    /// `x <= 300`，而 `match_at` 的 x 上界本来就是 bw-tw=220）。
+    #[test]
+    fn ypos_gate_follows_the_measured_offset() {
+        let (bg_png, slice_png) = synth_gt4_pair();
+        let (bg_gray, bw, bh) = decode_gray(&bg_png).expect("decode bg");
+        let (slice_gray, sw, sh) = decode_gray(&slice_png).expect("decode slice");
+        let bg_edges = canny(&gaussian_blur(&bg_gray, bw, bh), bw, bh, 100.0, 200.0);
+        let slice_edges = canny(&gaussian_blur(&slice_gray, sw, sh), sw, sh, 100.0, 200.0);
+        let (x0, y0, _) = match_at(&bg_edges, bw, bh, &slice_edges, sw, sh);
+
+        // 合成图：背景方块在 (150..200, 60..110)，切片实体在 (15..65, 15..65)。
+        // 整张切片模板的左上角对齐时应在 (135, 45)。
+        assert!((x0 as i32 - 135).abs() <= 4, "合成图定位不准: x={x0}");
+        assert!((y0 as i32 - 45).abs() <= 4, "合成图定位不准: y={y0}");
+
+        // 缺 ypos：放行。
+        assert!(get_distance_checked(&bg_png, &slice_png, None).is_ok());
+        // 与识别出的 y 一致：必须放行（这就是 ypos 的真实语义）。
+        assert!(
+            get_distance_checked(&bg_png, &slice_png, Some(y0)).is_ok(),
+            "ypos 与识别一致却被拒绝 —— 校验方向写反了"
+        );
+        // 8px 边界内仍放行（代码是 > 8 才拒绝）。
+        assert!(get_distance_checked(&bg_png, &slice_png, Some(y0.saturating_sub(8))).is_ok());
+        // 超出边界：拒绝，并且错误信息要说明原因。
+        let err = get_distance_checked(&bg_png, &slice_png, Some(y0 + 9))
+            .expect_err("偏离 9px 时必须拒绝");
+        assert!(err.contains("偏离"), "错误信息应说明原因，实际: {err}");
     }
 }

@@ -14,7 +14,12 @@ Set-StrictMode -Version Latest
 if (-not $SdkPath) { $SdkPath = Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $TargetDir) {
-    $projectDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($projectRoot))).Substring(0, 12)
+    # Windows PowerShell 5.1（.NET Framework）既没有 SHA256.HashData，也没有
+    # Convert.ToHexString —— 两种写法都用最老的可用 API，5.1 与 7 都能跑。
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $projectHash = $hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($projectRoot)) }
+    finally { $hasher.Dispose() }
+    $projectDigest = (-join ($projectHash | ForEach-Object { $_.ToString('X2') })).Substring(0, 12)
     $TargetDir = Join-Path $env:TEMP "neko-android-$projectDigest"
 }
 if ($TargetDir -match '[^\x00-\x7F]') { throw 'NDK build cache path must contain ASCII characters only; pass -TargetDir with a suitable path.' }
@@ -42,8 +47,20 @@ foreach ($sourceName in @('java','res','AndroidManifest.xml')) {
 }
 
 function Invoke-Checked([string]$Executable, [string[]]$Arguments) {
-    & $Executable @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "$Executable exited with $LASTEXITCODE" }
+    # 这里显式用 `2>&1` 把子进程 stderr 并进来（否则 cargo/javac 的进度会被吞）。
+    # 但 Windows PowerShell 5.1 在 `$ErrorActionPreference='Stop'` 下会把 2>&1 收进来的
+    # stderr 记录包成 RemoteException 直接中止脚本，于是编译还在跑就报 exit 1、
+    # 真实错误反而看不到。所以这一段临时降级为 Continue，只按 $LASTEXITCODE 判定。
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Executable @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    foreach ($line in $output) { Write-Host "$line" }
+    if ($code -ne 0) { throw "$Executable exited with $code" }
 }
 
 # Scope all toolchain environment changes to this script's execution.
@@ -100,15 +117,18 @@ $libDir = Join-Path $stagingDir "lib\$Abi"
 New-Item -ItemType Directory -Force -Path $libDir | Out-Null
 Copy-Item -LiteralPath $nativeLibrary -Destination (Join-Path $libDir 'libnekosportsworldtool.so') -Force
 Copy-Item -LiteralPath (Join-Path $dexDir 'classes.dex') -Destination (Join-Path $stagingDir 'classes.dex') -Force
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$zip = [IO.Compression.ZipFile]::Open($unsignedApk, [IO.Compression.ZipArchiveMode]::Update)
-try {
-    foreach ($relative in @('classes.dex', "lib/$Abi/libnekosportsworldtool.so")) {
-        $oldEntry = $zip.GetEntry($relative)
-        if ($oldEntry) { $oldEntry.Delete() }
-        [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $stagingDir $relative), $relative, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
-    }
-} finally { $zip.Dispose() }
+# 把 classes.dex 与声明的原生库塞进 aapt2 产出的 APK。
+#
+# 原来用 System.IO.Compression.ZipArchive 更新；在一部分 Windows 上（本机就是）
+# Add-Type 报成功、但 [System.IO.Compression.ZipArchiveMode] 解析不到类型，
+# 脚本会在这里中断。改用 JDK 自带的 jar 更新 zip —— 依赖已经因为 javac 存在了。
+$jar = Join-Path $javaBin 'jar.exe'
+if (-not (Test-Path -LiteralPath $jar)) { throw "Missing jar tool: $jar" }
+Invoke-Checked $jar @(
+    '--update', '--file', $unsignedApk,
+    '-C', $stagingDir, 'classes.dex',
+    '-C', $stagingDir, "lib/$Abi/libnekosportsworldtool.so"
+)
 $alignedApk = Join-Path $outputDir 'aligned.apk'
 Invoke-Checked (Join-Path $buildTools 'zipalign.exe') @('-f','-P','16','4',$unsignedApk,$alignedApk)
 $keyStore = Join-Path $signingDir 'local-test.keystore'

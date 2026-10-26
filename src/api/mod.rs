@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod campus;
+pub mod captcha_guard;
 pub mod cheat;
 pub mod client;
 pub mod egress;

@@ -208,6 +208,110 @@ public final class MainActivity extends NativeActivity {
         });
     }
 
+    /** 路网文件选择：用系统文件选择器（SAF），把内容复制进私有目录后交给 Rust 解析。 */
+    private static final int REQUEST_PICK_OSM = 0x0A51;
+
+    public void pickOsmFile() {
+        runOnUiThread(() -> {
+            try {
+                android.content.Intent intent =
+                    new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                startActivityForResult(intent, REQUEST_PICK_OSM);
+            } catch (Exception error) {
+                nativePickedFile("", "无法打开文件选择器：" + error.getMessage());
+            }
+        });
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_PICK_OSM) return;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            nativePickedFile("", "已取消选择");
+            return;
+        }
+        final android.net.Uri uri = data.getData();
+        // 复制动作放到后台线程：路网文件几十 MB，主线程读会把界面卡死。
+        new Thread(() -> {
+            try {
+                String name = "imported.osm";
+                long declaredSize = -1L;
+                try (android.database.Cursor cursor =
+                         getContentResolver().query(uri, null, null, null, null)) {
+                    if (cursor != null && cursor.moveToFirst()) {
+                        int index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                        if (index >= 0) {
+                            String shown = cursor.getString(index);
+                            if (shown != null && !shown.isEmpty()) name = shown;
+                        }
+                        int sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE);
+                        if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                            declaredSize = cursor.getLong(sizeIndex);
+                        }
+                    }
+                }
+                // 先按声明大小拦一道：Rust 侧也有 64 MiB 上限，但那时文件已经写完，
+                // 手机上会先把私有存储占满（另一个后果是写入过程中 UI 卡顿）。
+                if (declaredSize > MAX_OSM_BYTES) {
+                    nativePickedFile("", "文件过大（"
+                        + (declaredSize / (1024 * 1024)) + " MiB，上限 "
+                        + (MAX_OSM_BYTES / (1024 * 1024)) + " MiB）；请先裁剪路网范围");
+                    return;
+                }
+                java.io.File dir = new java.io.File(getFilesDir(), "osm");
+                //noinspection ResultOfMethodCallIgnored
+                dir.mkdirs();
+                // 文件名加时间戳：同名重选时不能截断上一个还在被解析的文件。
+                String stamp = Long.toString(System.currentTimeMillis());
+                java.io.File target = new java.io.File(dir, stamp + "-" + sanitizeFileName(name));
+                long copied = 0L;
+                try (java.io.InputStream in = getContentResolver().openInputStream(uri);
+                     java.io.FileOutputStream out = new java.io.FileOutputStream(target)) {
+                    if (in == null) throw new java.io.IOException("无法读取所选文件");
+                    byte[] buffer = new byte[64 * 1024];
+                    int read;
+                    while ((read = in.read(buffer)) > 0) {
+                        copied += read;
+                        // 声明大小可能缺失或撒谎，边写边兜底。
+                        if (copied > MAX_OSM_BYTES) {
+                            out.close();
+                            //noinspection ResultOfMethodCallIgnored
+                            target.delete();
+                            nativePickedFile("", "文件过大（超过 "
+                                + (MAX_OSM_BYTES / (1024 * 1024)) + " MiB）；请先裁剪路网范围");
+                            return;
+                        }
+                        out.write(buffer, 0, read);
+                    }
+                }
+                nativePickedFile(target.getAbsolutePath(), "");
+            } catch (Exception error) {
+                nativePickedFile("", "读取所选文件失败：" + error.getMessage());
+            }
+        }).start();
+    }
+
+    /** 路网文件上限，与 Rust 侧 `load_network_path` 的 64 MiB 保持一致。 */
+    private static final long MAX_OSM_BYTES = 64L * 1024 * 1024;
+
+    private static String sanitizeFileName(String name) {
+        java.io.File base = new java.io.File(name);
+        String leaf = base.getName();
+        StringBuilder builder = new StringBuilder();
+        for (char ch : leaf.toCharArray()) {
+            if (Character.isLetterOrDigit(ch) || ch == '.' || ch == '_' || ch == '-') builder.append(ch);
+        }
+        String out = builder.toString();
+        // "." 与 ".." 会指向目录自身/父目录，new File(dir, "..") 必然写失败。
+        if (out.isEmpty() || out.equals(".") || out.equals("..")) return "imported.osm";
+        return out;
+    }
+
+    /** 文件选择结果回调：path 与 error 二选一。 */
+    public native void nativePickedFile(String path, String error);
+
     /** 当前 APK 的 versionName（与 Release tag 对齐，供更新检查比较）。 */
     public String appVersionName() {
         try {

@@ -2,6 +2,33 @@ use super::*;
 use crate::api::cheat::{CheatReport, Status};
 use serde_json::json;
 
+/// 每个测试一份独立的落盘目录。
+///
+/// 原来两处都把 `route_fixture` 指向 `std::env::temp_dir()`（全系统同一个 %TEMP%）：
+/// 并行跑测试时几个用例会看到对方写下的文件，症状是"偶发失败、单跑不复现"。
+struct FixtureDir(std::path::PathBuf);
+
+impl FixtureDir {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "violation-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture dir");
+        Self(root)
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn query_failure_missing_fields_and_stale_result_are_visible() {
     for width in [320., 360., 412., 880.] {
@@ -66,7 +93,8 @@ fn related_record_button_scrolls_and_opens_only_the_explicit_id() {
             },
             Config::default(),
         );
-        app.route_fixture = Some((host, std::env::temp_dir()));
+        let fixture = FixtureDir::new();
+        app.route_fixture = Some((host, fixture.path()));
         app.tab = 3;
         app.data_page.cheat = Some(CheatReport::from_data(&json!({"self":{
             "reason":"服务端原始原因".repeat(10), "rrid":"42", "id":999, "time":"2026-10-20 07:30:00"
@@ -143,7 +171,8 @@ fn mismatched_detail_finishes_with_an_error_for_the_requested_record() {
         },
         Config::default(),
     );
-    app.route_fixture = Some((host, std::env::temp_dir()));
+    let fixture = FixtureDir::new();
+    app.route_fixture = Some((host, fixture.path()));
     app.records_page.detail_rrid = Some(42);
     app.fetch_run_detail(42);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

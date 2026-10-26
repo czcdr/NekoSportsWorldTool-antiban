@@ -1344,7 +1344,15 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let now_ms = crate::crypto::envelope::now_ms();
-        assert_eq!(plan.start_ms, typed.min(now_ms));
+        // ensure_plan() 读时钟的时刻早于这里的 now_ms；要求两者毫秒相等会在
+        // 跨毫秒边界时偶发失败（实测约 1%）。与 specified_time_is_clamped_to_now
+        // 同一写法：允许 2ms 的时钟误差。
+        assert!(
+            (plan.start_ms as i64 - typed.min(now_ms) as i64).abs() <= 2,
+            "start_ms={} 与 min(typed, now)={} 偏差过大",
+            plan.start_ms,
+            typed.min(now_ms)
+        );
         assert_start_not_future(&plan);
         // 界面提示条件：填入时刻晚于现在（23:59 总成立，除非正好在那一分钟）
         if typed > now_ms {

@@ -64,6 +64,35 @@ pub fn install_apk(path: &str) {
     let _ = path;
 }
 
+/// 让用户挑一个本地文件（Android：系统文件选择器；桌面：由调用方用 rfd）。
+///
+/// 选中后文件内容会被复制进应用私有目录 —— Android 的 `content://` URI 只有
+/// 授权瞬间可读，交给后台线程解析会失效，先落盘再解析最省事。
+///
+/// 返回 false 表示选择器没能唤起（桌面端恒为 false，因为没有实现）。
+pub fn pick_file() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        crate::android::pick_file()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        false
+    }
+}
+
+/// 取一次选择结果（取走即清空）。`Some(Ok(路径))` / `Some(Err(原因))`。
+pub fn take_picked_file() -> Option<Result<String, String>> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android::take_picked_file()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
+
 #[cfg(feature = "gui")]
 pub fn sync_clipboard(context: &egui::Context) {
     #[cfg(target_os = "android")]

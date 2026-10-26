@@ -21,30 +21,51 @@ pub const LOGOUT_PATH: &str = "/api/v6/user/logout";
 pub const CAPTCHA_ID_BIZ0: &str = "8c065103d81f5fd3efec8ad3e3a84c30";
 
 /// checkGeeUse 免验证码探测：data=true 时本次登录可跳过 GT4 与 geevalidate。
-/// 未登录态调用（uid=-1/token=""）；请求异常一律按 false 走原流程。
-fn gee_check(client: &mut ApiClient, username: &str, log: &mut dyn FnMut(&str)) -> bool {
+///
+/// 三态处理（原来是「任何异常都当 false」）：
+/// - `Ok(true/false)`：服务端明确回答了要不要验证码；
+/// - `Err`：**问不出来**（网络/解密失败）。这时不要进 GT4 —— 否则会在同一个坏
+///   出口上继续烧验证码请求，把「网络不通」变成「滑块答错」。一个 GT4 请求都不发。
+fn gee_check(
+    client: &mut ApiClient,
+    username: &str,
+    uuid: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<bool, String> {
     let body = json!({
         "username": username,
-        "uuid": uuid::Uuid::new_v4().to_string(),
+        // 与 geevalidate / login 用同一个 uuid：同一次登录三条请求三个 uuid，
+        // 本身就是一条免费的「这不是一个客户端」证据。
+        "uuid": uuid,
         "unid": 0,
         "type": 2,
     })
     .to_string();
-    match client.call("POST", GEECHECK_PATH, &body, &[]) {
-        Ok(biz) => {
-            let skip = biz.get("data").and_then(|d| d.as_bool()).unwrap_or(false);
-            log(&format!(
-                "[gee] checkGeeUse data={}（{}）",
-                skip,
-                if skip { "跳过 GT4" } else { "走 GT4 流程" }
-            ));
-            skip
+    let mut attempt = 0;
+    let biz = loop {
+        attempt += 1;
+        match client.call("POST", GEECHECK_PATH, &body, &[]) {
+            Ok(biz) => break biz,
+            Err(e) if attempt < 2 => {
+                log(&format!("[gee] checkGeeUse 失败（{e}），1 秒后重试一次"));
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => {
-            log(&format!("[gee] checkGeeUse 失败（{e}），按需验证码处理"));
-            false
-        }
-    }
+    };
+    // 服务端可能给 bool，也可能给 "true" / 1；原来只认 bool，字符串会被当 false。
+    let skip = match biz.get("data") {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => text.eq_ignore_ascii_case("true") || text == "1",
+        Some(Value::Number(number)) => number.as_i64().map(|v| v != 0).unwrap_or(false),
+        _ => false,
+    };
+    log(&format!(
+        "[gee] checkGeeUse data={}（{}）",
+        skip,
+        if skip { "跳过 GT4" } else { "走 GT4 流程" }
+    ));
+    Ok(skip)
 }
 
 /// 完整登录：checkGeeUse → [GT4 → geevalidate] → login。成功返回 Session。
@@ -55,15 +76,42 @@ pub fn login(
     log: &mut dyn FnMut(&str),
 ) -> Result<Session, String> {
     let uuid_value = uuid::Uuid::new_v4().to_string();
-    if gee_check(client, username, log) {
-        log("[login] 免验证码路径：直接登录");
-    } else {
-        // GT4 → geevalidate；10003（验证失败）时重破滑块再验，最多 3 轮
-        let captcha_id = CAPTCHA_ID_BIZ0;
-        let mut validated = false;
-        for attempt in 1..=3 {
+
+    // 冷却期内一个验证码请求都不发。用户看到「滑块过不去」就会连点，而连点正好
+    // 是最坏的动作：每点一次都在加深极验对该会话的降级。
+    if let Some(secs) = super::captcha_guard::cooldown_remaining_secs() {
+        return Err(format!(
+            "验证码校验已被临时限流（不是账号或密码错误），请{}后再试",
+            super::captcha_guard::cooldown_hint(secs)
+        ));
+    }
+
+    match gee_check(client, username, &uuid_value, log) {
+        Ok(true) => log("[login] 免验证码路径：直接登录"),
+        Ok(false) => {
+            let captcha_id = CAPTCHA_ID_BIZ0;
             log("[login] 开始 GT4 滑块验证…");
-            let creds = solve_gt4(captcha_id, client, log)?;
+            let creds = match solve_gt4(captcha_id, client, log) {
+                Ok(creds) => creds,
+                Err(error) => {
+                    // 判错不重试（solve_gt4 内部已保证），这里只负责把话说明白。
+                    if matches!(error, super::gt4::Gt4Error::Rejected(_)) {
+                        let secs = super::captcha_guard::record_rejection();
+                        let wait = if secs > 0 {
+                            format!(
+                                "，请{}后再试",
+                                super::captcha_guard::cooldown_hint(secs)
+                            )
+                        } else {
+                            "；先别连续点击，过几分钟再试".to_string()
+                        };
+                        return Err(format!(
+                            "验证码判定未通过，已停止本次尝试以免触发风控{wait}（与账号密码无关）"
+                        ));
+                    }
+                    return Err(format!("验证码未能完成：{error}"));
+                }
+            };
             log(&format!(
                 "[login] GT4 通过 lot_number={}",
                 creds.get("lotNumber").and_then(|v| v.as_str()).unwrap_or("")
@@ -86,29 +134,66 @@ pub fn login(
             let url = format!("{HOST}{GEEVALIDATE_PATH}");
             // UA 必须由身份拼出：写死 iOS UA 会让同一账号的登录与其余请求分属两台设备。
             let ua = crate::crypto::header::ua_for(&client.identity);
-            let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
-            let gv_err = out.decrypted.as_ref().and_then(|d| d.business.get("error").cloned());
-            match gv_err.as_ref().and_then(|e| e.as_i64()) {
-                Some(10000) => {
-                    log("[geevalidate] 验证通过");
-                    validated = true;
-                    break;
-                }
-                Some(10003) => {
-                    log(&format!("[geevalidate] 验证失败（{attempt}/3），重试"));
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-                other => {
-                    log(&format!("[geevalidate] err={other:?}（继续尝试登录）"));
-                    validated = true; // 非 10003 的失败不阻塞登录（服务端可能仍放行）
-                    break;
+
+            // 只重发 geevalidate（凭证可能仍有效，重发比重新破一次滑块便宜）：
+            // 不再「重破滑块 3 轮」，也不再在拿不到业务码时当成通过 —— 后者会让
+            // 一次「没验证成功」滑到带密码的登录请求，被服务端记成一次失败登录。
+            let mut validated = false;
+            let mut last_code: Option<i64> = None;
+            for attempt in 1..=2 {
+                let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
+                let code = out
+                    .decrypted
+                    .as_ref()
+                    .and_then(|d| d.business.get("error").cloned())
+                    .and_then(|e| e.as_i64());
+                match code {
+                    Some(10000) => {
+                        super::captcha_guard::record_success();
+                        log("[geevalidate] 验证通过");
+                        validated = true;
+                        break;
+                    }
+                    Some(10003) => {
+                        let secs = super::captcha_guard::record_rejection();
+                        let wait = if secs > 0 {
+                            format!("，请{}后再试", super::captcha_guard::cooldown_hint(secs))
+                        } else {
+                            "，请稍后再试".to_string()
+                        };
+                        return Err(format!(
+                            "服务端拒绝了验证码校验（10003）{wait}（与账号密码无关）"
+                        ));
+                    }
+                    other => {
+                        log(&format!("[geevalidate] err={other:?}（第 {attempt}/2 次）"));
+                        last_code = other;
+                        if attempt < 2 {
+                            let gap = 800 + (crate::crypto::envelope::now_ms().max(0) as u64 % 800);
+                            std::thread::sleep(std::time::Duration::from_millis(gap));
+                        }
+                    }
                 }
             }
+            if !validated {
+                return Err(format!(
+                    "验证码校验未通过（错误码 {}），请稍后再试",
+                    last_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "无（响应无法解密）".into())
+                ));
+            }
+            // 验证码刚过就立刻登录同样是个特征；真实用户点「登录」之间会有停顿。
+            let pause = 1_200 + (crate::crypto::envelope::now_ms().max(0) as u64 % 2_300);
+            std::thread::sleep(std::time::Duration::from_millis(pause));
         }
-        if !validated {
-            return Err("geevalidate 连续验证失败（10003），请重试".into());
+        Err(error) => {
+            // 问不出来就不进 GT4：在坏出口上刷验证码请求，只会把「网络不通」
+            // 变成「滑块答错」，还白烧一次容忍度。
+            return Err(format!(
+                "无法确认当前是否需要验证码（{error}），本次没有发起验证；请检查网络后重试"
+            ));
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
     // login（Authorization Basic + Android 形态信封 body）
@@ -178,11 +263,11 @@ pub fn login(
     eprintln!(
         "[session] uid={} token={} unid={} name={} weight={} device={}",
         sess.uid,
-        &crate::textlog::mask(&sess.token),
+        crate::textlog::mask(&sess.token),
         sess.unid,
         sess.name,
         sess.weight,
-        &sess.device_id
+        sess.device_id
     );
     eprintln!(
         "[session] profile 字段数={}",

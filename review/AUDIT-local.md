@@ -219,3 +219,36 @@ error occurred in cc-rs: failed to find tool "clang.exe": program not found
 - `android` cfg 下的编译（缺 NDK clang），以及 `MainActivity.java` 里新增的 display/androidId 取值最终形态。
 - `src/api/model.rs`、`src/ui/device.rs` 的并行编辑收敛后，`fingerprint_from_device` 的置位/清除路径需要再走一遍（本次读到的是中间态：保存时按"机型是否变化"清 android_id/pixel，读取时按"两字段是否都非空"置 true，两者组合可能出现"手动改机型 → 清空 → ensure_fingerprint 用 seed 兜底 → from_device=false"的中间状态，行为正确但提示文案会短暂误导）。
 - `submission_guard`（本次未在范围内）与 `safety` 的**双重**拦截叠加：`guard.has_pending()` 与 `safety` 都可能在"上次提交结果未知"时拒绝，两者的错误文案容易让用户以为被风控了。
+
+---
+
+## 6. 0.3.9-antiban 复核记录（issue #1–#4）
+
+### 6.1 已修
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 偶发失败：`future_specified_time_is_clamped_and_detectable` | `src/ui/run.rs:1347` | `ensure_plan()` 与测试各读一次时钟，只在同一毫秒内相等；实测 500 次跑 5 次失败（≈1%）。改为区间断言（容差 2ms），与 `specified_time_is_clamped_to_now` 同写法 |
+| 共享落盘目录 | `src/ui/violation_tests.rs` | 两处把 `route_fixture` 指向全系统 `%TEMP%`，并行测试会互相看到对方文件；改为每测试一份 uuid 子目录（`FixtureDir` + Drop 清理） |
+| GT4 判错后仍重试 | `src/api/login.rs`、`src/api/gt4.rs` | 原来 10003 会重破滑块 3 轮，最坏 6 次 `/load` + 6 次 `/verify`；改为按失败原因分域重试，判错立即停手 |
+| 验证码连点 | 新增 `src/api/captcha_guard.rs` | 连续判错触发持久冷却（10 / 30 / 60 分钟），冷却期一个验证码请求都不发 |
+| `passtime` 常量 | `src/api/gt4.rs` | 原来固定 1887，改为真实耗时 |
+| 延迟位置错误 | `src/api/gt4.rs` | 延迟应在取图之后（看图）而不是之前 |
+| `lot_number` 切片 panic | `src/api/gt4.rs` | `lot.get(26..30)` 长度不足会 panic，改为安全取值 |
+| `checkGeeUse` 三态压成一种 | `src/api/login.rs` | 问不出来就不进 GT4；`uuid` 三请求复用；兼容 `"true"` / `1` |
+| geevalidate 解密失败 fail-open | `src/api/login.rs` | 拿不到业务码时重发一次，不再当成通过（否则会滑到带密码的失败登录） |
+| 路网文件无体积上限 | `src/track/generate_road.rs` | 手机可从文件选择器挑任意大文件，加 64 MiB 上限 |
+| 构建脚本 PS 5.1 断点 | `android/build.ps1` | `SHA256.HashData` / `Convert.ToHexString` / `ZipArchive` / `Invoke-Checked` 四处（见 CHANGES K.4） |
+
+### 6.2 明确不改（有理由）
+
+- `gee_guard.roe` 八键全 `"3"`：等于「全部未检出异常」，随机化成 1/2 反而是主动声称检测到异常。
+- `device_id: ""`、`ep`、`biht`、`em` 全 0：抓包字面量 / 诚实留空，没有证据前不动。
+- `complete: true`、`validDistance == totalDis`、`faceCheck = 1`：改了会直接影响记录是否算数。
+- 提交与 OBS 的窗口 `id` 口径：无抓包证据。
+
+### 6.3 仍未解决（需要真机或干净出口）
+
+1. 极验在**干净出口**上的真实通过率：本机出口已被降级，且不应用生产 captcha_id 继续刷。
+2. Android「选择文件…」的真机交互（本机只验证到编译 + 出包）。
+3. TLS 指纹（JA3/密码套件顺序）仍非 Conscrypt/BoringSSL。

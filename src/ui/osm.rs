@@ -89,6 +89,20 @@ impl App {
     fn draw_osm_contents(&mut self, ui: &mut egui::Ui) {
         let mut load_now = false;
 
+        // Android：系统文件选择器的结果（选中后已复制进私有目录）
+        if let Some(result) = crate::platform::take_picked_file() {
+            match result {
+                Ok(path) => {
+                    self.osm_page.path = path;
+                    self.osm_page.status = "已选择文件，正在加载路网…".into();
+                    load_now = true;
+                }
+                Err(reason) => {
+                    self.osm_page.status = format!("选择文件未完成：{reason}");
+                }
+            }
+        }
+
         ui.label("按学校围栏或当前点位获取路网；多出的里程沿同一道路闭环重复。");
         let school = self
             .session
@@ -128,7 +142,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("手动 OSM 文件：");
             ui.add_sized(
-                [ui.available_width().min(340.0).max(100.0), 26.0],
+                [ui.available_width().clamp(100.0, 340.0), 26.0],
                 egui::TextEdit::singleline(&mut self.osm_page.path)
                     .hint_text("拖入 .osm 文件或填写路径"),
             );
@@ -140,6 +154,15 @@ impl App {
                 {
                     self.osm_page.path = p.display().to_string();
                 }
+            }
+            // Android 没有 rfd：走系统文件选择器（SAF），选中后由 Java 侧复制到私有目录。
+            #[cfg(target_os = "android")]
+            if ui.button("选择文件…").clicked() {
+                self.osm_page.status = if crate::platform::pick_file() {
+                    "已打开系统文件选择器，选好后会自动加载".into()
+                } else {
+                    "无法打开系统文件选择器，请把 .osm 文件放到应用私有目录后填写路径".into()
+                };
             }
             let can_load = !self.osm_page.path.is_empty() && !self.osm_page.busy;
             if ui

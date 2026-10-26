@@ -12,6 +12,8 @@ static EDITS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 static SCREEN_ON: AtomicBool = AtomicBool::new(false);
 static SAFE_INSETS: Mutex<[i32; 4]> = Mutex::new([0; 4]);
 static DEVICE_INFO: Mutex<Option<DeviceInfoReply>> = Mutex::new(None);
+/// 文件选择器结果（路径 或 错误文本）。
+static PICKED: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 
 pub(crate) struct DeviceInfoReply {
     pub initial: bool,
@@ -201,6 +203,35 @@ pub(crate) fn set_keep_screen_on(enabled: bool) {
     }) {
         SCREEN_ON.store(enabled, Ordering::Relaxed);
     }
+}
+
+/// 打开系统文件选择器（SAF）。结果经 `nativePickedFile` 回到 `take_picked_file`。
+/// 返回 false 表示连选择器都没能唤起（调用失败）。
+pub(crate) fn pick_file() -> bool {
+    with_activity(|env, activity| {
+        env.call_method(activity, "pickOsmFile", "()V", &[])?;
+        Ok(())
+    })
+}
+
+/// 取文件选择结果：`Some(Ok(路径))` 选中并已复制进私有目录，`Some(Err)` 失败/取消。
+pub(crate) fn take_picked_file() -> Option<Result<String, String>> {
+    PICKED.lock().unwrap().take()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_nekosportsworld_tool_MainActivity_nativePickedFile(
+    mut env: JNIEnv<'_>, _activity: JObject<'_>, path: JString<'_>, error: JString<'_>,
+) {
+    let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
+    let error: String = env.get_string(&error).map(|s| s.into()).unwrap_or_default();
+    let reply = if error.is_empty() && !path.is_empty() {
+        Ok(path)
+    } else {
+        Err(if error.is_empty() { "未选择文件".to_string() } else { error })
+    };
+    *PICKED.lock().unwrap() = Some(reply);
+    if let Some(context) = CONTEXT.lock().unwrap().as_ref() { context.request_repaint(); }
 }
 
 #[no_mangle]

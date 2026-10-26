@@ -205,6 +205,126 @@ JA3 的 cipher 列表依旧对不上。要完全一致得换 BoringSSL 绑定，
 `cargo build`（桌面）通过；CLI 实跑 `update --check` 走通真实 TLS（GitHub API 支持 h2，
 返回"没有可用的发布资产"属正常 —— 该仓库没有 Release）。
 
+## K. 0.3.9-antiban：issue #1–#4（滑块与手机路网导入）
+
+对应 GitHub 上的四个 issue：#1「滑块验证过不了」、#2「v0.3.8 滑块验证失败」、
+#3「滑块」、#4「手机不能手动导入路网 建议改成文件形式」。前三个是同一件事。
+
+### K.1 滑块：实测出的两个真问题
+
+先做了一次不带账号的联网探针（`live_gt4_probe`，默认 `#[ignore]`，用 `--ignored` 手动跑），
+直连极验 `/load` → 下载两图 → 识别 → `/verify`，连续多轮统计：
+
+| 轮次 | 成功 | 说明 |
+|---|---|---|
+| 第 1 批 12 轮 | 11/12 | 唯一失败那次 `distance=75`，缺口实际在 ~200 —— 配到了背景里同纹理的别处 |
+| 后续各批 | 2/16、4/16、0/8… | 一路下滑，换 socks5 出口也没恢复 |
+
+结论两条：
+
+1. **识别是概率性的，偶发错配确实存在**（约 8%），这就是用户撞到的失败；
+2. **同一出口连续失败会把极验对该会话/IP 的容忍度打掉**：答错一次就消耗一次，
+   越试越不通过。所以「失败就立刻重试」这个既有行为本身在加剧问题。
+
+**试过又撤回的方案**：用 alpha 掩码裁掉切片透明边距 + 灰度 NCC、再换成梯度方向一致性
+匹配（`orient_match`）。在抓下来的样本图上**人工核对**过几轮，新算法反而不如旧管线
+（缺口左缘 x≈190 时它给 121，配到背景的蓝色装饰图案上），且验证码被降级后 `/verify`
+恒 fail、无法再用返回结果评估，于是不再赌新算法，**回退到原 Canny 管线**。
+
+**最终做法**（`src/api/gt4image.rs`、`src/api/gt4.rs`、`src/api/login.rs`、
+`src/api/captcha_guard.rs`）：
+
+- `/load` 的 `ypos` 被实测确认是「切片原图顶部」在背景中的 y（与整张切片模板的最佳 y
+  逐轮吻合 ±2px），拿它做**一致性校验**：识别出的 y 偏离 `ypos` 超过 8px 就判定这一张
+  不可靠，直接换图重试 —— **宁可不答，也不交错答案**；
+- **按失败原因分域重试**（`Gt4Error::{Unreliable, Rejected, Fatal}`）：认不准/网络抖动
+  才换图（最多 2 张，间隔 3–6s）；**极验判错立即停手**，不再重试 —— 原来 `login` 会在
+  10003 上重破滑块 3 轮，最坏一次登录要打 6 次 `/load` + 6 次 `/verify`，而这类失败
+  恰恰不该靠重试解决；
+- **验证码冷却**（新模块 `captcha_guard`）：连续 2 次判错冷却 10 分钟、3 次 30 分钟、
+  4 次以上 1 小时，状态落 `data_dir/captcha_state.json`，冷却期内 `login` 一个验证码
+  请求都不发。用户看到「过不了」就会连点，而连点正好在加深降级；
+- **`passtime` 改成真实耗时**（原来是常量 1887，所有账号所有次数完全一致）；
+- **延迟挪到正确的顺序**：取图 → 看图 0.9–1.9s → 拖动 0.12–0.38s → 交卷，
+  再在验证码通过后停 1.2–3.5s 才发登录（原来延迟加在取图之前，
+  可观测形态是「图到手 200ms 就交卷」）；
+- `checkGeeUse` 三态化：**问不出来（网络/解密失败）就不进 GT4**，否则会在坏出口上
+  继续烧验证码，把「网络不通」变成「滑块答错」；`uuid` 三条请求复用同一个
+  （原来一次登录三个 uuid）；`data` 兼容 `bool` / `"true"` / `1`；
+- geevalidate 拿不到业务码时**重发一次**而不是当成通过（原来 `other => validated = true`
+  会让「没验证成功」滑到带密码的登录请求，被服务端记成一次失败登录）；
+- 探针**必须显式给 `GT4_PROBE_CAPTCHA_ID`** 才跑（原来默认用生产 captcha_id 连跑，
+  本身就是一次密集打点，会污染之后的实测数据），轮次默认 3、间隔 5–10s；
+- 顺手修：`get_w` 里对 `lot_number` 直接切片，长度不足会 panic，改为安全取值。
+
+**没动**（没有证据、改了可能破坏通过路径）：`gee_guard.roe` 八键全 `"3"`（等于「全部
+未检出异常」，随机化等于主动承认异常）、`device_id: ""`、`ep` / `biht` 等抓包字面量、
+`em` 全 0。
+
+### K.2 手机路网导入（issue #4）
+
+原来「浏览…」按钮被 `#[cfg(not(target_os = "android"))]` 挡掉，Android 上只能手敲路径，
+而手机上没有可敲的路径 —— 等于功能在手机上不存在。
+
+改成走**系统文件选择器（SAF）**，不申请任何存储权限：
+
+| 层 | 改动 |
+|---|---|
+| `MainActivity.java` | 新增 `pickOsmFile()`（`ACTION_OPEN_DOCUMENT`）与 `onActivityResult`；选中后把文件**复制进私有目录**再回传路径 —— `content://` URI 只在授权瞬间可读，交给后台解析会失效 |
+| `src/android.rs` | JNI 调用 + `nativePickedFile` 回调 + `take_picked_file()` |
+| `src/platform.rs` | `pick_file()` / `take_picked_file()` 平台抽象（桌面为 no-op） |
+| `src/ui/osm.rs` | Android 上显示「选择文件…」，每帧轮询结果，选好即自动加载 |
+
+桌面路径不变（仍用 rfd）。
+
+### K.3 顺带修掉的偶发失败（不是本轮引入的）
+
+`cargo test --lib` 曾经偶发失败一次（`assertion left == right`，随后连跑多次全绿）。
+交给子代理专门去复现，定位到：
+
+- 用例 `ui::run::tests::future_specified_time_is_clamped_and_detectable`（`ui/run.rs:1347`）；
+- 原因：`ensure_plan()` 内部读一次时钟写 `start_ms`，测试随后又读一次 `now_ms()`，
+  两者只在同一毫秒内才相等 → 实测 500 次跑 5 次失败（约 1%）；
+- 修法：改成与相邻 `specified_time_is_clamped_to_now` 一致的**区间断言**（容差 2ms）；
+- 另一处同型隐患：`ui/violation_tests.rs` 两处把 `route_fixture` 指向共享的
+  `std::env::temp_dir()`，并行测试会互相看到对方落盘的文件 → 改成每个测试一份
+  uuid 子目录（`FixtureDir`，Drop 时清理）。
+
+### K.4 构建脚本在 Windows PowerShell 5.1 下的三个断点
+
+本机就是 5.1（`$PSVersionTable.PSVersion` = 5.1.26100）。`android/build.ps1` 原来有三处
+只在 PowerShell 7 / .NET 6+ 成立，导致 `build.ps1` 直接起不来：
+
+| 断点 | 原因 | 改动 |
+|---|---|---|
+| `[Security.Cryptography.SHA256]::HashData` | .NET Framework 没有该方法 | 改用 `SHA256.Create()` + `ComputeHash` |
+| `[Convert]::ToHexString` | 同上，.NET Framework 没有 | 改用 `-join ($bytes \| % { $_.ToString('X2') })` |
+| `System.IO.Compression.ZipArchive` | 本机 `Add-Type` 报成功但类型解析不到 | 改用 JDK 自带的 `jar --update` 更新 APK |
+| `Invoke-Checked` | 显式 `2>&1` 收进来的 stderr 记录，在 `$ErrorActionPreference='Stop'` 下会被包成 `RemoteException` 直接中止（裸调用不触发，只有 `2>&1` 才触发） | 这一段临时降级 `$ErrorActionPreference`，只按 `$LASTEXITCODE` 判定 |
+
+### K.5 验证
+
+```
+cargo test --lib                                234 passed / 0 failed（新增 3 个用例）
+cargo clippy --lib --all-features               exit 0（改动文件零新增告警）
+cargo check --all-targets --all-features        exit 0
+cargo check --target aarch64-linux-android --features android   Finished
+android/build.ps1  release arm64-v8a            APK 出包通过，v2+v3 签名验证通过
+                                                versionCode 30011 / 0.3.9-antiban
+                                                SHA-256 EF9D3A34…E6810
+```
+
+新增用例：
+- `api::gt4image::tests::ypos_gate_follows_the_measured_offset`：先用 `match_at` 求合成图上的
+  真实定位（x≈135 / y≈45）做基准，再断言「一致放行 / 8px 内放行 / 9px 拒绝」。
+  **不用写死像素的恒真式断言**（第一版 `assert!(x <= 300)` 就是恒真的，被审查抓出来）。
+- `api::captcha_guard::tests::second_rejection_starts_a_cooldown_and_success_clears_it`
+- `api::captcha_guard::tests::repeated_rejections_escalate_the_cooldown`
+
+**没有验证到的**（本机做不到，不冒充）：真机上「选择文件…」的实际交互、极验在干净出口
+上的真实通过率（本机出口已被降级，且不应用生产 captcha_id 去刷）。
+
+
 
 
 
