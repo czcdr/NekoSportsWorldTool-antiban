@@ -221,7 +221,7 @@ impl App {
             );
         }
         // 指纹自洽自检：机型↔分辨率↔系统版本↔androidId，比轨迹更容易被服务端判定。
-        // 读数来自真机时（fingerprint_from_device）不按机型库核对 —— 这台机不在那 13 款里是正常的。
+        // 读数来自真机时（fingerprint_from_device）不按机型库核对 —— 这台机不在机型表里是正常的。
         if self.identity.platform == "android" {
             let profile = crate::api::fingerprint::DeviceProfile::from_parts(
                 &self.identity.device_name,
@@ -315,7 +315,9 @@ fn randomize(buf: &mut HeaderIdentity, platform: &str) {
         buf.manufacturer = profile.brand;
         buf.os_version = profile.os_version;
         buf.pixel = profile.pixel;
-        buf.android_id = profile.android_id;
+        // androidId 独立随机（**不**跟着 device_id 派生）：真机上 ANDROID_ID 是
+        // 系统在安装时随机给的，和 App 自定义的 DeviceId 没有派生关系。
+        buf.android_id = crate::api::fingerprint::random_android_id();
         buf.idfa = String::new();
         // 随机生成的档案来自机型库，不是本机读数 → 自检按机型库核对。
         buf.fingerprint_from_device = false;

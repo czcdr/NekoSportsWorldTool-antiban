@@ -14,6 +14,14 @@ pub struct PolicyInfo {
     pub valid_time: i64,
     /// 必经点（BD 系，与打卡点同系），policy 响应里若有则返回。
     pub must_points: Vec<(f64, f64)>,
+    /// 服务端是否要求本次跑步做人脸核验。
+    ///
+    /// **只读**：只用于在日志/界面上提示「这次服务端要核验，而本工具不会执行」，
+    /// 不参与提交体构造（`faceCheck` 仍由用户配置决定）。`None` = 响应里没有这个
+    /// 字段，**不等于**「不要求」。
+    pub face_required: Option<bool>,
+    /// 人脸核验类型（官方 `RunFaceCheckConfigDTO.faceVerifyType`），只读。
+    pub face_verify_type: Option<i64>,
 }
 
 /// 从 policy 响应 `data` 中防御式提取必经点列表（字段名不确定，逐个尝试）。
@@ -71,6 +79,48 @@ pub fn fetch_policy(client: &mut ApiClient) -> Result<PolicyInfo, String> {
     parse_response(&biz)
 }
 
+/// 从 policy 响应里读人脸核验配置（**只读**，不参与提交体构造）。
+///
+/// 字段名来自官方 dex（`com.zjwh.android_wh_physicalfitness`）：
+/// `faceEnable` / `faceVerifyType` / `faceCheck` / `serverCheckStatus`，
+/// 以及 DTO `entity.RunFaceCheckConfigDTO`。服务端把开关放在顶层还是
+/// `runRuleModel` 里**没有抓包证据**，所以三处都找；找不到就是 `None`
+/// （= 不知道），不当成「不要求」。
+fn extract_face_rule(biz: &Value, rule: &Value) -> (Option<bool>, Option<i64>) {
+    // `runFaceCheck` 可能是一个 DTO 对象，把它的字段也纳入查找范围。
+    let nested = ["runFaceCheck", "runFaceCheckConfigDTO", "faceCheckConfig"]
+        .iter()
+        .find_map(|name| get_field(biz, name).filter(|v| v.is_object()).cloned())
+        .unwrap_or(Value::Null);
+
+    let pick = |name: &str| -> Option<Value> {
+        rule.get(name)
+            .cloned()
+            .or_else(|| get_field(biz, name).cloned())
+            .or_else(|| nested.get(name).cloned())
+            .filter(|v| !v.is_null())
+    };
+    let as_bool = |v: Value| -> Option<bool> {
+        match v {
+            Value::Bool(b) => Some(b),
+            Value::Number(n) => n.as_i64().map(|n| n != 0),
+            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    let face_required = pick("faceEnable")
+        .and_then(as_bool)
+        .or_else(|| pick("faceCheck").and_then(as_bool))
+        .or_else(|| pick("serverCheckStatus").and_then(as_bool));
+    let face_verify_type = pick("faceVerifyType").and_then(|v| v.as_i64());
+    (face_required, face_verify_type)
+}
+
 pub(crate) fn parse_response(biz: &Value) -> Result<PolicyInfo, String> {
     let biz = super::client::normalize_business_data(biz)?;
     let timestamp = get_field(&biz, "timestamp")
@@ -82,6 +132,7 @@ pub(crate) fn parse_response(biz: &Value) -> Result<PolicyInfo, String> {
     let rule = get_field(&biz, "runRuleModel")
         .cloned()
         .unwrap_or(Value::Null);
+    let (face_required, face_verify_type) = extract_face_rule(&biz, &rule);
     Ok(PolicyInfo {
         timestamp,
         policy,
@@ -91,6 +142,8 @@ pub(crate) fn parse_response(biz: &Value) -> Result<PolicyInfo, String> {
             .unwrap_or(1000),
         valid_time: rule.get("validTime").and_then(|t| t.as_i64()).unwrap_or(0),
         must_points: extract_must_points(&biz)?,
+        face_required,
+        face_verify_type,
     })
 }
 
@@ -130,5 +183,37 @@ mod tests {
             extract_must_points(&json!({"mustPoints":[{}, {"lat":39.9,"lon":116.4}]})).is_err()
         );
         assert!(extract_must_points(&json!({"mustPoints":"bad"})).is_err());
+    }
+
+    /// 人脸开关只做**读取**：三种落点（runRuleModel / 顶层 / DTO 对象）都要认，
+    /// 认不出必须是 `None` 而不是 `Some(false)` —— 后者会在日志里撒谎说"不要求核验"。
+    #[test]
+    fn face_rule_is_read_only_and_lenient() {
+        let cases = [
+            (json!({"data":{"timestamp":1,"runRuleModel":{"faceEnable":true}}}), Some(true)),
+            (json!({"data":{"timestamp":1,"faceCheck":1}}), Some(true)),
+            (json!({"data":{"timestamp":1,"faceCheck":"0"}}), Some(false)),
+            (
+                json!({"data":{"timestamp":1,"runFaceCheck":{"faceEnable":true,"faceVerifyType":2}}}),
+                Some(true),
+            ),
+            (json!({"data":{"timestamp":1,"serverCheckStatus":"1"}}), Some(true)),
+        ];
+        for (response, want) in cases {
+            let policy = parse_response(&response).unwrap();
+            assert_eq!(policy.face_required, want, "响应：{response}");
+        }
+
+        // 字段缺失 = 不知道，不能当成"不要求"。
+        let absent = parse_response(&json!({"data":{"timestamp":1}})).unwrap();
+        assert_eq!(absent.face_required, None);
+        assert_eq!(absent.face_verify_type, None);
+
+        // faceVerifyType 独立提取（可能只下发类型、不下发开关）。
+        let typed =
+            parse_response(&json!({"data":{"timestamp":1,"runRuleModel":{"faceVerifyType":3}}}))
+                .unwrap();
+        assert_eq!(typed.face_required, None);
+        assert_eq!(typed.face_verify_type, Some(3));
     }
 }

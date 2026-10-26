@@ -191,13 +191,20 @@ mod validation_tests {
     }
 }
 
-/// 10s 时间窗，id=(rrid%100000)*1000+窗口序秒（6 个真人样本跨 9 月记录验证一致；
-/// 旧版 App 样本为全局序号，不适用当前版本）。
+/// 10s 时间窗。**这是全链唯一的窗口构造函数**：提交的 `speedPerTenSec` /
+/// `stepsPerTenSec` 与 OBS 的 `speed_json` / `step_freq_json` 都从这里出，
+/// 不允许任何调用方再改写 `id` / `queueNum`（见文件底 `submit_and_obs_share_window_ids`）。
+///
+/// `id` 口径：以跑步开始时间（秒）为基数、模 100000，再加本次窗口下标。于是它
+/// **跨跑步单调递增**、单次跑步内连续，且与 rrid 无关 —— 真机样本里两次跑步
+/// 分别是 2..96、97..102 这种连续段，就是这个形态。
+/// `queueNum` 是**本次跑步内的 0 起下标**。
+///
 /// 步频上限（步/分）。窗口里的 `stepsNum` 与提交 body 的汇总 `avgStepFreq`
 /// 必须用同一个上限，否则短时长会算出「窗口 220、汇总 250」的自相矛盾数据。
 pub const MAX_STEP_FREQ_PER_MIN: f64 = 220.0;
 
-pub(crate) fn build_windows(track: &Track, rrid: i64) -> (Vec<Value>, Vec<Value>) {
+pub(crate) fn build_windows(track: &Track) -> (Vec<Value>, Vec<Value>) {
     let start_ms = track.startTime;
     let total_time = track.totalTime;
     let mut sp = Vec::new();
@@ -208,7 +215,6 @@ pub(crate) fn build_windows(track: &Track, rrid: i64) -> (Vec<Value>, Vec<Value>
     //   · `queueNum` 是**本次跑步内的 0 起下标**；
     //   · 末窗可能不足 10s，而 `speedPerTenSec` 里每项都是满 10 秒的统计量，
     //     必须按实际时长缩放，否则详情页会算出 300+ 步/分。
-    let _ = rrid;
     let id_base = (start_ms / 1000).rem_euclid(100_000);
     for (i, a) in track.speedPerTenSec.iter().enumerate() {
         let b = &track.stepsPerTenSec[i];
@@ -314,7 +320,7 @@ pub fn build_obs_object(
         .map(|p| conv_point(p, start_ms))
         .collect();
     let run_wrap = json!({ "allLocJson": Value::Array(pts).to_string(), "useZip": false });
-    let (sp, stf) = build_windows(track, rrid);
+    let (sp, stf) = build_windows(track);
     let laps = build_laps(track, start_ms);
     json!({
         "rrid": gz_str(&rrid.to_string()),
@@ -466,7 +472,7 @@ mod regression_tests {
             .read_to_string(&mut decoded)
             .unwrap();
         assert_eq!(decoded, wrapper);
-        let (speed, steps) = build_windows(&linear_track(1100.0, 603, 1201), 60);
+        let (speed, steps) = build_windows(&linear_track(1100.0, 603, 1201));
         assert_eq!(speed.last().unwrap()["endTime"], 603000);
         assert_eq!(speed.last().unwrap()["beginTime"], 600000);
         assert_eq!(
@@ -515,7 +521,7 @@ mod window_and_position_tests {
     /// 末窗不足 10s 时按实际时长缩放，避免详情页算出 300+ 步/分。
     #[test]
     fn last_partial_window_keeps_cadence_sane() {
-        let (sp, stf) = build_windows(&track_with(1237), 0);
+        let (sp, stf) = build_windows(&track_with(1237));
         let last = stf.last().unwrap();
         let secs = ((last["endTime"].as_i64().unwrap() - last["beginTime"].as_i64().unwrap()) as f64
             / 1000.0)
@@ -530,13 +536,52 @@ mod window_and_position_tests {
     /// `id` 必须是跨跑步递增的序号，`queueNum` 是窗内下标。
     #[test]
     fn window_ids_are_sequential() {
-        let (sp, stf) = build_windows(&track_with(60), 99_999_999);
+        let (sp, stf) = build_windows(&track_with(60));
         let ids: Vec<i64> = sp.iter().map(|w| w["id"].as_i64().unwrap()).collect();
         assert_eq!(ids, vec![ids[0], ids[0] + 1, ids[0] + 2, ids[0] + 3, ids[0] + 4, ids[0] + 5]);
         for (i, w) in sp.iter().enumerate() {
             assert_eq!(w["queueNum"].as_i64().unwrap(), i as i64);
         }
         assert_eq!(stf[1]["queueNum"].as_i64().unwrap(), 1);
+    }
+
+    /// 提交与 OBS 必须是**同一套**窗口 id / queueNum。
+    ///
+    /// 这是「口径不同」那个问题的回归锁：以前提交把 `id` 改写成 `60000 + i`，
+    /// 而 OBS 走 `build_windows` 的起点基数。同一次跑步对同一个窗口报两个 id，
+    /// 服务端把 `speedPerTenSec` 与 OBS 的 `speed_json` 对一遍就是硬矛盾。
+    #[test]
+    fn submit_and_obs_share_window_ids() {
+        let track = track_with(120);
+        let (sp, stf) = build_windows(&track);
+        let obs = build_obs_object(&track, 4_200_001, "uuid-fixture", 7, "{}");
+        let decode = |key: &str| -> Vec<Value> {
+            let bytes = crate::crypto::envelope::b64_decode(obs[key].as_str().unwrap()).unwrap();
+            let mut text = String::new();
+            use std::io::Read;
+            flate2::read::GzDecoder::new(&bytes[..])
+                .read_to_string(&mut text)
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let obs_speed = decode("speed_json");
+        let obs_steps = decode("step_freq_json");
+        assert_eq!(obs_speed.len(), sp.len());
+        assert_eq!(obs_steps.len(), stf.len());
+        for (wire, obs) in sp.iter().zip(obs_speed.iter()) {
+            assert_eq!(wire["id"], obs["id"], "提交/OBS 的窗口 id 必须同源");
+            assert_eq!(wire["queueNum"], obs["queueNum"]);
+        }
+        for (wire, obs) in stf.iter().zip(obs_steps.iter()) {
+            assert_eq!(wire["id"], obs["id"]);
+            assert_eq!(wire["queueNum"], obs["queueNum"]);
+        }
+        // 全链只有一套基数：起点秒 % 100000 + 窗口下标，不允许出现第二套。
+        let base = (track.startTime / 1000).rem_euclid(100_000);
+        for (i, w) in sp.iter().enumerate() {
+            assert_eq!(w["id"].as_i64().unwrap(), base + i as i64);
+            assert_eq!(w["queueNum"].as_i64().unwrap(), i as i64);
+        }
     }
 
     /// 五点的 `position` 用数组下标（真机样本为 0,1,2,…）。

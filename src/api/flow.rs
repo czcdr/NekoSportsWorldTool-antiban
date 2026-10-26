@@ -187,6 +187,19 @@ pub fn run_full_flow_cancellable(
         "√ [policy] ts={} policy={} minDistance={} validTime={}",
         pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
     ));
+    // 人脸核验：服务端要不要，本工具都**不执行**核验。这里只把事实摆出来 ——
+    // 让「这条记录可能被判无效」在跑之前就可见，而不是等详情页异常才发现。
+    match pol.face_required {
+        Some(true) => log(&format!(
+            "⚠ [policy] 服务端要求本次人脸核验（faceVerifyType={}）：本工具不执行核验，\
+             提交只有 faceCheck 标记、没有核验数据，记录可能被判无效",
+            pol.face_verify_type
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "未下发".into())
+        )),
+        Some(false) => log("[policy] 服务端本次未要求人脸核验"),
+        None => log("[policy] 响应未下发人脸核验配置（不代表不要求）"),
+    }
     // 服务端时钟对齐：本地时间偏差会让请求 timeStamp 与服务端对不上，
     // 是成本很低的异常特征，也是「提交成功却不算数」的常见原因之一。
     let skew_ms = server_skew_ms(pol.timestamp);

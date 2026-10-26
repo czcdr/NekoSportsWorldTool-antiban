@@ -169,12 +169,12 @@ mock 对未知路径返回业务错误，避免"什么都说成功"掩盖意外�
 
 | 项 | 为什么不动 |
 |---|---|
-| HTTP/TLS 指纹（ureq+rustls、HTTP/1.1、无 ALPN h2、无 `Accept-Encoding`/`Connection`） | 要对齐 OkHttp+Conscrypt 得换 BoringSSL 栈并启用 h2，属独立一轮的工程；半对齐（只加 `Accept-Encoding: gzip` 而不解压）反而会把响应解坏。**这是当前最大的单一特征，优先级最高。** |
+| HTTP/TLS 指纹（ureq+rustls、HTTP/1.1、无 ALPN h2、无 `Accept-Encoding`/`Connection`） | 要对齐 OkHttp+Conscrypt 得换 BoringSSL 栈并启用 h2，属独立一轮的工程；半对齐（只加 `Accept-Encoding: gzip` 而不解压）反而会把响应解坏。**这是当前最大的单一特征，优先级最高。** → 已在 **J.3**（h2/gzip）与 **L.1**（cipher 顺序/曲线/ALPN）处理；仍差扩展集合 |
 | `complete: true` / `unCompleteReason: 0` | 服务端若做交叉核对会露馅，但改成 false 等于主动让记录不算数 —— 直接损害代跑目的 |
 | `validDistance == totalDis` 恒等（100% 有效里程） | 扣一点里程更像真机，但一旦扣到 `minDistance` 以下记录直接不算数；在没有服务端口径证据前不动 |
 | `faceCheck=1` 而 `runFaceCheck` 为空 | 同样是「像真机」与「能算数」的取舍：置 0 可能让需要人脸核验的学校判无效 |
-| 提交窗口 `id = 60000+i` 与 OBS 的 `id` 口径不同 | 代码注释表明这是两种格式的既有差异（`submit_windows` 的注释），没有抓包证据前不擅自统一 |
-| 机型库仅 13 款、`androidId` 由 `device_id` 派生 | 属数据工程（补机型长尾）与「别整份复制 identity.json」的使用约束，不是代码 bug |
+| 提交窗口 `id = 60000+i` 与 OBS 的 `id` 口径不同 | 代码注释表明这是两种格式的既有差异（`submit_windows` 的注释），没有抓包证据前不擅自统一 → **已在 L.2 统一**（以内部一致优先） |
+| 机型库仅 13 款、`androidId` 由 `device_id` 派生 | 属数据工程（补机型长尾）与「别整份复制 identity.json」的使用约束，不是代码 bug → **已在 L.3 扩到 24 款并解耦 `androidId`** |
 
 **验证**：`cargo test --lib` 231 passed / 0 failed（含假跑双身份回归）；`cargo clippy --lib --all-features` 退出码 0；`cargo check --all-targets --all-features` 与 `--target aarch64-linux-android --features android` 均通过。假跑抓包已核对：`policy` 请求头含 `nonce/timeStamp/tokenSign`，`appVersion: 7.4.0`，全链 UA 统一。
 
@@ -200,6 +200,8 @@ JA3/JA4 + ALPN 就能把两类客户端分开，零误伤、零成本。
 
 **仍然不同（无法靠换 crate 解决）**：密码套件顺序仍是 rustls 而非 Conscrypt 的 BoringSSL，
 JA3 的 cipher 列表依旧对不上。要完全一致得换 BoringSSL 绑定，属另一量级工程。
+→ **后半句已在 L.1 推翻**：cipher 集合/顺序、曲线顺序、ALPN 都能在不换 crate 的前提下对齐，
+真正做不到的是**扩展集合**（那确实要 BoringSSL）。
 
 **验证**：231 passed；clippy 退出码 0；`--all-targets` 与 `--target aarch64-linux-android` 均通过；
 `cargo build`（桌面）通过；CLI 实跑 `update --check` 走通真实 TLS（GitHub API 支持 h2，
@@ -323,6 +325,205 @@ android/build.ps1  release arm64-v8a            APK 出包通过，v2+v3 签名�
 
 **没有验证到的**（本机做不到，不冒充）：真机上「选择文件…」的实际交互、极验在干净出口
 上的真实通过率（本机出口已被降级，且不应用生产 captcha_id 去刷）。
+
+---
+
+## L. 0.3.9-antiban 续：密码套件 / 窗口 id 口径 / 机型库长尾（**未发版**）
+
+这一轮只动三处「不需要服务端行为证据也能判断对错」的地方：握手参数、两份报文
+自相矛盾的编号、机型与 androidId 的生成方式。J.2 里那三个「自报结论」
+（`complete`、`validDistance`、`faceCheck`）**一个都没动** —— 理由和风险在 L.4 单独列清。
+
+### L.1 密码套件：把 ClientHello 的 cipher / 曲线顺序压到 Conscrypt 的形状
+
+J.3 换到 reqwest 只解决了 ALPN 与 h2，**密码套件顺序还是 rustls 自己的**。
+网关取一次 JA3 的 cipher 段（第 2 段）就能把官方客户端和本工具分开，成本近乎为零。
+新增 `src/tls.rs`，在 `Agent::new` 里用 `use_preconfigured_tls` 接上：
+
+| 项 | 做法 |
+|---|---|
+| 密码套件 | `rustls::crypto::ring` 的 provider 按 Conscrypt 的 9 套**重排**：TLS1.3 三套在前，之后 ECDHE_ECDSA / ECDHE_RSA 交替，每种密钥交换按 GCM-128 → GCM-256 → CHACHA20。rustls 恰好只支持这 9 套，所以是**逐项相等**，不是「Conscrypt 列表 + rustls 尾巴」 |
+| 曲线组 | `X25519` → `secp256r1` → `secp384r1`（BoringSSL 默认顺序），决定 JA3 的 EC 段，也决定 TLS1.3 `key_share` 首选 |
+| ALPN | `h2` / `http/1.1`，h2 在前 |
+| 版本 | TLS 1.3 + 1.2（Android 10+ 关掉 1.0/1.1） |
+| 失败处理 | 配置构造失败**必须打日志再退回默认 rustls**，不允许静默 —— 静默退回就是「以为对齐了、其实没对齐」 |
+
+对齐是**可断言的**：
+- `tls::tests::cipher_suites_match_conscrypt_order` 逐项比对 9 个套件名；
+- `tls::tests::kx_groups_match_conscrypt_order` 比对三条曲线；
+- `tls::tests::client_config_sets_h2_first_and_both_versions` 比对 ALPN 与 0-RTT 关闭；
+- `http::tests::reqwest_accepts_our_preconfigured_rustls_config` 卡住「rustls 版本漂移
+  导致 reqwest 的 `Any` downcast 失败、静默回到默认顺序」这个最难查的坑。
+
+**怎么确认配置真的被用了（而不是写了一个没人读的常量）**：读了 reqwest 0.12.28 的源码链——
+`ClientBuilder::use_preconfigured_tls` → `TlsBackend::BuiltRustls` →
+`connect::new_rustls_tls(…, tls, …)` 里 `Arc::new(tls)` 原样使用，**不覆盖 `alpn_protocols`**
+（覆盖只发生在内置 `TlsBackend::Rustls` 分支）。再实跑 `update --check` 走通真实 TLS：
+GitHub API 返回「没有可用的发布资产」（与仓库无 Release 一致），说明握手、证书校验、
+JSON 解析全通。这条是代码级 + 实跑级证据，不是推断。
+
+**仍然不同的（本轮不做，也不宣称做到）**：
+- **扩展集合与顺序**：BoringSSL 会发 `ec_point_formats`、`session_ticket` 等，rustls 的扩展表不同
+  → **完整 JA3 字符串仍然不等**。等的是 cipher 段与 EC 段，不是整串。
+- `signature_algorithms` 的列表/顺序由 rustls 的 `WebPkiSupportedAlgorithms` 决定，未改写。
+- 要逐字节一致只能换 BoringSSL 绑定（`boring` / `tokio-boring`）：cmake 构建 + Android
+  交叉编译 + 与 reqwest 连接器对接，是独立一轮的工程，不是改常量能收口的。
+- **没有抓包证明服务端看到的 JA3**。本机出口不适合拿生产端点做对比实验；
+  结论止于「客户端侧的握手参数按 Conscrypt 配好了，且有单测锁住」。
+
+### L.2 提交与 OBS 的 10s 窗口 id 统一
+
+同一次跑步里，提交体 `speedPerTenSec[i].id` 是 `60000 + i`，OBS `speed_json[i].id` 是
+`起点秒 % 100000 + i` —— 两份报文对同一个窗口报了不同编号。服务端把
+`speedPerTenSec` 与 OBS 的 `speed_json` 对一遍就是硬矛盾，而且是自己造成的。
+
+| 改法 | 细节 |
+|---|---|
+| 唯一出口 | `track::wire::build_windows` 成为全链唯一窗口构造函数 |
+| 删除二次改写 | `submit.rs` 的 `submit_windows` 不再覆盖 `id`/`queueNum`，直接转发 |
+| 去掉死参数 | `build_windows` 删了没人用的 `rrid`，并修掉一条与代码不符的注释（曾写 `id=(rrid%100000)*1000+…`，实际用的是 `startTime`） |
+| 回归锁 | `wire::window_and_position_tests::submit_and_obs_share_window_ids` 把 OBS 对象 gzip+base64 解回来，逐项比对两侧 `id`/`queueNum`，并断言 id 基数 = 起点秒 % 100000 |
+
+**风险（要明说）**：没有抓包证据证明服务端要哪一种。这一改动的取舍是
+「**内部一致**」优先于「**沿用某个会话内编号**」：两份报文自相矛盾是确定会被交叉核对
+抓到的；而「提交必须从 60000 起」只是从旧代码继承的猜测，没有任何样本支撑。
+如果将来抓到真机包证明提交侧另有基数，只需改 `build_windows` 一处（它仍是唯一出口）。
+
+### L.3 机型库长尾 + `androidId` 与 `device_id` 解耦
+
+| 项 | 变化 |
+|---|---|
+| 机型数 | 13 → **24 款**（新增 11）：Redmi K60 至尊版 / K70 / K40 / Note 12 Turbo、realme GT Neo5、vivo X100 Pro、Mate 40 Pro、P30、Galaxy S24 / S21 / A54 |
+| 分布 | 新增 `ModelProfile.weight`，按**走量档 > 旗舰档**近似真实人群（走量权重合计必须大于旗舰/长尾合计，有断言）。均匀抽样本身就是个统计特征：一批账号挤在同样几台 Ultra/Pro 上不像真人 |
+| androidId | 不再从 `MD5(device_id)` 派生，改为 `random_android_id()`：16 位小写 hex、独立随机、首次生成后落盘。真机上 ANDROID_ID 与 App 自定义 DeviceId 没有任何派生关系 |
+| 黑名单 | `BAD_ANDROID_ID`：全零 / 全 f / `9774d56d682e549c`（Android 2.3 时代大量设备共用的著名值）。生成时排除，自检时拦下 |
+
+新增/加固的测试：机型代号唯一（重复项会挤占别人的抽样概率）、`weight > 0`、长尾 ≥ 20 款、
+品牌 ≥ 5 个、权重抽样真的偏（4000 次抽样比较最重/最轻机型的命中数）、`random_android_id`
+的格式/唯一性/黑名单、坏 androidId 被 `audit` 拦下。
+
+**兼容性**：老 `identity.json` 里已有 `android_id` 的**完全不受影响**（`ensure_fingerprint`
+只补空值）；只有新建身份或点「随机」时才走新逻辑。
+
+**风险**：机型热度是按公开销量近似，不是本产品的真实用户分布；若服务端有机型白名单/黑名单，
+新补的机型可能落在名单外。比「只有 13 款、一批账号挤在同样几台机」要好，但这是估计，不是证据。
+
+### L.4 明确没改的：人脸与三个「自报结论」（附风险）
+
+按要求保留原样，**这些字段的取值一行代码都没动**。风险逐条写清，供决定要不要动：
+
+| 项 | 现状 | 风险 |
+|---|---|---|
+| `complete: true` / `unCompleteReason: 0` | 提交体恒报「本次记录完整」 | 服务端若把 `complete` 与 `faceCheck` / 点位 / 有效里程交叉核对，会判自相矛盾；但改成 `false` 等于主动让记录不算数 —— 直接损害代跑目的，所以不动 |
+| `validDistance == totalDis`（100% 有效里程） | 有效里程恒等于总里程 | 真机通常有 5–15% 无效里程（漂移、暂停、信号差），100% 是稳定特征；但扣减一旦跌破 `minDistance`，记录直接不算数，且没有服务端阈值证据 |
+| `faceCheck = 1` + `runFaceCheck = ""`（OBS 里是空串再 gzip） | 声明「本次需要人脸核验」，却不带任何核验数据 | **这条矛盾最硬**：真机 `faceCheck=1` 通常伴随核验结果。置 0 可能让需要核验的学校判无效；保持 1 又没有数据。两条路都缺服务端行为证据，当前选择「保持能算数的一侧」 |
+| `useMobilityTools=0` / `isUpload=false` / `more=false` | 维持真机默认值 | 无明显问题 |
+| 指纹自洽（机型↔分辨率↔os↔androidId） | 已收紧（见 L.3） | 本轮唯一「改了反而更安全」的一项 |
+
+> 一句话：**人脸这条不动，是因为动了会直接损害「记录是否算数」，不是因为没有改法。**
+
+### L.5 验证
+
+```
+cargo test --lib --offline                                    244 passed / 0 failed / 1 ignored（较 HEAD 的 234 新增 10 个用例）
+cargo clippy --lib --all-features --offline                    exit 0（14 条告警全部是既有的；新增文件零告警）
+cargo check --all-targets --all-features --offline             exit 0
+cargo check --target aarch64-linux-android --features android  Finished（需按 android/build.ps1 设 CC_*/AR_*/LINKER，缺 NDK 时报 ring 编译失败）
+cargo run -- update --check                                    走通真实 TLS（返回「没有可用的发布资产」，与仓库无 Release 一致）
+```
+
+新增用例（10）：
+- `tls::tests` 四条：cipher 顺序 / 曲线顺序 / ALPN 与 TLS 版本 / `describe()` 文案；
+- `http::tests::reqwest_accepts_our_preconfigured_rustls_config`：类型契约；
+- `track::wire::window_and_position_tests::submit_and_obs_share_window_ids`：两侧 id 同源；
+- `api::fingerprint::tests` 四条：长尾 ≥20 款、加权分布真的偏、`random_android_id`
+  格式与独立性、黑名单值被 `audit` 拦下。
+
+既有用例的加固（不算新增）：`model_table_is_well_formed` 增加「机型代号唯一」与
+`weight > 0`；`mint_spreads_across_models` 抽样次数 200 → 2000，门槛 10 → 20 款。
+
+**没有验证到的**（本机做不到，不冒充）：
+- 服务端实际收到的 JA3/JA4 —— 无抓包；
+- 提交侧真机的窗口 id 基数 —— 无新抓包样本，只有旧代码里的猜测；
+- 补进来的机型与真实用户分布的吻合度 —— 权重是公开销量的近似。
+
+---
+
+## M. 0.3.9-antiban 续：把「能伪装的」收口（未发版）
+
+依据是本地官方包 `msw/official.apk`（`com.zjwh.android_wh_physicalfitness`，
+**versionName 7.3.70 / versionCode 401**，Flutter + 133 个 so）的 `classes.dex`
+字符串核查（77 MB，ASCII 直读）。只动**有官方证据、且不影响记录是否算数**的项。
+
+### M.1 磁盘上的随机 MAC 归一为 Android 占位值
+
+`identity.json` 里一直存着一个随机 MAC（`random_mac()`），但**请求从不读它**——
+登录体的 `mac_address`、信封的 `blMac`/`wifiMac` 都直接用
+`ANDROID_PLACEHOLDER_MAC`。这个字段是"落盘但不使用"的残留，两个坏处：
+
+1. 导出/复制 `identity.json` 时它看上去像一个「设备指纹」，但它不是真机值，
+   也不是任何请求里出现过的值；
+2. 一旦将来有人把它接进某条链路，就是凭空造出一个 Android 6+ 根本读不到的值
+   （官方 `getMacAddress()` 固定返回 `02:00:00:00:00:00`）。
+
+改法：`load_identity_for_platform` 把任意非占位值**迁移**为占位值（`dirty` 落盘），
+删掉 `random_mac()`，`HeaderIdentity::default()` 直接给占位值。
+回归测试 `legacy_random_mac_is_normalized_to_the_android_placeholder`：
+写入随机 MAC → 加载后为占位值 → 再加载仍是同值（幂等）。
+
+### M.2 服务端的人脸核验要求：读出来、说清楚，但不伪造
+
+官方 dex 里有 `faceEnable` / `faceVerifyType` / `faceCheck` / `serverCheckStatus` 与
+DTO `entity.RunFaceCheckConfigDTO`。我们不知道它放在 policy 响应的哪一层，
+也不知道 `faceCheckData` 的格式，所以**不做任何伪造**，只做可见化：
+
+| 改动 | 行为 |
+|---|---|
+| `PolicyInfo.face_required: Option<bool>` | 在 `runRuleModel` / 顶层 / `runFaceCheck` 对象三处找 `faceEnable`→`faceCheck`→`serverCheckStatus`；认不出是 `None`（= 不知道），**不是** `Some(false)` |
+| `PolicyInfo.face_verify_type` | 独立取 `faceVerifyType`（可能只下发类型、不下发开关） |
+| `flow.rs` 日志 | `Some(true)` → 「服务端要求本次人脸核验，本工具不执行，记录可能被判无效」；`Some(false)` → 未要求；`None` → 未下发（不代表不要求） |
+
+约束写死在注释里：**这两字段不参与提交体构造**，`faceCheck` 仍取用户配置。
+测试 `face_rule_is_read_only_and_lenient` 覆盖五种落点 + 缺失字段 + 只下发类型。
+
+> 这条不解决人脸缺口，只是把「这次可能白跑」提前到跑步之前说出来。
+
+### M.3 核对结论：这些字段已经与官方同构，无需再改
+
+`classes.dex` 命中，与我们 Android 信封一一对应：
+`androidId`、`logicPixel`、`physicPixel`、`blMac`、`wifiMac`、`cpuModel`、
+`CustomDeviceId`、`tokenSign`、`headerSign`。
+
+UA 的归属也核了一遍：
+- `libapp.so`（Dart 层）里 **`okhttp` 0 命中**，只有 `dart:io` 系列——Dart 若自己发请求，
+  走的是 Dart HttpClient；
+- `classes.dex`（原生层）里 `okhttp/4.12.0` 与 `okhttp/3.14.9` 都在。
+
+所以「跑步提交由原生 OkHttp 发出、UA 取 OkHttp 默认值」这个判断有据，`okhttp/4.12.0`
+的方向正确。**仍未确定**的是提交具体走 4.12.0 还是 3.14.9（3.14.9 可能是某个第三方
+SDK 携带的），没有抓包不做二选一。
+
+### M.4 明确不做的（附理由，别再重复问）
+
+| 项 | 为什么不做 |
+|---|---|
+| 百度人脸 detect 的调用链（`aip.baidubce.com/oauth/2.0/token` + `face/v3/detect`） | 缺三样：`access_token` 的来源（客户端内置 AK/SK 换？服务端下发？）、`faceCheckData` 的编码、`RunFaceCheckConfigDTO` 的下发时机。任何一项猜错都是**新增**异常，比现状更差 |
+| `datapoint.gxapp.iydsj.com` 埋点（`/api/v76/startup/pv`、`/api/v70240/run/pv` 等） | 端点已确认存在，但请求体字段一个都没抓过。凭空发空 body 会在服务端多出一条"异常埋点"，属于自伤 |
+| HTTP/2 SETTINGS / 帧参数 | OkHttp 与 hyper 的 `INITIAL_WINDOW_SIZE`、`MAX_FRAME_SIZE` 默认值不同，但没有抓包就改调优参数，只能靠猜 |
+| `appVersion` 回退到 7.3.70 | **证据冲突**：手上的官方包是 7.3.70，而 J.2 记录"现网 7.4.0"。改回旧版本可能触发强更，保持 7.4.0。这一条列入待核实 |
+| `complete` / `validDistance` / `faceCheck` 取值 | 见 L.4：改了直接损害记录是否算数 |
+
+### M.5 验证
+
+```
+cargo test --lib --offline        246 passed / 0 failed / 1 ignored（较 L 节净增 2）
+```
+新增：`model::points_cache_tests::legacy_random_mac_is_normalized_to_the_android_placeholder`、
+`policy::tests::face_rule_is_read_only_and_lenient`。
+
+**没有验证到的**：官方提交到底走 OkHttp 4.12.0 还是 3.14.9；policy 是否真的下发
+`faceEnable`（三处落点都只是"能认"，不是"见过"）；`faceVerifyType` 的取值含义。
+
 
 
 

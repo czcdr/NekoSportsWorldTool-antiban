@@ -14,8 +14,9 @@
 //! - `Accept-Encoding: gzip` 并自动解压（OkHttp 默认就发这个头）；
 //! - 保留 socks5 / http 代理支持（出口池依赖）。
 //!
-//! 仍然不同的：密码套件顺序仍是 rustls 而不是 Conscrypt 的 BoringSSL。要完全一致
-//! 得换 BoringSSL 绑定，那是另一个量级的工程；ALPN/h2/头集合这几项已经落地。
+//! 仍然不同的：密码套件顺序见 [`crate::tls`] —— 该模块已把 cipher 集合/顺序、
+//! 曲线顺序、ALPN 都压到 Conscrypt 的形状；剩下的差异（扩展集合、signature_algorithms）
+//! 要换 BoringSSL 绑定才能解决，属另一量级的工程。
 
 use std::io::Read;
 use std::time::Duration;
@@ -209,6 +210,15 @@ impl Agent {
             .gzip(true)
             // h2 与 http/1.1 由 ALPN 协商（http2 feature 打开后 rustls 自动带上）。
             .http2_adaptive_window(true);
+        // TLS 指纹：把 ClientHello 的 cipher/曲线顺序压到 Conscrypt 的形状。
+        // 失败时**必须留痕**再退回默认 rustls —— 静默退回会让"以为对齐了、其实没对齐"
+        // 这种最难查的问题留在线上。
+        match crate::tls::client_config() {
+            Ok(tls) => builder = builder.use_preconfigured_tls(tls),
+            Err(error) => {
+                eprintln!("[net] TLS 指纹配置失败，本次退回 rustls 默认握手：{error}");
+            }
+        }
         if let Some(url) = proxy_url {
             let proxy =
                 reqwest::Proxy::all(url).map_err(|e| format!("代理 {url} 配置无效：{e}"))?;
@@ -248,5 +258,27 @@ impl Agent {
 
     pub fn put(&self, url: &str) -> Request {
         self.request("PUT", url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 预置 TLS 配置必须被 reqwest **认出来**。
+    ///
+    /// reqwest 用 `Any::downcast` 识别传进来的类型；一旦它的 rustls 依赖升到与本
+    /// crate 不同的实例，downcast 会失败、落进 `UnknownPreconfigured`，`build()`
+    /// 直接报错。那时线上表现是「静默回到默认 rustls 顺序」或「直接连不上」——
+    /// 两种都很难从现象定位到这里。所以把类型契约钉成测试。
+    #[test]
+    fn reqwest_accepts_our_preconfigured_rustls_config() {
+        let config = crate::tls::client_config().expect("TLS 配置必须可构造");
+        let built = reqwest::blocking::Client::builder()
+            .use_preconfigured_tls(config)
+            .build();
+        assert!(
+            built.is_ok(),
+            "reqwest 没认出这份 rustls 配置（rustls 版本不一致？）：{:?}",
+            built.err()
+        );
     }
 }

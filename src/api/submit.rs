@@ -20,16 +20,14 @@ fn pace_speed_value(seconds: i64, meters: f64) -> i64 {
     (seconds as f64 / 60.0 / (distance / 1000.0) * 1000.0).round() as i64
 }
 
+/// 提交体的 10s 窗口**必须与 OBS 对象同一套 id/queueNum**。
+///
+/// 以前这里把 `id` 改写成 `60000 + i`，而 OBS 的 `speed_json` 用的是
+/// `build_windows` 的口径 —— 同一次跑步的两份报文对同一个窗口报了不同的 id，
+/// 服务端把 `speedPerTenSec` 与 OBS 的 `speed_json` 对一遍就是硬矛盾。
+/// 现在两侧都直接取 `wire::build_windows`，不再有第二套编号。
 fn submit_windows(track: &Track) -> (Vec<Value>, Vec<Value>) {
-    let (mut speed, mut steps) = crate::track::wire::build_windows(track, 0);
-    // Submit IDs and queue numbers differ from the OBS wire format; metrics do not.
-    for values in [&mut speed, &mut steps] {
-        for (i, value) in values.iter_mut().enumerate() {
-            value["id"] = Value::from(60000 + i as i64);
-            value["queueNum"] = Value::from(i);
-        }
-    }
-    (speed, steps)
+    crate::track::wire::build_windows(track)
 }
 
 /// bdA 正差分累计。

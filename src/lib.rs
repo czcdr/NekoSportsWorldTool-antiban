@@ -13,6 +13,7 @@ pub mod safety;
 mod task_control;
 pub mod template;
 mod textlog;
+pub mod tls;
 mod track;
 mod update;
 

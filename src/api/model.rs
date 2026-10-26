@@ -241,8 +241,13 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
             crate::crypto::header::HeaderIdentity::fresh_install_time(&id.platform);
         dirty = true;
     }
-    if id.mac_address.is_empty() {
-        id.mac_address = crate::crypto::header::random_mac();
+    // MAC 一律归一到 Android 6+ 的占位值。请求里从来不用 `identity.mac_address`
+    // ——登录体的 `mac_address` 与信封的 `blMac`/`wifiMac` 都直接用
+    // `ANDROID_PLACEHOLDER_MAC`。磁盘上留一个随机 MAC 只会在导出/复制
+    // identity.json 时变成一个假的「设备指纹」，而且一旦将来哪条链路读它，
+    // 就是一处凭空造出来的异常值（Android 6+ 普通应用读不到真实 MAC）。
+    if id.mac_address != crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC {
+        id.mac_address = crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC.to_string();
         dirty = true;
     }
     // 一次性迁移：老版本桌面端的默认身份是 iOS（`iPhone` + `26.5.2`），
@@ -782,6 +787,43 @@ mod points_cache_tests {
             serde_json::to_value(&fixed).unwrap(),
             serde_json::to_value(&again).unwrap()
         );
+    }
+
+    /// 老配置里存的随机 MAC 必须在加载时归一成 Android 占位值。
+    ///
+    /// 请求从不读 `identity.mac_address`（登录体与 `blMac`/`wifiMac` 都用常量），
+    /// 但磁盘上留一个随机 MAC 会在导出/复制 identity.json 时变成假的「设备指纹」，
+    /// 也会诱导后续有人把它接进某条链路——那就是凭空造出来的异常值。
+    #[test]
+    fn legacy_random_mac_is_normalized_to_the_android_placeholder() {
+        let directory =
+            std::env::temp_dir().join(format!("neko-identity-mac-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory);
+
+        let mut legacy = serde_json::to_value(HeaderIdentity::default()).unwrap();
+        legacy["platform"] = "android".into();
+        legacy["device_id"] = "22222222-2222-4222-8222-222222222222".into();
+        legacy["mac_address"] = "08:a4:11:22:33:44".into();
+        write_json("identity.json", &legacy).unwrap();
+
+        let fixed = load_identity_for_platform("android");
+        assert_eq!(
+            fixed.mac_address,
+            crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC,
+            "随机 MAC 必须被归一"
+        );
+        // 幂等：再加载一次还是同一个值，且不该再被判定为 dirty 反复重写。
+        let again = load_identity_for_platform("android");
+        assert_eq!(again.mac_address, crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC);
     }
 
     /// 老版本桌面端写下的「从没动过的 iOS 默认身份」要一次性迁到 Android；

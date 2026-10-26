@@ -52,7 +52,9 @@ pub struct HeaderIdentity {
     pub anchor_lon: f64,
     #[serde(default)]
     pub app_install_time: i64,
-    /// 设备 MAC（首次生成后持久化，避免写死指纹）
+    /// 设备 MAC。真机上 Android 6+ 的普通应用只能读到占位值
+    /// `02:00:00:00:00:00`，所以这里**恒为该占位值**，不生成随机 MAC：
+    /// 随机值既不符合官方取数行为，也会成为磁盘上一个假指纹。
     #[serde(default)]
     pub mac_address: String,
     /// Android `Settings.Secure.ANDROID_ID`：16 位小写 hex，首次生成后固定。
@@ -79,17 +81,6 @@ pub struct HeaderIdentity {
     /// 迁移过一次就置位，避免反复改写用户的选择。
     #[serde(default)]
     pub platform_migrated: bool,
-}
-
-pub fn random_mac() -> String {
-    // 本地管理位随机单播 MAC
-    let mut rng = rand::thread_rng();
-    let octets: [u8; 3] = [0x08, 0xa4, rand::Rng::gen(&mut rng)];
-    let tail: [u8; 3] = rand::Rng::gen(&mut rng);
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        octets[0], octets[1], octets[2], tail[0], tail[1], tail[2]
-    )
 }
 
 fn default_platform() -> String { "ios".into() }
@@ -146,7 +137,7 @@ impl Default for HeaderIdentity {
             anchor_lat: default_anchor_lat(),
             anchor_lon: default_anchor_lon(),
             app_install_time: 0,
-            mac_address: String::new(),
+            mac_address: crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC.into(),
             android_id: String::new(),
             pixel: String::new(),
             logic_pixel: String::new(),
@@ -227,7 +218,10 @@ impl HeaderIdentity {
             );
             let mut changed = false;
             if self.android_id.is_empty() {
-                self.android_id = profile.android_id;
+                // **不**从 device_id 派生：真机上 ANDROID_ID 与任何 App 的 DeviceId
+                // 都不同源。派生出来的值一旦被服务端按 deviceId 建画像，就会把
+                // 「同一台机器换过的身份」串成一条线。生成后立即落盘，终身稳定。
+                self.android_id = crate::api::fingerprint::random_android_id();
                 changed = true;
             }
             if self.pixel.is_empty() {

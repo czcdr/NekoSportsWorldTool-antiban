@@ -32,6 +32,12 @@ egui_extras = { version = "0.29", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "socks", "gzip", "http2"] }
+# 只用来把 ClientHello 压到 Conscrypt 的形状（cipher 顺序 / 曲线顺序 / ALPN）。
+# 必须与 reqwest 内部的 rustls 同一个 0.23.x，`use_preconfigured_tls` 才能接上；
+# provider 选 ring：reqwest 的 rustls-tls 在这个版本上用的就是 ring（锁里没有 aws-lc-rs），
+# 两套 provider 同时存在会让 TLS 初始化在多处竞争。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }
 rsa = "0.9"
