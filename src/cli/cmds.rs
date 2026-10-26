@@ -24,6 +24,7 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         "ai-info" => cmd_ai_info(&rest),
         "semester" => cmd_semester(),
         "cheat" => cmd_cheat(&rest),
+        "recover" => cmd_recover(&rest),
         "rank" => cmd_rank(&rest),
         "unlock" => cmd_unlock(&rest),
         "update" => cmd_update(&rest),
@@ -761,6 +762,179 @@ fn cmd_cheat(rest: &[&str]) -> i32 {
             1
         }
     }
+}
+
+/// 异常记录修复（红转绿）。
+///
+/// 默认只诊断（dry-run）：先看清「是记录不达标，还是已经被记进违规台账」，
+/// 再决定要不要动。`--yes` 才会真的覆盖提交，单次默认最多修 3 条。
+fn cmd_recover(rest: &[&str]) -> i32 {
+    use crate::api::recover::{self, FixPlan};
+    let flags = parse_flags(rest);
+    let yes = get(&flags, "yes").is_some();
+    let verify = get(&flags, "verify").is_some();
+    let only: Option<i64> = get(&flags, "only").and_then(|v| v.parse().ok());
+    let limit: usize = get(&flags, "limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+        .clamp(1, 10);
+    let plan = FixPlan {
+        dist: get(&flags, "dist").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) * 1000.0,
+        pace_s: get(&flags, "pace").map(parse_pace).unwrap_or(0.0) as f64,
+        face_check: get(&flags, "face").map(|v| (v == "1" || v == "true") as i64).unwrap_or(1),
+    };
+    let seed: u64 = get(&flags, "seed").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let mut client = match make_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let mut log = logger();
+    let diag = match recover::diagnose(&mut client, &mut log) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("诊断失败: {e}");
+            return 1;
+        }
+    };
+
+    println!("—— 现状 ——");
+    println!(
+        "禁跑状态：{}{}",
+        diag.freeze_text(),
+        if diag.freeze_message.is_empty() {
+            String::new()
+        } else {
+            format!("（服务端文案：{}）", diag.freeze_message)
+        }
+    );
+    println!("违规榜：{}", diag.cheat.label());
+    if diag.flagged() {
+        println!(
+            "  原因：{}；发生时间：{}",
+            diag.cheat.reason(),
+            diag.cheat.occurred_at()
+        );
+        if let Some(id) = diag.cheat.record_id() {
+            println!("  关联记录：{id}");
+        }
+    }
+    println!(
+        "记录：共 {} 条，其中未达标 {} 条",
+        diag.total_records,
+        diag.abnormal.len()
+    );
+    for a in diag.abnormal.iter().take(20) {
+        println!(
+            "  rrid={:<12} {}  {:.0}m / {}s  原因：{}",
+            a.rrid,
+            crate::track::geom::fmt_cst(a.start_ms, "%Y-%m-%d %H:%M"),
+            a.total_dis,
+            a.total_time,
+            a.reason_text()
+        );
+    }
+    if diag.abnormal.len() > 20 {
+        println!("  …其余 {} 条略", diag.abnormal.len() - 20);
+    }
+    println!("—— 判断 ——");
+    println!("{}", diag.verdict());
+
+    if !yes {
+        println!("\n（dry-run）确认无误后加 --yes 覆盖提交；也可先 --only <rrid> 单条试一条。");
+        return 0;
+    }
+    // 冻结期提交会被服务端独立拒绝（客户端强行提交只是白挨一次风控计数），先拦住。
+    if diag.frozen() {
+        eprintln!(
+            "账号处于禁跑期（{}），服务端会拒绝提交。等倒计时归零后再跑本命令；\
+             这几条记录不会因为等待而消失。",
+            diag.freeze_text()
+        );
+        return 1;
+    }
+    if diag.abnormal.is_empty() {
+        println!("没有需要修复的记录。");
+        return 0;
+    }
+
+    // 挑本轮要修的
+    let batch: Vec<_> = diag
+        .abnormal
+        .iter()
+        .filter(|a| only.map(|id| id == a.rrid).unwrap_or(true))
+        .take(limit)
+        .cloned()
+        .collect();
+    if batch.is_empty() {
+        eprintln!("--only {only:?} 没有匹配到未达标记录");
+        return 1;
+    }
+
+    let cfg = model::load_config();
+    let route_mode = crate::track::generate_road::RouteMode::from_str(
+        get(&flags, "route").unwrap_or(&cfg.route_mode),
+    );
+    println!("\n—— 开始修复 {} 条 ——", batch.len());
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for (i, a) in batch.iter().enumerate() {
+        if i > 0 {
+            // 逐条之间随机间隔：等距时序本身就是特征（见 antiban.md 2.3）
+            let gap = 3000 + (rand::random::<u64>() % 5000);
+            std::thread::sleep(std::time::Duration::from_millis(gap));
+        }
+        match recover::fix_one(&mut client, a, plan, route_mode, seed, &mut log) {
+            Ok(out) => {
+                println!(
+                    "  √ rrid={} → 新 rrid={} 判定={}",
+                    a.rrid,
+                    out.result.rrid,
+                    out.verification.label()
+                );
+                if out.verification.complete == Some(false) {
+                    for r in out.verification.failure_reasons() {
+                        println!("     仍未达标：{r}");
+                    }
+                }
+                ok += 1;
+            }
+            Err(e) => {
+                println!("  × rrid={} 修复失败: {e}", a.rrid);
+                failed += 1;
+            }
+        }
+    }
+    println!("修复结果：成功 {ok} / 失败 {failed}");
+
+    if verify {
+        println!("\n—— 复查 ——");
+        match recover::diagnose(&mut client, &mut log) {
+            Ok(after) => {
+                println!("违规榜：{}", after.cheat.label());
+                if after.cheat.status() == crate::api::cheat::Status::Flagged {
+                    println!("  仍在榜（原因：{}）", after.cheat.reason());
+                }
+                println!(
+                    "未达标记录：{} → {}",
+                    diag.abnormal.len(),
+                    after.abnormal.len()
+                );
+                if after.abnormal.len() < diag.abnormal.len() {
+                    println!("√ 记录状态已改善");
+                } else if after.abnormal.len() == diag.abnormal.len() {
+                    println!("⚠ 数量未变：覆盖可能未生效（服务端按键去重不是日期），或服务端把判定锁死了");
+                } else {
+                    println!("⚠ 未达标记录变多：先停下，别再批量覆盖");
+                }
+            }
+            Err(e) => println!("复查失败: {e}"),
+        }
+    }
+    if ok > 0 { 0 } else { 1 }
 }
 
 fn cmd_rank(rest: &[&str]) -> i32 {

@@ -245,10 +245,28 @@ pub fn parse_osm(bytes: &[u8]) -> Result<ParsedOsm, String> {
     })
 }
 
+/// 节点焊接精度：1e-7 度（约 1.1 cm）。
+///
+/// OSM 里同一个路口可能被不同 way 用**不同 node id** 表达（合并数据源、手绘、
+/// AI 生成、导出工具重编号都会这样）。只按 id 建图时它们「看着连着、图上断开」，
+/// 表现为闭环搜索报「道路不连通」或被迫绕远 —— 这是「路网残缺」最常见的一类假断点。
+/// 按坐标量化合并可以消除它，且因为容差只有 1 cm，不会误并相距正常的两个路口。
+const WELD_QUANT: f64 = 1e7;
+
+fn weld_key(c: Coord) -> (i64, i64) {
+    (
+        (c.lon * WELD_QUANT).round() as i64,
+        (c.lat * WELD_QUANT).round() as i64,
+    )
+}
+
 /// 用道路 way 构建路网图。
+///
+/// 节点按**量化坐标**去重（焊接），而不是只按 OSM node id：
+/// 同坐标不同 id 的节点共用同一个图节点，交叉口因此真正连通。
 pub fn build_graph(parsed: &ParsedOsm) -> RoadGraph {
     let mut g = RoadGraph::new();
-    let mut node_map: HashMap<u64, petgraph::graph::NodeIndex> = HashMap::new();
+    let mut node_map: HashMap<(i64, i64), petgraph::graph::NodeIndex> = HashMap::new();
 
     for r in &parsed.roads {
         // 先解析节点 id → NodeIndex（避免闭包跨迭代借用）。
@@ -257,11 +275,12 @@ pub fn build_graph(parsed: &ParsedOsm) -> RoadGraph {
             .iter()
             .filter_map(|id| {
                 let c = *parsed.nodes.get(id)?;
-                if let Some(&n) = node_map.get(id) {
+                let key = weld_key(c);
+                if let Some(&n) = node_map.get(&key) {
                     Some(n)
                 } else {
                     let n = g.add_node(c);
-                    node_map.insert(*id, n);
+                    node_map.insert(key, n);
                     Some(n)
                 }
             })
@@ -335,3 +354,92 @@ fn geo_haversine(a: Coord, b: Coord) -> f64 {
     let pb = geo::Point::new(b.lon, b.lat);
     pa.haversine_distance(&pb)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn road(id: u64, refs: &[u64]) -> OsmRoad {
+        OsmRoad {
+            id,
+            node_refs: refs.to_vec(),
+            oneway: false,
+            oneway_reversed: false,
+            highway: "footway".into(),
+            maxspeed_kmh: None,
+        }
+    }
+
+    fn parsed(nodes: &[(u64, f64, f64)], roads: Vec<OsmRoad>) -> ParsedOsm {
+        ParsedOsm {
+            nodes: nodes
+                .iter()
+                .map(|&(id, lat, lon)| (id, Coord::new(lon, lat)))
+                .collect(),
+            roads,
+            buildings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn same_coordinate_different_ids_are_welded_into_one_node() {
+        // 节点 2 与 3 完全同坐标但 id 不同：两条 way 应在此真正连通。
+        let p = parsed(
+            &[
+                (1, 39.9000, 116.4000),
+                (2, 39.9005, 116.4000),
+                (3, 39.9005, 116.4000),
+                (4, 39.9010, 116.4000),
+            ],
+            vec![road(10, &[1, 2]), road(11, &[3, 4])],
+        );
+        let g = build_graph(&p);
+        assert_eq!(g.graph.node_count(), 3, "2/3 应合并成一个节点");
+        assert_eq!(g.graph.edge_count(), 4, "两条双向 way 各 2 条有向边");
+        // 焊接点应同时归属两条 way：一条 way 在这里收尾（入边）、另一条从这里出发（出边）
+        use petgraph::Direction;
+        let welded = g
+            .graph
+            .node_indices()
+            .find(|n| (g.node_coord(*n).lat - 39.9005).abs() < 1e-9)
+            .expect("应存在焊接点");
+        let out = g.graph.edges_directed(welded, Direction::Outgoing).count();
+        let inc = g.graph.edges_directed(welded, Direction::Incoming).count();
+        // 两条 way 都是双向：焊接点对各自的另一端各有一条出边和一条入边。
+        assert_eq!((out, inc), (2, 2), "焊接点应连到两条 way 的另一端（各双向）");
+    }
+
+    #[test]
+    fn distinct_coordinates_one_metre_apart_stay_separate() {
+        // 1e-5 度纬度约 1.1 m，远超 1 cm 焊接容差：不应合并。
+        let p = parsed(
+            &[
+                (1, 39.90000, 116.4000),
+                (2, 39.90050, 116.4000),
+                (3, 39.90051, 116.4000),
+                (4, 39.90100, 116.4000),
+            ],
+            vec![road(10, &[1, 2]), road(11, &[3, 4])],
+        );
+        let g = build_graph(&p);
+        assert_eq!(g.graph.node_count(), 4, "相邻 1 m 的两个点不该被焊接");
+        assert_eq!(g.graph.edge_count(), 4);
+    }
+
+    #[test]
+    fn welded_network_is_a_single_connected_component() {
+        let p = parsed(
+            &[
+                (1, 39.9000, 116.4000),
+                (2, 39.9005, 116.4000),
+                (3, 39.9005, 116.4000),
+                (4, 39.9010, 116.4000),
+            ],
+            vec![road(10, &[1, 2]), road(11, &[3, 4])],
+        );
+        let g = build_graph(&p);
+        let comps = petgraph::algo::connected_components(&g.graph);
+        assert_eq!(comps, 1, "焊接后应只有一个连通分量，否则闭环路由会失败");
+    }
+}
+

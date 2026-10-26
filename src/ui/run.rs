@@ -414,14 +414,20 @@ impl App {
                 ui.label("路线算法：");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
-                if page.route_mode == RouteMode::Road && self.network.is_none() {
+                ui.selectable_value(&mut page.route_mode, RouteMode::Manual, "自定义点位")
+                    .on_hover_text(
+                        "只用实时点位顺序串联，不要求经过策略必经点；没有路网时按点位连线",
+                    );
+                if page.route_mode.requires_network() && self.network.is_none() {
                     ui.colored_label(theme::warn(), "（正在按学校获取，可到路网页查看）");
                 }
             });
         }
 
-        // 切换到真实道路路由时按需拉取电子围栏与实时点位（经典模式不触发这些端点）。
-        if self.run_page.route_mode == RouteMode::Road && prev_route != RouteMode::Road {
+        // 切到需要学校数据的模式时按需拉取围栏/点位/路网（经典模式不触发这些端点）。
+        if self.run_page.route_mode.needs_school_route()
+            && !prev_route.needs_school_route()
+        {
             self.refresh_points();
         }
 
@@ -896,7 +902,7 @@ impl App {
 
     fn start_run(&mut self) {
         if self.run_busy { return; }
-        if self.run_page.route_mode == RouteMode::Road && self.network.is_none() {
+        if self.run_page.route_mode.requires_network() && self.network.is_none() {
             self.status = "请先加载路网并刷新路线点位".into();
             return;
         }
@@ -930,11 +936,7 @@ impl App {
         self.config.face_check = page.face_check;
         self.config.manual_altitude = manual_altitude;
         self.config.manual_altitude_range = manual_altitude_range;
-        self.config.route_mode = if route_mode == RouteMode::Road {
-            "road".into()
-        } else {
-            "legacy".into()
-        };
+        self.config.route_mode = route_mode.as_str().into();
         let _ = crate::api::model::save_config(&self.config);
 
         let identity = self.identity.clone();

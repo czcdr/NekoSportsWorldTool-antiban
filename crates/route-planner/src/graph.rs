@@ -77,6 +77,11 @@ pub struct RoadGraph {
     pub buildings: Vec<Vec<Coord>>,
     /// 校园边界，工作坐标系；非空时禁止平滑/采样切出边界。
     pub boundaries: Vec<Vec<Coord>>,
+    /// WGS84→BD-09 对齐是否已应用。
+    ///
+    /// 该变换不是幂等的：对已对齐的图再跑一次，会整体再偏移数百米而且**不报错**。
+    /// 现在所有调用点都只调一次，这个标记是给将来新增调用方的护栏。
+    pub align_applied: bool,
     index: RTree<Seg>,
 }
 
@@ -110,6 +115,7 @@ impl RoadGraph {
             meter_per_lng: MET_PER_DEG_LNG_EQ,
             buildings: Vec::new(),
             boundaries: Vec::new(),
+            align_applied: false,
             index: RTree::new(),
         }
     }

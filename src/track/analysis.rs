@@ -9,6 +9,9 @@ pub struct Analysis {
     pub coverage: Vec<bool>,
     pub outside: Vec<(f64, f64)>,
     pub crossing: Vec<Vec<(f64, f64)>>,
+    /// 真实累计爬升/下降（米）。GPX 里没有 `<ele>` 时为 `None` —— 不要用 0 冒充。
+    pub ascent_m: Option<f64>,
+    pub descent_m: Option<f64>,
     pub warnings: Vec<String>,
 }
 pub fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -18,12 +21,29 @@ pub fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
         + a.0.to_radians().cos() * b.0.to_radians().cos() * (dx / 2.).sin().powi(2);
     6371000. * 2. * h.sqrt().clamp(0., 1.).asin()
 }
+/// 按内容识别坐标格式，统一转成采样点。
+///
+/// `<` → GPX XML；`[` / `{` → 坐标 JSON；其余 → 每行 `lat,lon[,ele]` 文本。
+/// 识别只看首个非空白字符 —— 扩展名不可靠（用户常把 GPX 存成 `.txt`）。
+pub fn parse_any(text: &str) -> Result<Vec<route_planner::gpx::Sample>, String> {
+    let head = text.trim_start();
+    if head.starts_with('<') {
+        return route_planner::gpx::parse(text);
+    }
+    if head.starts_with('[') || head.starts_with('{') {
+        // 先按坐标 JSON 试；失败再退回 GPX（有些导出的 JSON 里塞的是转义 XML）。
+        return route_planner::gpx::parse_point_json(text)
+            .or_else(|_| route_planner::gpx::parse(text));
+    }
+    route_planner::gpx::parse_point_text(text)
+}
+
 pub fn analyze(
     text: &str,
     fences: &[Vec<(f64, f64)>],
     checkpoints: &[(f64, f64)],
 ) -> Result<Analysis, String> {
-    let samples = route_planner::gpx::parse(text)?;
+    let samples = parse_any(text)?;
     let polys: Vec<Vec<Coord>> = fences
         .iter()
         .map(|p| p.iter().map(|&(a, b)| Coord::new(b, a)).collect())
@@ -36,6 +56,8 @@ pub fn analyze(
         coverage: vec![false; checkpoints.len()],
         outside: Vec::new(),
         crossing: Vec::new(),
+        ascent_m: None,
+        descent_m: None,
         warnings: Vec::new(),
     };
     let (mut time_ok, mut total_ms) = (true, 0i64);
@@ -63,12 +85,8 @@ pub fn analyze(
         let prev = &samples[i - 1];
         let a = (prev.coordinate.lat, prev.coordinate.lon);
         out.distance_m += distance(a, p);
-        let parse = |s: &Option<String>| {
-            s.as_ref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.timestamp_millis())
-        };
-        match (parse(&prev.time), parse(&s.time)) {
+        // 时间已在解析阶段转成毫秒；这里只比大小，不再重复解析 RFC3339。
+        match (prev.time_ms, s.time_ms) {
             (Some(x), Some(y)) if y > x => total_ms += y - x,
             _ => time_ok = false,
         }
@@ -104,6 +122,15 @@ pub fn analyze(
     } else {
         out.warnings
             .push("时间缺失、重复或倒退，无法计算可信配速".into());
+    }
+    // 真实海拔：GPX 没有 <ele> 就保持 None，界面显示「未提供」而不是 0 米爬升。
+    let (up, down, n_ele) = route_planner::gpx::ascent_descent(&samples);
+    if n_ele >= 2 {
+        out.ascent_m = Some(up);
+        out.descent_m = Some(down);
+    } else if !samples.is_empty() {
+        out.warnings
+            .push("GPX 未提供海拔（<ele>），爬升/下降未知".into());
     }
     if polys.is_empty() {
         out.warnings.push("未载入校区围栏，越界状态未知".into());

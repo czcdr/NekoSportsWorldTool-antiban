@@ -18,6 +18,7 @@ pub mod points;
 pub mod policy;
 pub mod rank;
 pub mod records;
+pub mod recover;
 pub mod school_roads;
 pub mod semester;
 pub mod submit;

@@ -113,6 +113,43 @@ mod tests {
         assert!(track.totalSteps > 500, "steps={}", track.totalSteps);
     }
 
+    /// 模式 C（自定义点位）：不传 `must_bd` 也能生成，且给定点位必须全部经过。
+    ///
+    /// 这是 Manual 与 Road 的本质差别：Road 把策略必经点也塞进强制集合，
+    /// Manual 只认调用方给的那几个点。
+    #[test]
+    fn test_build_road_manual_requires_only_given_points() {
+        let net = road_grid();
+        let pts: Vec<_> = net
+            .graph
+            .node_indices()
+            .step_by(10)
+            .map(|i| {
+                let c = net.node_coord(i);
+                (c.lat, c.lon)
+            })
+            .collect();
+        let start = 1_788_958_186_123i64;
+        // 与 Road 测试同参数、同点位，唯一差别是 must_bd 传空 —— 正好隔离出 Manual 的语义。
+        let manual = match build_road(3300.0, 1220, 42, start, &pts, &[], &net) {
+            Ok(t) => t,
+            Err(e) => panic!("manual build 失败：{e}"),
+        };
+        assert!(
+            (manual.totalDistance - 3300.0).abs() < 0.5,
+            "dist={}",
+            manual.totalDistance
+        );
+        assert_eq!(manual.totalTime, 1220);
+        assert!(
+            pts.iter().all(|p| super::wire::passes_point(&manual, *p)),
+            "自定义模式必须经过全部给定点位"
+        );
+        // 与 Road 模式同样的哨兵语义：第 2 点 type=5、末点 type=6
+        assert_eq!(manual.locations[1].ptype, 5);
+        assert_eq!(manual.locations.last().unwrap().ptype, 6);
+    }
+
     /// 轨迹生成抽样断言：距离精确、采样间隔分布、哨兵/断崖/位移语义。
     #[test]
     fn test_generator_distribution() {

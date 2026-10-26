@@ -116,17 +116,17 @@ impl App {
             }
         });
         ui.collapsing("导入真实 GPX 并分析", |ui| {
-            ui.label("仅在本地分析；不用于成绩提交。GPX 坐标按 WGS84 读取。");
+            ui.label("仅在本地分析；不用于成绩提交。支持 GPX、每行 lat,lon[,海拔] 的文本、以及坐标 JSON；坐标按 WGS84 读取。");
             ui.add(
                 egui::TextEdit::singleline(&mut self.osm_page.gpx_path)
                     .desired_width(ui.available_width())
-                    .hint_text("GPX 文件路径"),
+                    .hint_text("轨迹文件路径（.gpx / .txt / .json）"),
             );
             ui.horizontal_wrapped(|ui| {
                 #[cfg(not(target_os = "android"))]
                 if ui.button("选择 GPX").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("GPX", &["gpx"])
+                        .add_filter("轨迹（GPX / 坐标文本 / JSON）", &["gpx", "txt", "json", "csv"])
                         .pick_file()
                     {
                         self.osm_page.gpx_path = p.display().to_string();
@@ -171,6 +171,15 @@ impl App {
                     a.pace_min_km
                         .map(|v| format!("{v:.2} 分/公里"))
                         .unwrap_or("未知".into())
+                ));
+                ui.label(format!(
+                    "累计爬升 {} · 累计下降 {}",
+                    a.ascent_m
+                        .map(|v| format!("{v:.1} 米"))
+                        .unwrap_or("未提供".into()),
+                    a.descent_m
+                        .map(|v| format!("{v:.1} 米"))
+                        .unwrap_or("未提供".into())
                 ));
                 ui.label(format!(
                     "点位覆盖 {}/{} · 越界采样点 {} · 越界连线 {}",

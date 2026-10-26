@@ -22,8 +22,9 @@ fn usage() {
                                            登录并保存会话；--pass - 从标准输入读密码（避免留在 shell 历史与进程列表）
                                            --remember 同时保存凭据供自动重登；也可用环境变量 NSWT_PASS
   logout                                   登出并清理本地会话
-  run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
-                                           跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
+  run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road|manual]
+                                           跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法；
+                                           manual=只按实时点位串联、不要求策略必经点，无路网时退回按点位连线）
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
   ai-list                                  AI 运动项目列表
   ai     --sport <id> [--mode min|count] [--score n]
@@ -32,6 +33,10 @@ fn usage() {
   ai-records --sport <id>                  AI 运动记录（按天分组）
   semester                                 学期完成度
   cheat  [--page n]                        违规自查
+  recover [--yes] [--verify] [--only rrid] [--limit n] [--dist km] [--pace 秒/km]
+                                           异常记录修复：默认只诊断（违规榜 + 未达标记录 +
+                                           原因）；--yes 才用原开始时刻覆盖提交，默认一次最多 3 条；
+                                           --verify 修完复查（记录是否转绿、违规榜是否清）
   rank   main   --type 1|2|3 --sort 1|2 [--gender 0|1] [--date YYYY-MM-DD]
                                            排行榜（1个人 2班级 3院系；1日 2月）
   rank   indoor --range 1|2|3 [--gender 0|1]

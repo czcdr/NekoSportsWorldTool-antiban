@@ -20,22 +20,48 @@ use route_planner::{
     KinParams, RoadGraph, Route, RouteOptions, Sdf,
 };
 
-/// 路线算法模式（二选一）。
+/// 路线算法模式（三选一）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RouteMode {
     /// 经典打卡点环（Catmull-Rom）。
     #[default]
     Legacy,
-    /// 真实道路拓扑路由。
+    /// 真实道路拓扑路由：强制经过**全部**策略必经点与实时点位。
     Road,
+    /// 自定义点位：只按实时点位顺序串联，不追加策略必经点。
+    ///
+    /// 有可用路网时沿道路走；没有路网（未配置 / 读取失败 / 围栏裁剪为空 / 不连通）
+    /// 时**退回按点位连线**，而不是报错 —— 这是它与 `Road` 的关键区别。
+    /// 适合「点位接口只给了 3 个点，但策略又要求 5 个必经点」这类必然对不上的场景。
+    Manual,
 }
 
 impl RouteMode {
     pub fn from_str(s: &str) -> Self {
-        match s {
+        match s.trim().to_ascii_lowercase().as_str() {
             "road" => RouteMode::Road,
+            "manual" | "custom" => RouteMode::Manual,
             _ => RouteMode::Legacy,
         }
+    }
+
+    /// 配置持久化用的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteMode::Legacy => "legacy",
+            RouteMode::Road => "road",
+            RouteMode::Manual => "manual",
+        }
+    }
+
+    /// 是否**必须**拿到路网才能工作。`Manual` 不必须（拿不到就退回连线）。
+    pub fn requires_network(self) -> bool {
+        matches!(self, RouteMode::Road)
+    }
+
+    /// 是否需要拉取学校点位/围栏/路网。经典模式不触发这些端点。
+    pub fn needs_school_route(self) -> bool {
+        matches!(self, RouteMode::Road | RouteMode::Manual)
     }
 }
 
@@ -46,7 +72,9 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
     }
     // 手机上的路网是从系统文件选择器挑的，可能是任意大小；先按体积挡住，
     // 否则一个几百 MB 的 .osm 会在解析阶段把内存吃光（手机上就是闪退）。
-    const MAX_OSM_BYTES: u64 = 64 * 1024 * 1024;
+    // 与下载路径（`school_roads::MAX_BYTES`）保持同一个上限：两条入口给不同额度，
+    // 只会让用户遇到「自动下载能跑、手动导入却闪退」这种自相矛盾的失败。
+    const MAX_OSM_BYTES: u64 = 24 * 1024 * 1024;
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_OSM_BYTES {
             return Err(format!(
@@ -161,7 +189,15 @@ pub fn plan_road_view(
 /// 变化），故用标准 WGS84→GCJ-02→BD-09 变换逐节点转换，校园尺度下与真实道路
 /// 对齐（优于旧版质心常数平移的米级~数十米残差）。
 pub fn align_network(net: &mut RoadGraph) {
+    // 幂等护栏：WGS84→BD-09 不是常数平移，对已对齐的图再跑一次会**二次偏移数百米
+    // 而且不报错**（轨迹整体挪到隔壁街区，看起来仍然"像一条路"）。
+    // 现在所有调用点都只调一次；这个门是给将来新增调用方的，`apply_fences` 走 clone
+    // 会带着标记一起复制，所以裁剪后不会丢掉"已对齐"的事实。
+    if net.align_applied {
+        return;
+    }
     if net.graph.node_count() == 0 {
+        // 空图不标记：等真正有节点时再对齐，否则会永久跳过。
         return;
     }
     for node in net.graph.node_weights_mut() {
@@ -176,6 +212,7 @@ pub fn align_network(net: &mut RoadGraph) {
             c.lon = lon;
         }
     }
+    net.align_applied = true;
     net.compute_anchor();
     net.rebuild_index();
 }
@@ -410,8 +447,16 @@ pub fn build_road(
     let cadence_seed = seed.wrapping_add(0xC6A4_A793_5BD1_E995);
     let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.25, 0.5, 110.0, 220.0);
 
-    // GPS 抖动：AR(1) 相关漂移 + 高斯测量噪声（SDF 逐点放大）
-    let mut jitter = GpsJitter::new(0.72, 0.75, 0.3);
+    // GPS 抖动：AR(1) 相关漂移 + 高斯测量噪声（SDF 逐点放大）。
+    //
+    // 参数**每个 seed 独立随机**：固定 α/σ 会让所有用户、所有圈次的漂移形态完全一致，
+    // 等于给每个人发同一枚指纹（同一套抖动序列是可聚类的）。单点稳态标准差按手机实测
+    // 落在 2.8–4.2 m；旧值 0.72/0.75 的稳态 std 仅 ≈1.08 m，轨迹贴线贴得像尺子画的。
+    // 稳态 std = σ_step/√(1−α²)，所以这里由目标稳态值反解 σ_step。
+    let jitter_alpha = rng.uniform(0.86, 0.95);
+    let jitter_steady = rng.uniform(2.8, 4.2);
+    let jitter_sigma = jitter_steady * (1.0 - jitter_alpha * jitter_alpha).sqrt();
+    let mut jitter = GpsJitter::new(jitter_alpha, jitter_sigma, rng.uniform(0.25, 0.65));
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut positions = Vec::with_capacity(n);
@@ -451,14 +496,12 @@ pub fn build_road(
             let (jxd, jyd) = jitter.step(sc, z);
             px = bx + jxd;
             py = by + jyd;
-            rad = round_to(
-                if typ == 3 {
-                    rng.uniform(1.4, 5.1)
-                } else {
-                    rng.uniform(1.4, 2.4)
-                },
-                2,
-            );
+            // accuracy 按对数正态取：真机上报值多数在 4–8 m，长尾到 15 m 以上。
+            // 旧实现是均匀 1.4–2.4 m —— 每条记录、每个用户都困在这个窄区间，
+            // 本身就是可聚类特征（真实设备不会这么整齐）。
+            let acc_z = rng.gauss(0.0, 1.0);
+            let acc_median = if typ == 3 { 11.0 } else { 7.0 };
+            rad = round_to((acc_median * (0.42 * acc_z).exp()).clamp(3.0, 15.0), 2);
             state = if typ == 0 {
                 rng.weighted(&[(1, 145), (2, 45), (3, 164)])
             } else {
@@ -483,7 +526,10 @@ pub fn build_road(
                 px = x + jx;
                 py = y + jy;
             }
-            rad = round_to(rng.uniform(1.6, 10.0), 2);
+            // 异常点保留原有上限（radius ≤ 10 m 的契约由 `track::tests` 钉住），
+            // 只把分布从均匀换成对数正态。
+            let acc_z = rng.gauss(0.0, 1.0);
+            rad = round_to((6.0 * (0.42 * acc_z).exp()).clamp(3.0, 10.0), 2);
             state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
         }
         if typ != -1 {
@@ -607,6 +653,68 @@ pub fn build_road(
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn route_mode_strings_and_capabilities_round_trip() {
+        assert_eq!(RouteMode::from_str("road"), RouteMode::Road);
+        assert_eq!(RouteMode::from_str("manual"), RouteMode::Manual);
+        // 兼容参考实现的别名
+        assert_eq!(RouteMode::from_str("custom"), RouteMode::Manual);
+        // 容忍大小写与前后空白（配置里手写的值）
+        assert_eq!(RouteMode::from_str("  MANUAL "), RouteMode::Manual);
+        assert_eq!(RouteMode::from_str("legacy"), RouteMode::Legacy);
+        assert_eq!(RouteMode::from_str("随便写点什么"), RouteMode::Legacy);
+
+        for m in [RouteMode::Legacy, RouteMode::Road, RouteMode::Manual] {
+            assert_eq!(RouteMode::from_str(m.as_str()), m, "配置序列化必须可往返");
+        }
+
+        // 只有 Road 必须有路网；Manual 拿不到会退回按点位连线
+        assert!(RouteMode::Road.requires_network());
+        assert!(!RouteMode::Manual.requires_network());
+        assert!(!RouteMode::Legacy.requires_network());
+
+        // Manual 仍然要拉学校点位/围栏（只是不追加策略必经点）
+        assert!(RouteMode::Road.needs_school_route());
+        assert!(RouteMode::Manual.needs_school_route());
+        assert!(!RouteMode::Legacy.needs_school_route());
+    }
+
+    #[test]
+    fn align_network_shifts_once_and_never_twice() {
+        // WGS84→BD-09 在境内会产生数百米偏移；重复应用会再偏一次且不报错，
+        // 所以这里钉死「第一次生效、第二次必须无效」。
+        let mut net = RoadGraph::new();
+        let n = net.add_node(Coord::new(116.4, 39.9));
+        net.compute_anchor();
+        let before = net.node_coord(n);
+        assert!(!net.align_applied);
+
+        align_network(&mut net);
+        let after = net.node_coord(n);
+        assert!(net.align_applied);
+        assert!(
+            (after.lat - before.lat).abs() > 1e-4 || (after.lon - before.lon).abs() > 1e-4,
+            "首次对齐应产生可见偏移"
+        );
+
+        align_network(&mut net);
+        let again = net.node_coord(n);
+        assert_eq!(
+            (after.lat, after.lon),
+            (again.lat, again.lon),
+            "第二次 align_network 必须不生效"
+        );
+    }
+
+    #[test]
+    fn empty_network_is_not_marked_aligned() {
+        // 空图不标记，否则以后加进节点也永远不会对齐。
+        let mut net = RoadGraph::new();
+        align_network(&mut net);
+        assert!(!net.align_applied);
+    }
+
     #[test]
     fn preview_and_generation_share_required_points_options_and_seed() {
         let mut net = RoadGraph::new();

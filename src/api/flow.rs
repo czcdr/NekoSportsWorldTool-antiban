@@ -318,6 +318,56 @@ pub fn run_full_flow_cancellable(
             )
             .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
         }
+        RouteMode::Manual => {
+            // 自定义点位：只用实时点位，**不追加**策略必经点（`route_pts` 含 must_points）。
+            // 有可用路网就沿道路串起来；拿不到路网就退回按点位连线，
+            // 而不是像 Road 那样直接失败 —— 这是 Manual 存在的意义。
+            let manual_pts = points::points_bd(&pts);
+            log(&format!(
+                "[manual] 自定义点位 {} 个（不含策略必经点），优先沿道路串联",
+                manual_pts.len()
+            ));
+            let config = super::model::load_config();
+            let loaded = super::school_roads::load_for_route_cancellable(
+                &config.osm_path,
+                &sess.unid,
+                &fences.polygons,
+                &manual_pts,
+                false,
+                control,
+                log,
+            );
+            match loaded {
+                Ok(mut net) => {
+                    crate::track::generate_road::align_network(&mut net);
+                    let filtered = crate::track::generate_road::apply_fences(&net, &fences.polygons);
+                    log("[manual] 沿道路按点位顺序串联；不要求经过策略必经点");
+                    crate::track::generate_road::build_road(
+                        params.dist,
+                        params.dur,
+                        params.seed,
+                        start_ms,
+                        &manual_pts,
+                        &[],
+                        &filtered,
+                    )
+                    .map_err(|e| {
+                        format!("自定义点位路由失败：{e}；可留空路网退回按点位连线")
+                    })?
+                }
+                Err(e) => {
+                    log(&format!("[manual] 无可用路网（{e}），退回按点位连线"));
+                    gen_track(
+                        params.dist,
+                        params.dur,
+                        params.seed,
+                        (anchor.latitude, anchor.longitude),
+                        start_ms,
+                        &manual_pts,
+                    )
+                }
+            }
+        }
         RouteMode::Legacy => gen_track(
             params.dist,
             params.dur,

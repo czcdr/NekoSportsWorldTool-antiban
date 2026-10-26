@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "nekosportsworldtool"
-version = "0.3.9-antiban"
+version = "0.4.0-antiban"
 dependencies = [
  "aes",
  "android-activity",
@@ -3614,6 +3614,7 @@ checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
 name = "route-planner"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "geo",
  "geo-types",
  "petgraph",
@@ -3622,6 +3623,7 @@ dependencies = [
  "rand_distr",
  "rstar",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

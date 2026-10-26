@@ -524,6 +524,92 @@ cargo test --lib --offline        246 passed / 0 failed / 1 ignored（较 L 节�
 **没有验证到的**：官方提交到底走 OkHttp 4.12.0 还是 3.14.9；policy 是否真的下发
 `faceEnable`（三处落点都只是"能认"，不是"见过"）；`faceVerifyType` 的取值含义。
 
+---
+
+## N. 0.4.0-antiban：禁跑诊断 / 路网补全 / 自定义路由
+
+本轮三件事：把「被禁跑还剩多久」变成可读数字、补掉路网与轨迹真实性的四处缺口、加第三种路线模式。
+
+### N.1 禁跑倒计时 + `recover` 命令
+
+**发现**：`POST /api/v70103/runModePolicy` 的响应里 `data.freezeRunTime` 是**剩余冻结秒数**。
+这个接口我们一直在调，但只取了 `policy/minDistance/validTime/mustPoints`，把该字段丢了。
+官方文案「您已被查出跑步违规.无法进行跑步.将在…」的「将在」就是它换算出来的解禁时刻。
+
+- `src/api/policy.rs`：`PolicyInfo` 增 `freeze_run_time`（负值按 0）与 `freeze_message`，
+  加 `frozen()` / `freeze_text()`（`还剩 2 天 00:00:00`）。
+- `src/api/recover.rs`（新增）：`diagnose` = 冻结倒计时 + 违规榜 + 记录列表 + 逐条 `reasonList`；
+  `fix_one` 用**原记录 `startTime`** 覆盖提交（`save/record` 对同日同 `sportType` 无去重锁，
+  商品截图里 `1.72km→1.68km` 证明是重算覆盖而非改状态位）。
+- `src/cli/cmds.rs`：`recover [--yes] [--verify] [--only rrid] [--limit n]`。默认 dry-run；
+  **冻结期直接拒绝提交**（服务端独立校验资格，强提交只是白挨一次风控计数）；修完 `--verify` 复查。
+
+**边界（写进代码注释，不吹）**：修复动的是**记录**，不是台账。`freezeRunTime` 归零是唯一能区分
+「派生冻结 vs 独立台账」的证据，`--verify` 就是为这个实验留的。
+
+### N.2 路网与轨迹真实性的四处缺口
+
+| 缺口 | 改动 | 影响 |
+|---|---|---|
+| OSM 只按 node id 建图，**同坐标不同 id 的路口不连通** | `load.rs` 改按量化坐标焊接（1e-7°≈1.1 cm），3 个回归测试 | 「看着连、图上断」的假断点；参考实现同样没有 |
+| GPS 漂移硬编码 `(0.72,0.75,0.3)`，稳态 std 仅 1.08 m 且每 seed 相同 | `generate_road.rs` 每 seed 随机 α∈[0.86,0.95]、稳态 std∈[2.8,4.2] m、测量噪声∈[0.25,0.65] | 轨迹不再贴线；固定参数＝所有人共用一枚指纹 |
+| 手动导入上限 64 MiB、自动下载 24 MiB，自相矛盾 | 统一 `24 MiB`（`generate_road.rs` 与 `school_roads::MAX_BYTES` 同额） | 消除「自动下载能跑、手动导入闪退」 |
+| `align_network` 无幂等门，重复调用二次偏移数百米且不报错 | `RoadGraph.align_applied` + 门 + 2 个测试 | 将来新增调用方不会静默毁掉整个路网 |
+
+顺带：`accuracy` 从均匀 1.4–2.4 m 改成对数正态（中位 7 m；异常点 6 m，保留 `≤10 m` 原契约）。
+
+### N.3 GPX 补全（`crates/route-planner/src/gpx.rs`）
+
+原来 89 行只取经纬度。现在：
+
+- **海拔** `<ele>`（非法值按缺失，不让整条轨迹失败）+ `ascent_descent()`（3 m 阈值滤 GPS 抖动）
+- **RFC3339 → 毫秒**（`parse_time_ms`），`analysis.rs` 不再逐点重复解析
+- **`parse_point_text`**：每行 `lat,lon[,ele]`，跳表头/注释，分隔符兼容逗号/空白/分号
+- **`parse_point_json`**：`[{lat,lon}]` / `[[lat,lon]]` / `{points:…}`，键名兼容 `latitude/lng/ele/alt`
+- `analysis::parse_any` 按**内容**识别格式（`<`→GPX、`[`/`{`→JSON、其余→文本），扩展名不可靠
+- 分析结果输出真实累计爬升/下降；没有 `<ele>` 时显示「未提供」而不是 0
+
+### N.4 第三种路线模式 `Manual`
+
+`RouteMode` 增 `Manual`（`from_str` 兼容 `manual`/`custom`）：
+
+| | 强制集合 | 无路网时 |
+|---|---|---|
+| `Road` | 实时点位 **+ 策略必经点** | **失败**（这是设计） |
+| `Manual` | **只有实时点位**，`must_bd` 传空 | **退回按点位连线**（经典 `gen_track`） |
+
+配套：`as_str()` 做配置持久化（`run.rs` 的三元改成它）、`requires_network()`（只有 Road 必须路网）、
+`needs_school_route()`（Road/Manual 都要拉学校数据，`jobs.rs` 原来 `!= Road` 会漏掉 Manual）。
+UI 加第三项并带 hover 说明；CLI `--route manual`。
+
+### N.5 验证
+
+```
+cargo test --release --lib --offline    257 passed / 0 failed / 1 ignored（较 M 节净增 11）
+cargo test --release -p route-planner     16 passed（lib）+ 7 passed（tests/basic.rs）
+cargo clippy --release --lib --all-features   exit 0
+cargo check --all-targets --all-features      exit 0
+cargo check -p route-planner --target aarch64-linux-android   Finished
+```
+
+本轮新增用例：`recover` 5 个（含冻结优先于修复建议）、`policy` 2 个（冻结解析/格式化）、
+`load` 3 个（焊接/不误并/单连通分量）、`align` 2 个（幂等/空图不标记）、
+`RouteMode` 1 个（字符串往返 + 能力位）、`build_road` Manual 1 个、
+`gpx` 5 个（海拔时间/爬升阈值/文本/JSON/DTD）。
+
+**Android 交叉编译的真实边界**：`route-planner` 全 crate 在 `aarch64-linux-android` 上通过
+（纯 Rust 依赖）。**主 crate 未通过**——本机 Android SDK/NDK 不存在
+（`C:\Users\lenovo\AppData\Local\Android\Sdk` 无此目录），`ring` 找不到
+`aarch64-linux-android-clang`。这是**环境缺失，不是本轮代码问题**；要真验证需装 NDK 后按
+`android/build.ps1` 设 `CC_*`/`AR_*`/`LINKER` 再跑。本轮新增代码无平台相关 API：
+`road_tools.rs` 的 `rfd::FileDialog` 仍在 `#[cfg(not(target_os = "android"))]` 内，
+其余为纯逻辑或 `std`。
+
+**没有验证到的**：`freezeRunTime` 归零是否真等于解冻（需真实被冻结账号跑一次 `recover --verify`）；
+`save/record` 的覆盖键到底是日期还是 `startTime`（同理，需实测一条）；焊接容差 1 cm 在真实
+杂乱 OSM 上的收益幅度（只有构造用例，没有真实脏数据样本）。
+
+
 
 
 
