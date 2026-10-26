@@ -426,10 +426,13 @@ mod regression_tests {
         ] {
             let track = linear_track(distance, seconds, 1200);
             let obs = build_obs_object(&track, 1, "fixture", 1, "{}");
-            let bytes = crate::crypto::envelope::b64_decode(obs["laps_json"].as_str().unwrap()).unwrap();
+            let bytes =
+                crate::crypto::envelope::b64_decode(obs["laps_json"].as_str().unwrap()).unwrap();
             let mut decoded = String::new();
             use std::io::Read;
-            flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut decoded).unwrap();
+            flate2::read::GzDecoder::new(&bytes[..])
+                .read_to_string(&mut decoded)
+                .unwrap();
             let laps: Vec<Value> = serde_json::from_str(&decoded).unwrap();
             assert_eq!(laps.len(), 1);
             assert_eq!(laps[0]["avgPace"], pace);
@@ -441,7 +444,12 @@ mod regression_tests {
         let laps = build_laps(&linear_track(1010.0, 408, 1200), 0);
         assert_eq!(laps[0]["avgPace"], 404.0);
         assert_eq!(laps[1]["avgPace"], 400.0);
-        assert_eq!(laps.iter().map(|l| l["duration"].as_i64().unwrap()).sum::<i64>(), 408);
+        assert_eq!(
+            laps.iter()
+                .map(|l| l["duration"].as_i64().unwrap())
+                .sum::<i64>(),
+            408
+        );
     }
 
     #[test]
@@ -512,8 +520,18 @@ mod window_and_position_tests {
             startLongitude: 113.37,
             locations: Vec::new(),
             totalSteps: 1800,
-            speedPerTenSec: (0..n).map(|_| TenWindow { time: 10, value: 30.0 }).collect(),
-            stepsPerTenSec: (0..n).map(|_| TenWindow { time: 10, value: 26.0 }).collect(),
+            speedPerTenSec: (0..n)
+                .map(|_| TenWindow {
+                    time: 10,
+                    value: 30.0,
+                })
+                .collect(),
+            stepsPerTenSec: (0..n)
+                .map(|_| TenWindow {
+                    time: 10,
+                    value: 26.0,
+                })
+                .collect(),
             segments: Vec::new(),
         }
     }
@@ -523,7 +541,8 @@ mod window_and_position_tests {
     fn last_partial_window_keeps_cadence_sane() {
         let (sp, stf) = build_windows(&track_with(1237));
         let last = stf.last().unwrap();
-        let secs = ((last["endTime"].as_i64().unwrap() - last["beginTime"].as_i64().unwrap()) as f64
+        let secs = ((last["endTime"].as_i64().unwrap() - last["beginTime"].as_i64().unwrap())
+            as f64
             / 1000.0)
             .max(0.1);
         let cadence = last["stepsNum"].as_i64().unwrap() as f64 / secs * 60.0;
@@ -538,7 +557,17 @@ mod window_and_position_tests {
     fn window_ids_are_sequential() {
         let (sp, stf) = build_windows(&track_with(60));
         let ids: Vec<i64> = sp.iter().map(|w| w["id"].as_i64().unwrap()).collect();
-        assert_eq!(ids, vec![ids[0], ids[0] + 1, ids[0] + 2, ids[0] + 3, ids[0] + 4, ids[0] + 5]);
+        assert_eq!(
+            ids,
+            vec![
+                ids[0],
+                ids[0] + 1,
+                ids[0] + 2,
+                ids[0] + 3,
+                ids[0] + 4,
+                ids[0] + 5
+            ]
+        );
         for (i, w) in sp.iter().enumerate() {
             assert_eq!(w["queueNum"].as_i64().unwrap(), i as i64);
         }

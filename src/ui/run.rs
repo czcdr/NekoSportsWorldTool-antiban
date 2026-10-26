@@ -425,9 +425,7 @@ impl App {
         }
 
         // 切到需要学校数据的模式时按需拉取围栏/点位/路网（经典模式不触发这些端点）。
-        if self.run_page.route_mode.needs_school_route()
-            && !prev_route.needs_school_route()
-        {
+        if self.run_page.route_mode.needs_school_route() && !prev_route.needs_school_route() {
             self.refresh_points();
         }
 
@@ -901,7 +899,9 @@ impl App {
     }
 
     fn start_run(&mut self) {
-        if self.run_busy { return; }
+        if self.run_busy {
+            return;
+        }
         if self.run_page.route_mode.requires_network() && self.network.is_none() {
             self.status = "请先加载路网并刷新路线点位".into();
             return;

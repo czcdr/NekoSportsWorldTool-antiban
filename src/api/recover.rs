@@ -347,14 +347,54 @@ mod tests {
     #[test]
     fn explicit_plan_distance_is_clamped_to_compliance_band() {
         let a = ab(1, 1200.0, 1);
-        assert!((FixPlan { dist: 9000.0, pace_s: 0.0, face_check: 1 }.resolved_dist(&a) - MAX_DIST).abs() < 1e-9);
-        assert!((FixPlan { dist: 0.0, pace_s: 0.0, face_check: 1 }.resolved_dist(&a) - 1200.0).abs() < 1e-9);
+        assert!(
+            (FixPlan {
+                dist: 9000.0,
+                pace_s: 0.0,
+                face_check: 1
+            }
+            .resolved_dist(&a)
+                - MAX_DIST)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (FixPlan {
+                dist: 0.0,
+                pace_s: 0.0,
+                face_check: 1
+            }
+            .resolved_dist(&a)
+                - 1200.0)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
     fn pace_is_always_inside_band_even_when_operator_asks_for_extremes() {
-        assert!((FixPlan { dist: 0.0, pace_s: 60.0, face_check: 1 }.resolved_pace() - MIN_PACE_S).abs() < 1e-9);
-        assert!((FixPlan { dist: 0.0, pace_s: 9999.0, face_check: 1 }.resolved_pace() - MAX_PACE_S).abs() < 1e-9);
+        assert!(
+            (FixPlan {
+                dist: 0.0,
+                pace_s: 60.0,
+                face_check: 1
+            }
+            .resolved_pace()
+                - MIN_PACE_S)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (FixPlan {
+                dist: 0.0,
+                pace_s: 9999.0,
+                face_check: 1
+            }
+            .resolved_pace()
+                - MAX_PACE_S)
+                .abs()
+                < 1e-9
+        );
         for _ in 0..200 {
             let p = FixPlan::default().resolved_pace();
             assert!((MIN_PACE_S..=MAX_PACE_S).contains(&p), "随机配速越界: {p}");
@@ -416,7 +456,10 @@ mod tests {
         let v = frozen.verdict();
         assert!(v.contains("禁跑期"), "{v}");
         assert!(v.contains("2 天"), "{v}");
-        assert!(v.contains("2 条待修"), "应保留待修条数供解冻后立即处理: {v}");
+        assert!(
+            v.contains("2 条待修"),
+            "应保留待修条数供解冻后立即处理: {v}"
+        );
         assert!(!v.contains("最可修"), "冻结时不该给「直接修」的结论: {v}");
 
         // 拿不到策略 = 状态未知，不能当成「未冻结」放行
@@ -440,7 +483,9 @@ mod tests {
     fn missing_start_time_is_rejected_before_any_network_call() {
         // fix_one 的第一道守卫不依赖网络；用空 Abnormal 验证错误信息可读。
         let bad = ab(7, 1200.0, 0);
-        let msg = match (bad.start_ms <= 0).then(|| format!("rrid={} 缺少开始时刻，无法原位覆盖", bad.rrid)) {
+        let msg = match (bad.start_ms <= 0)
+            .then(|| format!("rrid={} 缺少开始时刻，无法原位覆盖", bad.rrid))
+        {
             Some(m) => m,
             None => unreachable!(),
         };

@@ -506,7 +506,11 @@ mod storage_tests {
         expected["pixel"] = imported.pixel.clone().into();
         // 本用例的 info 不含真机分辨率/androidId → 按机型库补齐，来源标记为 false
         expected["fingerprint_from_device"] = false.into();
-        assert_eq!(imported.android_id.len(), 16, "导入后必须补齐 16 位 androidId");
+        assert_eq!(
+            imported.android_id.len(),
+            16,
+            "导入后必须补齐 16 位 androidId"
+        );
         assert!(!imported.pixel.is_empty(), "导入后必须有分辨率");
         assert_eq!(
             serde_json::to_value(&imported).unwrap(),
@@ -579,9 +583,10 @@ mod storage_tests {
             device_id: "0E5A5B4C-1111-4A2B-9C3D-5E6F70819234".into(),
             ..identity.clone()
         };
-        let partial: DeviceInfo =
-            serde_json::from_str(r#"{"manufacturer":"Xiaomi","model":"23127PN0CC","os_version":"14"}"#)
-                .unwrap();
+        let partial: DeviceInfo = serde_json::from_str(
+            r#"{"manufacturer":"Xiaomi","model":"23127PN0CC","os_version":"14"}"#,
+        )
+        .unwrap();
         let inferred = identity_with_device_info(&with_id, &partial).unwrap();
         assert!(!inferred.fingerprint_from_device);
         assert!(!inferred.pixel.is_empty() && inferred.android_id.len() == 16);
@@ -897,7 +902,10 @@ mod points_cache_tests {
         );
         // 幂等：再加载一次还是同一个值，且不该再被判定为 dirty 反复重写。
         let again = load_identity_for_platform("android");
-        assert_eq!(again.mac_address, crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC);
+        assert_eq!(
+            again.mac_address,
+            crate::api::fingerprint::ANDROID_PLACEHOLDER_MAC
+        );
     }
 
     /// 老版本桌面端写下的「从没动过的 iOS 默认身份」要一次性迁到 Android；
@@ -926,7 +934,10 @@ mod points_cache_tests {
         write_json("identity.json", &pristine).unwrap();
 
         let migrated = load_identity_for_platform("android");
-        assert_eq!(migrated.platform, "android", "旧默认身份应一次性迁到 Android");
+        assert_eq!(
+            migrated.platform, "android",
+            "旧默认身份应一次性迁到 Android"
+        );
         assert!(migrated.platform_migrated);
         assert_ne!(
             migrated.device_name, "iPhone",
@@ -983,7 +994,10 @@ mod points_cache_tests {
         );
         assert!(raw.contains("password_sealed"), "{raw}");
         let loaded = load_config();
-        assert_eq!(loaded.password, "s3cret-pass", "重新加载必须还原明文供登录用");
+        assert_eq!(
+            loaded.password, "s3cret-pass",
+            "重新加载必须还原明文供登录用"
+        );
         assert_eq!(loaded.username, "13800000000");
         assert!(loaded.remember);
 

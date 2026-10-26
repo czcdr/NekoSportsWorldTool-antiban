@@ -21,7 +21,9 @@ impl Drop for FixtureDir {
     }
 }
 
-pub(super) fn mock_school(responses: Vec<(&'static str, Value)>) -> (String, std::thread::JoinHandle<usize>) {
+pub(super) fn mock_school(
+    responses: Vec<(&'static str, Value)>,
+) -> (String, std::thread::JoinHandle<usize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let host = format!("http://{}", listener.local_addr().unwrap());

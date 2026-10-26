@@ -47,63 +47,227 @@ pub const ANDROID_PLACEHOLDER_MAC: &str = "02:00:00:00:00:00";
 pub const MODELS: &[ModelProfile] = &[
     // ── 小米 / Redmi ────────────────────────────────────────────────
     // Redmi K50 至尊版（2208 = 2022-08）：2712x1220 1.5K
-    ModelProfile { device_name: "22081212C", logical: (1220, 2712), dpi: 440, os_versions: &["13", "14"], brand: "Xiaomi", weight: 3 },
+    ModelProfile {
+        device_name: "22081212C",
+        logical: (1220, 2712),
+        dpi: 440,
+        os_versions: &["13", "14"],
+        brand: "Xiaomi",
+        weight: 3,
+    },
     // Redmi K60 至尊版（2307 = 2023-07）：2712x1220 1.5K
-    ModelProfile { device_name: "23078RKD5C", logical: (1220, 2712), dpi: 440, os_versions: &["13", "14"], brand: "Xiaomi", weight: 4 },
+    ModelProfile {
+        device_name: "23078RKD5C",
+        logical: (1220, 2712),
+        dpi: 440,
+        os_versions: &["13", "14"],
+        brand: "Xiaomi",
+        weight: 4,
+    },
     // Redmi K70（2311 = 2023-11）：3200x1440 2K
-    ModelProfile { device_name: "23113RKC6C", logical: (1440, 3200), dpi: 526, os_versions: &["14"], brand: "Xiaomi", weight: 3 },
+    ModelProfile {
+        device_name: "23113RKC6C",
+        logical: (1440, 3200),
+        dpi: 526,
+        os_versions: &["14"],
+        brand: "Xiaomi",
+        weight: 3,
+    },
     // Redmi K40（M2012 = 2020-12）：2400x1080
-    ModelProfile { device_name: "M2012K11AC", logical: (1080, 2400), dpi: 440, os_versions: &["11", "12", "13"], brand: "Xiaomi", weight: 4 },
+    ModelProfile {
+        device_name: "M2012K11AC",
+        logical: (1080, 2400),
+        dpi: 440,
+        os_versions: &["11", "12", "13"],
+        brand: "Xiaomi",
+        weight: 4,
+    },
     // Redmi Note 12 Turbo（2304 = 2023-04）：2400x1080（这一档销量最大）
-    ModelProfile { device_name: "23049RAD8C", logical: (1080, 2400), dpi: 440, os_versions: &["13", "14"], brand: "Xiaomi", weight: 6 },
+    ModelProfile {
+        device_name: "23049RAD8C",
+        logical: (1080, 2400),
+        dpi: 440,
+        os_versions: &["13", "14"],
+        brand: "Xiaomi",
+        weight: 6,
+    },
     // Xiaomi 13（2211 = 2022-11）：2400x1080
-    ModelProfile { device_name: "2211133C", logical: (1080, 2400), dpi: 440, os_versions: &["13", "14"], brand: "Xiaomi", weight: 4 },
+    ModelProfile {
+        device_name: "2211133C",
+        logical: (1080, 2400),
+        dpi: 440,
+        os_versions: &["13", "14"],
+        brand: "Xiaomi",
+        weight: 4,
+    },
     // Xiaomi 14（2312 = 2023-12）：2670x1200
-    ModelProfile { device_name: "23127PN0CC", logical: (1200, 2670), dpi: 460, os_versions: &["14"], brand: "Xiaomi", weight: 3 },
+    ModelProfile {
+        device_name: "23127PN0CC",
+        logical: (1200, 2670),
+        dpi: 460,
+        os_versions: &["14"],
+        brand: "Xiaomi",
+        weight: 3,
+    },
     // Xiaomi 11 Ultra（M2102 = 2021-02）：3200x1440
-    ModelProfile { device_name: "M2102K1AC", logical: (1440, 3200), dpi: 515, os_versions: &["12", "13"], brand: "Xiaomi", weight: 1 },
-
+    ModelProfile {
+        device_name: "M2102K1AC",
+        logical: (1440, 3200),
+        dpi: 515,
+        os_versions: &["12", "13"],
+        brand: "Xiaomi",
+        weight: 1,
+    },
     // ── 一加 / OPPO / realme（同源产线，型号互相印证）────────────────
     // OnePlus 12（PJD110）：3168x1440
-    ModelProfile { device_name: "PJD110", logical: (1440, 3168), dpi: 510, os_versions: &["14"], brand: "OnePlus", weight: 2 },
+    ModelProfile {
+        device_name: "PJD110",
+        logical: (1440, 3168),
+        dpi: 510,
+        os_versions: &["14"],
+        brand: "OnePlus",
+        weight: 2,
+    },
     // OnePlus Ace 2 Pro（PHK110）：2772x1240 1.5K
-    ModelProfile { device_name: "PHK110", logical: (1240, 2772), dpi: 450, os_versions: &["13", "14"], brand: "OnePlus", weight: 4 },
+    ModelProfile {
+        device_name: "PHK110",
+        logical: (1240, 2772),
+        dpi: 450,
+        os_versions: &["13", "14"],
+        brand: "OnePlus",
+        weight: 4,
+    },
     // OPPO Find X6（PGFM10）：2772x1240 1.5K（竖屏 1240x2772）
-    ModelProfile { device_name: "PGFM10", logical: (1240, 2772), dpi: 450, os_versions: &["13", "14"], brand: "OPPO", weight: 2 },
+    ModelProfile {
+        device_name: "PGFM10",
+        logical: (1240, 2772),
+        dpi: 450,
+        os_versions: &["13", "14"],
+        brand: "OPPO",
+        weight: 2,
+    },
     // OPPO Find X2 Pro（PDEM10）：3168x1440
-    ModelProfile { device_name: "PDEM10", logical: (1440, 3168), dpi: 513, os_versions: &["11", "12"], brand: "OPPO", weight: 1 },
+    ModelProfile {
+        device_name: "PDEM10",
+        logical: (1440, 3168),
+        dpi: 513,
+        os_versions: &["11", "12"],
+        brand: "OPPO",
+        weight: 1,
+    },
     // realme GT5（RMX3820）：2772x1240 1.5K
-    ModelProfile { device_name: "RMX3820", logical: (1240, 2772), dpi: 450, os_versions: &["13", "14"], brand: "realme", weight: 3 },
+    ModelProfile {
+        device_name: "RMX3820",
+        logical: (1240, 2772),
+        dpi: 450,
+        os_versions: &["13", "14"],
+        brand: "realme",
+        weight: 3,
+    },
     // realme GT Neo5（RMX3706）：2772x1240 1.5K
-    ModelProfile { device_name: "RMX3706", logical: (1240, 2772), dpi: 450, os_versions: &["13", "14"], brand: "realme", weight: 5 },
-
+    ModelProfile {
+        device_name: "RMX3706",
+        logical: (1240, 2772),
+        dpi: 450,
+        os_versions: &["13", "14"],
+        brand: "realme",
+        weight: 5,
+    },
     // ── vivo / iQOO ────────────────────────────────────────────────
     // vivo X90 Pro（V2227A）：2800x1260
-    ModelProfile { device_name: "V2227A", logical: (1260, 2800), dpi: 453, os_versions: &["13", "14"], brand: "vivo", weight: 2 },
+    ModelProfile {
+        device_name: "V2227A",
+        logical: (1260, 2800),
+        dpi: 453,
+        os_versions: &["13", "14"],
+        brand: "vivo",
+        weight: 2,
+    },
     // vivo X100（V2309A）：2800x1260
-    ModelProfile { device_name: "V2309A", logical: (1260, 2800), dpi: 453, os_versions: &["14"], brand: "vivo", weight: 4 },
+    ModelProfile {
+        device_name: "V2309A",
+        logical: (1260, 2800),
+        dpi: 453,
+        os_versions: &["14"],
+        brand: "vivo",
+        weight: 4,
+    },
     // vivo X100 Pro（V2324A）：2800x1260
-    ModelProfile { device_name: "V2324A", logical: (1260, 2800), dpi: 453, os_versions: &["14"], brand: "vivo", weight: 2 },
-
+    ModelProfile {
+        device_name: "V2324A",
+        logical: (1260, 2800),
+        dpi: 453,
+        os_versions: &["14"],
+        brand: "vivo",
+        weight: 2,
+    },
     // ── 华为 ──────────────────────────────────────────────────────
     // （荣耀没有收录：独立后的机型代号规则与华为不同，手上没有可双向核对的样本，
     //   按本文件的口径「宁可少收录」不猜）
     // Huawei Mate 60 Pro（ALN-AL80）：2720x1260
-    ModelProfile { device_name: "ALN-AL80", logical: (1260, 2720), dpi: 460, os_versions: &["12", "13"], brand: "HUAWEI", weight: 3 },
+    ModelProfile {
+        device_name: "ALN-AL80",
+        logical: (1260, 2720),
+        dpi: 460,
+        os_versions: &["12", "13"],
+        brand: "HUAWEI",
+        weight: 3,
+    },
     // Huawei Mate 40 Pro（NOH-AN00）：2772x1344
-    ModelProfile { device_name: "NOH-AN00", logical: (1344, 2772), dpi: 456, os_versions: &["10", "11", "12"], brand: "HUAWEI", weight: 2 },
+    ModelProfile {
+        device_name: "NOH-AN00",
+        logical: (1344, 2772),
+        dpi: 456,
+        os_versions: &["10", "11", "12"],
+        brand: "HUAWEI",
+        weight: 2,
+    },
     // Huawei P30（ELE-AL00）：2340x1080（长尾老机，仍有在网）
-    ModelProfile { device_name: "ELE-AL00", logical: (1080, 2340), dpi: 422, os_versions: &["9", "10"], brand: "HUAWEI", weight: 1 },
-
+    ModelProfile {
+        device_name: "ELE-AL00",
+        logical: (1080, 2340),
+        dpi: 422,
+        os_versions: &["9", "10"],
+        brand: "HUAWEI",
+        weight: 1,
+    },
     // ── 三星（A 系列走量，S Ultra 少量）───────────────────────────
     // Galaxy S23 Ultra（SM-S9180）：3088x1440
-    ModelProfile { device_name: "SM-S9180", logical: (1440, 3088), dpi: 500, os_versions: &["13", "14"], brand: "samsung", weight: 2 },
+    ModelProfile {
+        device_name: "SM-S9180",
+        logical: (1440, 3088),
+        dpi: 500,
+        os_versions: &["13", "14"],
+        brand: "samsung",
+        weight: 2,
+    },
     // Galaxy S24（SM-S9210）：2340x1080
-    ModelProfile { device_name: "SM-S9210", logical: (1080, 2340), dpi: 450, os_versions: &["14"], brand: "samsung", weight: 2 },
+    ModelProfile {
+        device_name: "SM-S9210",
+        logical: (1080, 2340),
+        dpi: 450,
+        os_versions: &["14"],
+        brand: "samsung",
+        weight: 2,
+    },
     // Galaxy S21（SM-G9910）：2400x1080
-    ModelProfile { device_name: "SM-G9910", logical: (1080, 2400), dpi: 421, os_versions: &["11", "12", "13"], brand: "samsung", weight: 1 },
+    ModelProfile {
+        device_name: "SM-G9910",
+        logical: (1080, 2400),
+        dpi: 421,
+        os_versions: &["11", "12", "13"],
+        brand: "samsung",
+        weight: 1,
+    },
     // Galaxy A54（SM-A5460）：2340x1080（三星在校园里的主力是 A 系列）
-    ModelProfile { device_name: "SM-A5460", logical: (1080, 2340), dpi: 390, os_versions: &["13", "14"], brand: "samsung", weight: 4 },
+    ModelProfile {
+        device_name: "SM-A5460",
+        logical: (1080, 2340),
+        dpi: 390,
+        os_versions: &["13", "14"],
+        brand: "samsung",
+        weight: 4,
+    },
 ];
 
 /// 一台真实 iPhone 的屏幕与系统组合。
@@ -123,15 +287,35 @@ pub struct IosModelProfile {
 /// iOS 机型库：都是公开规格里能双向核对的组合（逻辑×2 或 ×3 = 物理）。
 pub const IOS_MODELS: &[IosModelProfile] = &[
     // iPhone 16 Pro：402x874 @3x
-    IosModelProfile { logical: (402, 874), physical: (1206, 2622), os_versions: &["18.1", "18.2"] },
+    IosModelProfile {
+        logical: (402, 874),
+        physical: (1206, 2622),
+        os_versions: &["18.1", "18.2"],
+    },
     // iPhone 15 Pro / 14 Pro：393x852 @3x
-    IosModelProfile { logical: (393, 852), physical: (1179, 2556), os_versions: &["17.6", "18.1"] },
+    IosModelProfile {
+        logical: (393, 852),
+        physical: (1179, 2556),
+        os_versions: &["17.6", "18.1"],
+    },
     // iPhone 14 / 13 / 12：390x844 @3x
-    IosModelProfile { logical: (390, 844), physical: (1170, 2532), os_versions: &["17.6", "18.1"] },
+    IosModelProfile {
+        logical: (390, 844),
+        physical: (1170, 2532),
+        os_versions: &["17.6", "18.1"],
+    },
     // iPhone 11 / XR：414x896 @2x
-    IosModelProfile { logical: (414, 896), physical: (828, 1792), os_versions: &["16.7", "17.4"] },
+    IosModelProfile {
+        logical: (414, 896),
+        physical: (828, 1792),
+        os_versions: &["16.7", "17.4"],
+    },
     // iPhone SE 3：375x667 @2x
-    IosModelProfile { logical: (375, 667), physical: (750, 1334), os_versions: &["16.7", "17.5"] },
+    IosModelProfile {
+        logical: (375, 667),
+        physical: (750, 1334),
+        os_versions: &["16.7", "17.5"],
+    },
 ];
 
 /// 一套自洽的 iOS 屏幕档案（`deviceName` 恒为 `iPhone`，见上）。
@@ -155,8 +339,7 @@ impl IosProfile {
             z ^ (z >> 31)
         };
         let model = IOS_MODELS[(next() % IOS_MODELS.len() as u64) as usize];
-        let os_version =
-            model.os_versions[(next() % model.os_versions.len() as u64) as usize];
+        let os_version = model.os_versions[(next() % model.os_versions.len() as u64) as usize];
         Self {
             device_name: "iPhone".into(),
             os_version: os_version.to_string(),
@@ -205,11 +388,7 @@ pub struct DeviceProfile {
 ///
 /// - 全零 / 全 f：手工构造或默认零值；
 /// - `9774d56d682e549c`：Android 2.3 时代大量设备共用的著名值，早被各风控标黑。
-pub const BAD_ANDROID_ID: &[&str] = &[
-    "0000000000000000",
-    "ffffffffffffffff",
-    "9774d56d682e549c",
-];
+pub const BAD_ANDROID_ID: &[&str] = &["0000000000000000", "ffffffffffffffff", "9774d56d682e549c"];
 
 /// 生成一个 androidId（16 位小写 hex），**与 device_id 无关**。
 ///
@@ -377,7 +556,10 @@ pub fn audit_ex(profile: &DeviceProfile, check_model: bool) -> Vec<String> {
     let mut issues = Vec::new();
     if check_model {
         if !profile.is_known_model() {
-            issues.push(format!("机型 {} 不在已知库内，分辨率无法核对", profile.device_name));
+            issues.push(format!(
+                "机型 {} 不在已知库内，分辨率无法核对",
+                profile.device_name
+            ));
         } else if let Some(model) = MODELS.iter().find(|m| m.device_name == profile.device_name) {
             let expected = format!("{}x{}", model.logical.0, model.logical.1);
             if profile.pixel != expected {
@@ -395,7 +577,12 @@ pub fn audit_ex(profile: &DeviceProfile, check_model: bool) -> Vec<String> {
         }
     }
 
-    if profile.android_id.len() != 16 || !profile.android_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+    if profile.android_id.len() != 16
+        || !profile
+            .android_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
         issues.push(format!(
             "androidId 必须是 16 位小写十六进制，当前 {:?}",
             profile.android_id
@@ -458,8 +645,7 @@ mod tests {
             "机型库只有 {} 款，长尾不足",
             MODELS.len()
         );
-        let brands: std::collections::HashSet<&str> =
-            MODELS.iter().map(|m| m.brand).collect();
+        let brands: std::collections::HashSet<&str> = MODELS.iter().map(|m| m.brand).collect();
         assert!(brands.len() >= 5, "品牌过窄：{brands:?}");
         // 走量档必须比旗舰档更可能被抽到（权重不是装饰）。
         let popular: u32 = MODELS
@@ -484,14 +670,19 @@ mod tests {
             let a = DeviceProfile::mint(seed);
             let b = DeviceProfile::mint(seed);
             assert_eq!(a, b, "同 seed 必须恒等");
-            assert!(audit(&a).is_empty(), "seed {seed} 生成不自洽: {:?}", audit(&a));
+            assert!(
+                audit(&a).is_empty(),
+                "seed {seed} 生成不自洽: {:?}",
+                audit(&a)
+            );
         }
     }
 
     #[test]
     fn mint_spreads_across_models() {
-        let models: std::collections::HashSet<String> =
-            (0..2000u64).map(|s| DeviceProfile::mint(s).device_name).collect();
+        let models: std::collections::HashSet<String> = (0..2000u64)
+            .map(|s| DeviceProfile::mint(s).device_name)
+            .collect();
         assert!(
             models.len() >= 20,
             "机型分布过窄: {}（机型库 {} 款）",
@@ -505,7 +696,9 @@ mod tests {
     fn weighted_mint_favours_popular_models() {
         let mut hits = std::collections::HashMap::new();
         for seed in 0..4000u64 {
-            *hits.entry(DeviceProfile::mint(seed).device_name).or_insert(0u32) += 1;
+            *hits
+                .entry(DeviceProfile::mint(seed).device_name)
+                .or_insert(0u32) += 1;
         }
         let heaviest = MODELS.iter().max_by_key(|m| m.weight).unwrap();
         let lightest = MODELS.iter().min_by_key(|m| m.weight).unwrap();
@@ -531,7 +724,8 @@ mod tests {
         for id in &ids {
             assert_eq!(id.len(), 16, "{id}");
             assert!(
-                id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                id.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "{id} 必须是 16 位小写 hex"
             );
             assert!(!BAD_ANDROID_ID.contains(&id.as_str()), "{id} 是黑名单值");
@@ -582,15 +776,24 @@ mod tests {
         assert!(issues.iter().any(|i| i.contains("1220x2712")), "{issues:?}");
 
         // androidId 为空 = 官方客户端不可能出现
-        let empty_id = DeviceProfile { android_id: String::new(), ..bad.clone() };
+        let empty_id = DeviceProfile {
+            android_id: String::new(),
+            ..bad.clone()
+        };
         assert!(audit(&empty_id).iter().any(|i| i.contains("androidId")));
 
         // 随机 MAC = 异常
-        let random_mac = DeviceProfile { wifi_mac: "a4:50:46:11:22:33".into(), ..bad.clone() };
+        let random_mac = DeviceProfile {
+            wifi_mac: "a4:50:46:11:22:33".into(),
+            ..bad.clone()
+        };
         assert!(audit(&random_mac).iter().any(|i| i.contains("MAC")));
 
         // 系统版本超出机型范围
-        let wrong_os = DeviceProfile { os_version: "16".into(), ..bad };
+        let wrong_os = DeviceProfile {
+            os_version: "16".into(),
+            ..bad
+        };
         assert!(audit(&wrong_os).iter().any(|i| i.contains("不支持")));
     }
 

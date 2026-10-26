@@ -13,8 +13,8 @@
 //!
 //! 未知路径一律返回业务错误，避免"mock 什么都说成功"掩盖掉意外的请求。
 
-use crate::api::client::ApiClient;
 use super::{run_full_flow, RunOutcome, RunParams};
+use crate::api::client::ApiClient;
 use crate::api::model::Session;
 use crate::crypto::header::{
     ua_for, HeaderIdentity, ANDROID_APP_VERSION, IOS_APP_VERSION, UA_ANDROID, UA_IOS,
@@ -293,10 +293,7 @@ fn drive(platform: &str) -> Chain {
         )
         .unwrap_or_default();
         let _ = std::fs::write(dir.join(format!("fake-run-{platform}.json")), dump);
-        let _ = std::fs::write(
-            dir.join(format!("fake-run-{platform}.log")),
-            log.join("\n"),
-        );
+        let _ = std::fs::write(dir.join(format!("fake-run-{platform}.log")), log.join("\n"));
     }
 
     crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
@@ -413,10 +410,12 @@ fn android_chain_reports_exactly_one_identity() {
 fn ios_identity_keeps_the_known_two_identity_split() {
     let chain = drive("ios");
     let requests = seen(&chain.hits);
-    let outcome = chain
-        .outcome
-        .as_ref()
-        .unwrap_or_else(|e| panic!("iOS 身份全链失败：{e}\n请求：{requests:#?}\n日志：{:#?}", chain.log));
+    let outcome = chain.outcome.as_ref().unwrap_or_else(|e| {
+        panic!(
+            "iOS 身份全链失败：{e}\n请求：{requests:#?}\n日志：{:#?}",
+            chain.log
+        )
+    });
     assert_eq!(outcome.obs_ok, 2, "OBS 上传失败；日志：{:#?}", chain.log);
 
     for hit in &chain.hits {

@@ -21,6 +21,6 @@ pub mod records;
 pub mod recover;
 pub mod school_roads;
 pub mod semester;
-pub mod submit;
 pub(crate) mod submission_guard;
+pub mod submit;
 pub mod user;

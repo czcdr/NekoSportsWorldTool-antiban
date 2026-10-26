@@ -122,7 +122,9 @@ impl App {
                             ui.toggle_value(&mut self.data_page.show_cheat_list, "查看列表");
                         }
                         None => {
-                            if !self.data_page.cheat_checking && self.data_page.cheat_error.is_none() {
+                            if !self.data_page.cheat_checking
+                                && self.data_page.cheat_error.is_none()
+                            {
                                 ui.label("未检查");
                             }
                         }
@@ -135,16 +137,29 @@ impl App {
                     }
                 });
                 if let Some(c) = &self.data_page.cheat {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs(1));
                     if c.checked_at_ms > 0 {
-                        ui.label(format!("检查时间：{}", crate::track::geom::fmt_cst(c.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间")));
+                        ui.label(format!(
+                            "检查时间：{}",
+                            crate::track::geom::fmt_cst(
+                                c.checked_at_ms,
+                                "%Y-%m-%d %H:%M:%S 北京时间"
+                            )
+                        ));
                     }
                     ui.label("这是查询时的服务端状态，不代表后续记录一定有效。");
                     if c.self_info.as_object().is_some_and(|o| !o.is_empty()) {
                         ui.label(format!("服务端原因：{}", c.reason()));
                         ui.label(format!("发生时间：{}", c.occurred_at()));
                         if let Some(rrid) = c.record_id() {
-                            if ui.add_enabled(self.session.is_some(), egui::Button::new(format!("查看关联跑步记录 #{rrid}"))).clicked() {
+                            if ui
+                                .add_enabled(
+                                    self.session.is_some(),
+                                    egui::Button::new(format!("查看关联跑步记录 #{rrid}")),
+                                )
+                                .clicked()
+                            {
                                 open_record = Some(rrid);
                             }
                         } else {

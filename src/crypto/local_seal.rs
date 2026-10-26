@@ -99,8 +99,8 @@ pub fn seal(plain: &str) -> Option<String> {
     }
     let key = key()?;
     let iv: [u8; 16] = rand::random();
-    let ciphertext = Aes256CbcEnc::new(&key.into(), &iv.into())
-        .encrypt_padded_vec::<Pkcs7>(plain.as_bytes());
+    let ciphertext =
+        Aes256CbcEnc::new(&key.into(), &iv.into()).encrypt_padded_vec::<Pkcs7>(plain.as_bytes());
     let mut blob = Vec::with_capacity(16 + ciphertext.len());
     blob.extend_from_slice(&iv);
     blob.extend_from_slice(&ciphertext);
@@ -188,6 +188,9 @@ mod tests {
         let mut blob = B64.decode(&sealed[3..]).unwrap();
         let last = blob.len() - 1;
         blob[last] ^= 0xFF;
-        assert!(open(&format!("v1:{}", B64.encode(blob))).is_none(), "被改过的密文必须解不开");
+        assert!(
+            open(&format!("v1:{}", B64.encode(blob))).is_none(),
+            "被改过的密文必须解不开"
+        );
     }
 }

@@ -162,9 +162,10 @@ pub fn parse_point_text(text: &str) -> Result<Vec<Sample>, String> {
         if !lat.is_finite() || !lon.is_finite() || lat.abs() > 90. || lon.abs() > 180. {
             return Err(format!("第 {} 行坐标超出范围", idx + 1));
         }
-        let elevation = it.next().and_then(|v| v.parse::<f64>().ok()).filter(|v| {
-            v.is_finite() && (-500.0..=9000.0).contains(v)
-        });
+        let elevation = it
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (-500.0..=9000.0).contains(v));
         out.push(Sample {
             coordinate: Coord::new(lon, lat),
             time: None,
@@ -198,15 +199,11 @@ pub fn parse_point_json(text: &str) -> Result<Vec<Sample>, String> {
     let mut out = Vec::new();
     for (idx, item) in arr.iter().enumerate() {
         let (lat, lon, ele) = if let Some(pair) = item.as_array() {
-            (
-                num(pair.first()),
-                num(pair.get(1)),
-                num(pair.get(2)),
-            )
+            (num(pair.first()), num(pair.get(1)), num(pair.get(2)))
         } else {
-            let obj = item.as_object().ok_or_else(|| {
-                format!("第 {} 个元素既不是数组也不是对象", idx + 1)
-            })?;
+            let obj = item
+                .as_object()
+                .ok_or_else(|| format!("第 {} 个元素既不是数组也不是对象", idx + 1))?;
             let pick = |keys: &[&str]| keys.iter().find_map(|k| num(obj.get(*k)));
             (
                 pick(&["lat", "latitude", "Lat"]),
@@ -306,7 +303,10 @@ mod tests {
         let flat = vec![mk(Some(50.)), mk(Some(51.)), mk(Some(49.)), mk(Some(50.5))];
         let (up, down, n) = ascent_descent(&flat);
         assert_eq!(n, 4);
-        assert!(up < 1e-9 && down < 1e-9, "抖动不该计入：up={up} down={down}");
+        assert!(
+            up < 1e-9 && down < 1e-9,
+            "抖动不该计入：up={up} down={down}"
+        );
         let hill = vec![mk(Some(50.)), mk(Some(60.)), mk(Some(45.))];
         let (up, down, _) = ascent_descent(&hill);
         assert!((up - 10.0).abs() < 1e-9);
@@ -328,14 +328,20 @@ mod tests {
 
     #[test]
     fn point_json_handles_objects_pairs_and_wrappers() {
-        let a = parse_point_json(r#"[{"lat":39.9,"lon":116.4,"ele":50},{"latitude":39.91,"longitude":116.4}]"#).unwrap();
+        let a = parse_point_json(
+            r#"[{"lat":39.9,"lon":116.4,"ele":50},{"latitude":39.91,"longitude":116.4}]"#,
+        )
+        .unwrap();
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].elevation, Some(50.0));
         let b = parse_point_json(r#"{"points":[[39.9,116.4],[39.91,116.4,61]]}"#).unwrap();
         assert_eq!(b.len(), 2);
         assert_eq!(b[1].elevation, Some(61.0));
         assert!(parse_point_json(r#"{"nope":1}"#).is_err());
-        assert!(parse_point_json(r#"[{"lat":39.9}]"#).is_err(), "缺经度应报错");
+        assert!(
+            parse_point_json(r#"[{"lat":39.9}]"#).is_err(),
+            "缺经度应报错"
+        );
     }
 
     #[test]

@@ -51,7 +51,9 @@ fn cmd_login(rest: &[&str]) -> i32 {
         return 1;
     };
     let Some(pw) = read_password(&flags) else {
-        eprintln!("缺少 --pass：可直接给值，或用 `--pass -` 从标准输入读取，或设置环境变量 NSWT_PASS");
+        eprintln!(
+            "缺少 --pass：可直接给值，或用 `--pass -` 从标准输入读取，或设置环境变量 NSWT_PASS"
+        );
         return 1;
     };
     let identity = model::load_identity();
@@ -741,10 +743,15 @@ fn cmd_cheat(rest: &[&str]) -> i32 {
     match crate::api::cheat::query(&mut client, page, &mut log) {
         Ok(r) => {
             println!("自查：{}", r.label());
-            println!("检查时间：{}", crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间"));
+            println!(
+                "检查时间：{}",
+                crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间")
+            );
             if r.status() == crate::api::cheat::Status::Flagged {
                 println!("服务端原因：{}；发生时间：{}", r.reason(), r.occurred_at());
-                if let Some(id) = r.record_id() { println!("关联跑步记录：{id}"); }
+                if let Some(id) = r.record_id() {
+                    println!("关联跑步记录：{id}");
+                }
             }
             println!("本页通报 {} 条（非全校总数）", r.list.len());
             for item in r.list.iter().take(20) {
@@ -781,11 +788,18 @@ fn cmd_recover(rest: &[&str]) -> i32 {
         .unwrap_or(3)
         .clamp(1, 10);
     let plan = FixPlan {
-        dist: get(&flags, "dist").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) * 1000.0,
+        dist: get(&flags, "dist")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            * 1000.0,
         pace_s: get(&flags, "pace").map(parse_pace).unwrap_or(0.0) as f64,
-        face_check: get(&flags, "face").map(|v| (v == "1" || v == "true") as i64).unwrap_or(1),
+        face_check: get(&flags, "face")
+            .map(|v| (v == "1" || v == "true") as i64)
+            .unwrap_or(1),
     };
-    let seed: u64 = get(&flags, "seed").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let seed: u64 = get(&flags, "seed")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let mut client = match make_client() {
         Ok(c) => c,
@@ -950,7 +964,11 @@ fn cmd_recover(rest: &[&str]) -> i32 {
             Err(e) => println!("复查失败: {e}"),
         }
     }
-    if ok > 0 { 0 } else { 1 }
+    if ok > 0 {
+        0
+    } else {
+        1
+    }
 }
 
 fn cmd_rank(rest: &[&str]) -> i32 {

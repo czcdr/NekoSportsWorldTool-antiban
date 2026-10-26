@@ -10,10 +10,7 @@ struct FixtureDir(std::path::PathBuf);
 
 impl FixtureDir {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "violation-fixture-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("violation-fixture-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create fixture dir");
         Self(root)
     }

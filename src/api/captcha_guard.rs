@@ -85,7 +85,9 @@ impl Drop for FileLock {
 
 /// 读-改-写的唯一入口：全程持锁，写完把失败报出来。
 fn update<T>(f: impl FnOnce(&mut State) -> T) -> T {
-    let _guard = STATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _file_lock = FileLock::acquire(&state_path());
     let mut state = load();
     let out = f(&mut state);
@@ -173,7 +175,10 @@ mod tests {
             let secs = record_rejection();
             assert_eq!(secs, 600, "连续第二次判错应冷却 10 分钟");
             let remaining = cooldown_remaining_secs().expect("应处于冷却中");
-            assert!(remaining > 500 && remaining <= 601, "剩余 {remaining}s 不合理");
+            assert!(
+                remaining > 500 && remaining <= 601,
+                "剩余 {remaining}s 不合理"
+            );
 
             record_success();
             assert_eq!(cooldown_remaining_secs(), None, "成功后必须清零");

@@ -406,7 +406,11 @@ mod tests {
         let out = g.graph.edges_directed(welded, Direction::Outgoing).count();
         let inc = g.graph.edges_directed(welded, Direction::Incoming).count();
         // 两条 way 都是双向：焊接点对各自的另一端各有一条出边和一条入边。
-        assert_eq!((out, inc), (2, 2), "焊接点应连到两条 way 的另一端（各双向）");
+        assert_eq!(
+            (out, inc),
+            (2, 2),
+            "焊接点应连到两条 way 的另一端（各双向）"
+        );
     }
 
     #[test]
@@ -442,4 +446,3 @@ mod tests {
         assert_eq!(comps, 1, "焊接后应只有一个连通分量，否则闭环路由会失败");
     }
 }
-

@@ -45,7 +45,11 @@ pub fn put_object(
         .set("User-Agent", ua)
         .send_bytes(payload)
         .map_err(super::client::http_err)?;
-    log(&format!("[obs] PUT {} -> {}", shorten(signed_url), resp.status()));
+    log(&format!(
+        "[obs] PUT {} -> {}",
+        shorten(signed_url),
+        resp.status()
+    ));
     Ok(())
 }
 
@@ -81,7 +85,11 @@ fn shorten(url: &str) -> &str {
 
 /// 回读验证（GET 签名）。
 #[allow(dead_code)]
-pub fn fetch_object(client: &mut ApiClient, key: &str, log: &mut dyn FnMut(&str)) -> Result<Value, String> {
+pub fn fetch_object(
+    client: &mut ApiClient,
+    key: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<Value, String> {
     let signed = sign_url(client, "Get", key)?;
     let ua = crate::crypto::header::ua_for(&client.identity);
     let agent = super::client::make_agent();
@@ -94,4 +102,3 @@ pub fn fetch_object(client: &mut ApiClient, key: &str, log: &mut dyn FnMut(&str)
     log(&format!("[obs] GET 回读 {} 字节", text.len()));
     serde_json::from_str(&text).map_err(|e| format!("OBS 对象解析失败: {e}"))
 }
-

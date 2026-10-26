@@ -106,14 +106,17 @@ fn valid_xy(lat: f64, lon: f64) -> bool {
 fn field_num(p: &Value, keys: &[&str]) -> Option<f64> {
     keys.iter().find_map(|k| {
         p.get(*k).and_then(|v| {
-            v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
+            v.as_f64()
+                .or_else(|| v.as_str()?.trim().parse().ok())
                 .filter(|n: &f64| n.is_finite())
         })
     })
 }
 
 pub(crate) fn run_area_id(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| value.as_str()?.trim().parse().ok())
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
         .filter(|id| *id >= 0)
 }
 
@@ -172,8 +175,15 @@ mod metadata_tests {
         }
         let missing = parse_response(&json!({"data":"{}"})).err().unwrap();
         assert!(missing.contains("缺少 geoFences"));
-        assert!(parse_response(&json!({"data":"{invalid"})).err().unwrap().contains("data JSON"));
-        for point in [json!({"lat":"NaN","lon":"116.4"}), json!({"lat":"91","lon":"116.4"}), json!({"lat":"39.9","lon":"inf"})] {
+        assert!(parse_response(&json!({"data":"{invalid"}))
+            .err()
+            .unwrap()
+            .contains("data JSON"));
+        for point in [
+            json!({"lat":"NaN","lon":"116.4"}),
+            json!({"lat":"91","lon":"116.4"}),
+            json!({"lat":"39.9","lon":"inf"}),
+        ] {
             assert_eq!(point_xy(&point), None);
         }
         let gcj = json!({"lat":"0","lon":"0","glat":"39.9","glng":"116.4"});
@@ -206,10 +216,7 @@ mod metadata_tests {
     }
     #[test]
     fn optional_metadata_does_not_invent_ids() {
-        for v in [
-            json!({"geoFences":null}),
-            json!({"geoFences":[]}),
-        ] {
+        for v in [json!({"geoFences":null}), json!({"geoFences":[]})] {
             let r = parse_response(&v).unwrap();
             assert!(r.polygons.is_empty());
             assert_eq!(r.area.run_area_id, -1);

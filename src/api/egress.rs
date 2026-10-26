@@ -274,9 +274,18 @@ mod tests {
 
     #[test]
     fn never_crosses_city() {
-        let mut p = pool(&[("socks5://1.1.1.1:1080", "大连市"), ("socks5://2.2.2.2:1080", "沈阳市")]);
-        assert_eq!(p.acquire_at("大连", 1000).unwrap().url, "socks5://1.1.1.1:1080");
-        assert_eq!(p.acquire_at("大连市", 1000).unwrap().url, "socks5://1.1.1.1:1080");
+        let mut p = pool(&[
+            ("socks5://1.1.1.1:1080", "大连市"),
+            ("socks5://2.2.2.2:1080", "沈阳市"),
+        ]);
+        assert_eq!(
+            p.acquire_at("大连", 1000).unwrap().url,
+            "socks5://1.1.1.1:1080"
+        );
+        assert_eq!(
+            p.acquire_at("大连市", 1000).unwrap().url,
+            "socks5://1.1.1.1:1080"
+        );
         // 杭州没有任何出口：宁可 NoCandidate，也不拿大连的顶上
         assert_eq!(p.acquire_at("杭州", 1000), Err(PoolError::NoCandidate));
     }
@@ -297,19 +306,31 @@ mod tests {
         let key = "socks5://1.1.1.1:1080";
         // 第一次失败：60s
         p.report_at(key, Outcome::Failed, 1_000_000);
-        assert_eq!(p.acquire_at("大连", 1_000_000 + 59_999), Err(PoolError::Exhausted));
+        assert_eq!(
+            p.acquire_at("大连", 1_000_000 + 59_999),
+            Err(PoolError::Exhausted)
+        );
         assert!(p.acquire_at("大连", 1_000_000 + 60_001).is_ok());
         // 第二次：180s
         p.report_at(key, Outcome::Failed, 2_000_000);
-        assert_eq!(p.acquire_at("大连", 2_000_000 + 179_999), Err(PoolError::Exhausted));
+        assert_eq!(
+            p.acquire_at("大连", 2_000_000 + 179_999),
+            Err(PoolError::Exhausted)
+        );
         // 第三次：3600s
         p.report_at(key, Outcome::Failed, 3_000_000);
-        assert_eq!(p.acquire_at("大连", 3_000_000 + 3_599_999), Err(PoolError::Exhausted));
+        assert_eq!(
+            p.acquire_at("大连", 3_000_000 + 3_599_999),
+            Err(PoolError::Exhausted)
+        );
         // 成功清零
         p.report_at(key, Outcome::Ok, 4_000_000);
         assert!(p.acquire_at("大连", 4_000_000).is_ok());
         p.report_at(key, Outcome::Failed, 5_000_000);
-        assert!(p.acquire_at("大连", 5_000_000 + 60_001).is_ok(), "清零后应回到 60s 档");
+        assert!(
+            p.acquire_at("大连", 5_000_000 + 60_001).is_ok(),
+            "清零后应回到 60s 档"
+        );
     }
 
     #[test]
@@ -329,7 +350,12 @@ mod tests {
     fn empty_pool_means_direct_connect() {
         let p = EgressPool::default();
         assert!(p.is_empty());
-        assert_eq!(EgressPool::load(Path::new("definitely-missing.json")).unwrap().len(), 0);
+        assert_eq!(
+            EgressPool::load(Path::new("definitely-missing.json"))
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     /// 同一份配置的两个实例必须共享健康度与游标 —— 否则每个作业都从"全新"开始，
@@ -374,9 +400,19 @@ mod tests {
 
     #[test]
     fn local_relay_detection() {
-        let e = ProxyEntry { id: String::new(), url: "socks5://127.0.0.1:1080".into(), city: "大连".into(), carrier: String::new() };
+        let e = ProxyEntry {
+            id: String::new(),
+            url: "socks5://127.0.0.1:1080".into(),
+            city: "大连".into(),
+            carrier: String::new(),
+        };
         assert!(e.is_local_relay());
-        let e = ProxyEntry { id: String::new(), url: "socks5://8.8.8.8:1080".into(), city: "大连".into(), carrier: String::new() };
+        let e = ProxyEntry {
+            id: String::new(),
+            url: "socks5://8.8.8.8:1080".into(),
+            city: "大连".into(),
+            carrier: String::new(),
+        };
         assert!(!e.is_local_relay());
     }
 

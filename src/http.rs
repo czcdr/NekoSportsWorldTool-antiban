@@ -91,8 +91,7 @@ impl Response {
                 format!("响应体超过上限 {MAX_BODY} 字节"),
             ));
         }
-        String::from_utf8(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// 流式读取。调用方（更新包下载、路网下载）自己控制上限。
@@ -240,8 +239,7 @@ impl Agent {
     }
 
     pub fn request(&self, method: &str, url: &str) -> Request {
-        let method =
-            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         // 不额外塞 Accept：OkHttp 默认不发这个头，少一个头就少一处差异。
         Request {
             inner: Some(self.inner.request(method, url)),

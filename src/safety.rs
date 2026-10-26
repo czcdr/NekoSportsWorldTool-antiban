@@ -193,8 +193,7 @@ fn parse_state(text: &str, path: &Path) -> Result<State, String> {
     if text.trim().is_empty() {
         return Ok(State::default());
     }
-    serde_json::from_str(text)
-        .map_err(|_| format!("安全状态文件 {} 损坏", path.display()))
+    serde_json::from_str(text).map_err(|_| format!("安全状态文件 {} 损坏", path.display()))
 }
 
 fn load_state_at(root: &Path) -> Result<State, String> {
@@ -236,12 +235,14 @@ fn save_state_at(root: &Path, state: &State) -> Result<(), String> {
         // 保留上一版，供损坏时回退/人工救回。
         let _ = std::fs::copy(&path, backup_path(root));
     }
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("提交安全状态失败（{}）：{e}", path.display()))
+    std::fs::rename(&tmp, &path).map_err(|e| format!("提交安全状态失败（{}）：{e}", path.display()))
 }
 
 /// 在跨进程文件锁内做「读 - 改 - 写」。抢锁有超时，不会无限期挂住。
-fn with_lock<T>(root: &Path, action: impl FnOnce(&mut State) -> Result<T, String>) -> Result<T, String> {
+fn with_lock<T>(
+    root: &Path,
+    action: impl FnOnce(&mut State) -> Result<T, String>,
+) -> Result<T, String> {
     std::fs::create_dir_all(root).map_err(|e| format!("创建数据目录失败：{e}"))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -392,12 +393,7 @@ pub fn check_ai(policy: &SafetyPolicy, count: u32) -> Result<(), String> {
     )
 }
 
-fn check_ai_at(
-    root: &Path,
-    policy: &SafetyPolicy,
-    count: u32,
-    now_ms: i64,
-) -> Result<(), String> {
+fn check_ai_at(root: &Path, policy: &SafetyPolicy, count: u32, now_ms: i64) -> Result<(), String> {
     policy.validate()?;
     if !policy.enabled {
         return Ok(());
@@ -576,7 +572,10 @@ mod tests {
     /// 同一记录日的第二条仍受 `daily_runs` 约束（两条上限各管一层）。
     #[test]
     fn same_record_day_still_capped_by_daily_runs() {
-        let p = SafetyPolicy { daily_submits: 9, ..SafetyPolicy::default() };
+        let p = SafetyPolicy {
+            daily_submits: 9,
+            ..SafetyPolicy::default()
+        };
         let dir = tmp();
         let now = at(12);
         reserve_run_at(&dir, &p, day(0, 12), now).unwrap().commit();
@@ -617,7 +616,10 @@ mod tests {
 
     #[test]
     fn disabled_policy_lets_everything_through_without_writing_state() {
-        let p = SafetyPolicy { enabled: false, ..Default::default() };
+        let p = SafetyPolicy {
+            enabled: false,
+            ..Default::default()
+        };
         let dir = tmp();
         assert!(reserve_run_at(&dir, &p, at(3), at(3)).is_ok());
         let reservation = reserve_run_at(&dir, &p, at(3), at(3)).unwrap();
@@ -649,7 +651,11 @@ mod tests {
         assert!(backup_path(&dir).exists(), "第二次写入应留下 .bak");
         std::fs::write(state_path(&dir), "{ half").unwrap();
         let recovered = reserve_run_at(&dir, &p, at(12), at(12));
-        assert!(recovered.is_ok(), "应回退到 .bak 而不是拒绝: {:?}", recovered.err());
+        assert!(
+            recovered.is_ok(),
+            "应回退到 .bak 而不是拒绝: {:?}",
+            recovered.err()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -666,21 +672,37 @@ mod tests {
     fn backfill_limits_cover_days_per_day_and_total() {
         let p = SafetyPolicy::default();
         assert!(check_backfill(&p, 3, 1, 3).is_ok());
-        assert!(check_backfill(&p, 30, 1, 30).unwrap_err().contains("上限 3"));
-        assert!(check_backfill(&p, 3, 10, 30).unwrap_err().contains("重复 10 次"));
-        assert!(check_backfill(&p, 3, 2, 30).unwrap_err().contains("单批上限"));
-        let off = SafetyPolicy { enabled: false, ..Default::default() };
+        assert!(check_backfill(&p, 30, 1, 30)
+            .unwrap_err()
+            .contains("上限 3"));
+        assert!(check_backfill(&p, 3, 10, 30)
+            .unwrap_err()
+            .contains("重复 10 次"));
+        assert!(check_backfill(&p, 3, 2, 30)
+            .unwrap_err()
+            .contains("单批上限"));
+        let off = SafetyPolicy {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(check_backfill(&off, 365, 10, 3650).is_ok());
     }
 
     #[test]
     fn zero_limits_and_equal_night_bounds_are_config_errors() {
         let dir = tmp();
-        let zero = SafetyPolicy { daily_runs: 0, ..Default::default() };
+        let zero = SafetyPolicy {
+            daily_runs: 0,
+            ..Default::default()
+        };
         assert!(reserve_run_at(&dir, &zero, at(12), at(12))
             .unwrap_err()
             .contains("daily_runs"));
-        let equal = SafetyPolicy { night_from: 3, night_to: 3, ..Default::default() };
+        let equal = SafetyPolicy {
+            night_from: 3,
+            night_to: 3,
+            ..Default::default()
+        };
         assert!(reserve_run_at(&dir, &equal, at(12), at(12))
             .unwrap_err()
             .contains("不能相同"));
@@ -715,14 +737,21 @@ mod tests {
     #[test]
     fn state_keeps_only_recent_days() {
         // 这里只验证保留窗口，不受提交日配额影响。
-        let p = SafetyPolicy { daily_submits: 100, ..SafetyPolicy::default() };
+        let p = SafetyPolicy {
+            daily_submits: 100,
+            ..SafetyPolicy::default()
+        };
         let dir = tmp();
         for days_ago in 0..25i64 {
             let reservation = reserve_run_at(&dir, &p, day(days_ago, 12), day(0, 12)).unwrap();
             reservation.commit();
         }
         let state = load_state_at(&dir).unwrap();
-        assert!(state.days.len() <= KEEP_DAYS, "状态膨胀到 {} 天", state.days.len());
+        assert!(
+            state.days.len() <= KEEP_DAYS,
+            "状态膨胀到 {} 天",
+            state.days.len()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -98,10 +98,7 @@ pub fn login(
                     if matches!(error, super::gt4::Gt4Error::Rejected(_)) {
                         let secs = super::captcha_guard::record_rejection();
                         let wait = if secs > 0 {
-                            format!(
-                                "，请{}后再试",
-                                super::captcha_guard::cooldown_hint(secs)
-                            )
+                            format!("，请{}后再试", super::captcha_guard::cooldown_hint(secs))
                         } else {
                             "；先别连续点击，过几分钟再试".to_string()
                         };
@@ -114,7 +111,10 @@ pub fn login(
             };
             log(&format!(
                 "[login] GT4 通过 lot_number={}",
-                creds.get("lotNumber").and_then(|v| v.as_str()).unwrap_or("")
+                creds
+                    .get("lotNumber")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
             ));
 
             let body = json!({
@@ -235,13 +235,18 @@ pub fn login(
         .unwrap_or("")
         .to_string();
     if uid < 1 || token.is_empty() {
-        return Err(format!("登录响应缺 uid/token: {}", truncate(&crate::textlog::redact_json(&biz).to_string(), 200)));
+        return Err(format!(
+            "登录响应缺 uid/token: {}",
+            truncate(&crate::textlog::redact_json(&biz).to_string(), 200)
+        ));
     }
     let sess = Session {
         uid,
         token,
         unid: {
-            let v = get_field(&biz, "unid").cloned().unwrap_or(Value::String("0".into()));
+            let v = get_field(&biz, "unid")
+                .cloned()
+                .unwrap_or(Value::String("0".into()));
             match &v {
                 Value::String(s) => s.clone(),
                 Value::Number(n) => n.to_string(),
@@ -252,7 +257,9 @@ pub fn login(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        weight: get_field(&biz, "weight").and_then(|v| v.as_f64()).unwrap_or(68.0),
+        weight: get_field(&biz, "weight")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(68.0),
         username: username.to_string(),
         device_id,
         profile: super::client::parse_data_field(&biz),

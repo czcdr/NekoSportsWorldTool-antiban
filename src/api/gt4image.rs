@@ -73,9 +73,13 @@ pub fn canny(src: &[f32], w: usize, h: usize, low: f32, high: f32) -> Vec<u8> {
     for y in 0..h as i32 {
         for x in 0..w as i32 {
             let gx = -at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1)
-                + at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1);
+                + at(x + 1, y - 1)
+                + 2.0 * at(x + 1, y)
+                + at(x + 1, y + 1);
             let gy = -at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1)
-                + at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1);
+                + at(x - 1, y + 1)
+                + 2.0 * at(x, y + 1)
+                + at(x + 1, y + 1);
             let i = (y * w as i32 + x) as usize;
             mag[i] = (gx * gx + gy * gy).sqrt();
             dir[i] = gy.atan2(gx);
@@ -253,7 +257,9 @@ pub fn get_distance_checked(
     if let Some(yp) = ypos {
         // 8px 余量：实测偏差在 ±2px，留 4 倍余量以吸收不同分辨率下的取整差异。
         if (y as i64 - yp as i64).abs() > 8 {
-            return Err(format!("识别不可靠：y={y} 与 ypos={yp} 偏离过大（换图重试）"));
+            return Err(format!(
+                "识别不可靠：y={y} 与 ypos={yp} 偏离过大（换图重试）"
+            ));
         }
     }
     Ok((x, score))
@@ -281,7 +287,10 @@ mod tests {
         }
         let bg_blur = gaussian_blur(&bg, w, h);
         let bg_edges = canny(&bg_blur, w, h, 50.0, 120.0);
-        assert!(bg_edges.iter().filter(|&&v| v == 255).count() > 20, "边缘太少");
+        assert!(
+            bg_edges.iter().filter(|&&v| v == 255).count() > 20,
+            "边缘太少"
+        );
         // 模板 = x=30 起裁 30x30（亮块 + 周边背景，真实切片同构）
         let (tw2, th2) = (30usize, 30usize);
         let mut tpl = vec![0u8; tw2 * th2];
@@ -311,16 +320,26 @@ mod tests {
         for y in 15..65u32 {
             for x in 15..65u32 {
                 // 切片内容与背景方块同色，但整体压暗（GT4 缺口被遮罩压暗的近似）
-                let v = if x < 16 || y < 16 || x > 63 || y > 63 { 230 } else { 150 };
+                let v = if x < 16 || y < 16 || x > 63 || y > 63 {
+                    230
+                } else {
+                    150
+                };
                 slice.put_pixel(x, y, Rgba([v, v, v, 255]));
             }
         }
         let mut bg_png = Vec::new();
-        bg.write_to(&mut std::io::Cursor::new(&mut bg_png), image::ImageFormat::Png)
-            .expect("encode bg");
+        bg.write_to(
+            &mut std::io::Cursor::new(&mut bg_png),
+            image::ImageFormat::Png,
+        )
+        .expect("encode bg");
         let mut slice_png = Vec::new();
         slice
-            .write_to(&mut std::io::Cursor::new(&mut slice_png), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut slice_png),
+                image::ImageFormat::Png,
+            )
             .expect("encode slice");
         (bg_png, slice_png)
     }

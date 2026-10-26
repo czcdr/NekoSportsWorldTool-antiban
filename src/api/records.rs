@@ -45,7 +45,10 @@ pub fn fetch_records(client: &mut ApiClient) -> Result<Vec<RecordRow>, String> {
     Ok(arr
         .iter()
         .map(|r| RecordRow {
-            rrid: r.get("rrid").and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0),
+            rrid: r
+                .get("rrid")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(0),
             total_dis: r.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
             total_time: r.get("totalTime").and_then(|v| v.as_i64()).unwrap_or(0),
             start_time: r.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -122,7 +125,11 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
         .map(|arr| {
             arr.iter()
                 .map(|r| ReasonItem {
-                    reason: r.get("reason").and_then(|v| v.as_str()).unwrap_or("").into(),
+                    reason: r
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
                     complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
                 })
                 .collect()
@@ -130,7 +137,11 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
         .unwrap_or_default();
     Ok(RunDetail {
         rrid,
-        uuid: raw.get("uuid").and_then(|v| v.as_str()).unwrap_or("").into(),
+        uuid: raw
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .into(),
         sport_type: raw.get("sportType").and_then(|v| v.as_i64()).unwrap_or(0),
         total_time: raw.get("totalTime").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
         total_dis: raw.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -139,13 +150,27 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
         avg_power: raw.get("avgPower").and_then(|v| v.as_i64()).unwrap_or(0),
         total_steps: raw.get("totalSteps").and_then(|v| v.as_i64()).unwrap_or(0),
         total_ascent: raw.get("totalAscent").and_then(|v| v.as_i64()).unwrap_or(0),
-        total_descent: raw.get("totalDescent").and_then(|v| v.as_i64()).unwrap_or(0),
+        total_descent: raw
+            .get("totalDescent")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
         avg_step_freq: raw.get("avgStepFreq").and_then(|v| v.as_i64()).unwrap_or(0),
         valid_dis: raw.get("validDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
         valid_time: raw.get("validTime").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
-        address: raw.get("address").and_then(|v| v.as_str()).unwrap_or("").into(),
-        status_info: raw.get("statusInfo").and_then(|v| v.as_str()).unwrap_or("").into(),
-        complete: raw.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
+        address: raw
+            .get("address")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .into(),
+        status_info: raw
+            .get("statusInfo")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .into(),
+        complete: raw
+            .get("complete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         reason_list: reasons,
         start_time: raw.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
     })
@@ -162,12 +187,23 @@ mod tests {
             total_dis: 1234.0,
             valid_dis: 1200.0,
             status_info: "有效".into(),
-            reason_list: vec![ReasonItem { reason: "里程达标".into(), complete: true }],
+            reason_list: vec![ReasonItem {
+                reason: "里程达标".into(),
+                complete: true,
+            }],
             start_time: 1_700_000_000_000,
             ..Default::default()
         };
         let v: serde_json::Value = serde_json::to_value(&d).unwrap();
-        for key in ["totalDis", "validDis", "statusInfo", "reasonList", "startTime", "sportType", "avgStepFreq"] {
+        for key in [
+            "totalDis",
+            "validDis",
+            "statusInfo",
+            "reasonList",
+            "startTime",
+            "sportType",
+            "avgStepFreq",
+        ] {
             assert!(v.get(key).is_some(), "缺少键 {key}");
         }
         assert!(v.get("total_dis").is_none());

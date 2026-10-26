@@ -588,7 +588,9 @@ impl App {
 
     /// 学期 + 违规自查（登录 / 跑步提交成功后自动调用）。
     pub fn refresh_data_page(&mut self) {
-        if self.data_page.cheat_checking { return; }
+        if self.data_page.cheat_checking {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             self.status = "请先登录".into();
             return;
@@ -641,7 +643,9 @@ impl App {
     }
 
     pub fn refresh_cheat_only(&mut self) {
-        if self.data_page.cheat_checking { return; }
+        if self.data_page.cheat_checking {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             self.status = "请先登录".into();
             return;

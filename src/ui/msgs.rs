@@ -154,7 +154,8 @@ impl App {
                     // Filter before coalescing messages: a late reply must not
                     // discard the current record's reply in the same frame.
                     if raw.get("rrid").and_then(|v| v.as_i64()) == self.records_page.detail_rrid
-                        && self.records_page.detail_rrid.is_some() {
+                        && self.records_page.detail_rrid.is_some()
+                    {
                         detail_raw = Some(raw);
                     }
                 }

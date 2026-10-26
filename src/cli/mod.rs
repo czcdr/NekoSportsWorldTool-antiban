@@ -218,7 +218,10 @@ mod tests {
         );
         // 前面没有 flag 的裸 "-" 不再产生空名开关（也不会把后面的 token 当值留下）
         assert!(pairs(&["-", "Secret"]).is_empty());
-        assert_eq!(pairs(&["--pass", "-"]), vec![("pass".to_string(), "-".to_string())]);
+        assert_eq!(
+            pairs(&["--pass", "-"]),
+            vec![("pass".to_string(), "-".to_string())]
+        );
     }
 
     #[test]

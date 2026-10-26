@@ -6,7 +6,7 @@
 //! `NSWT_UPDATE_REPO` 环境变量可强制指定仓库（测试/自建发布用）。
 //! 版本号 / 重启 / 安装的平台差异见 platform.rs。
 
-use crate::api::client::{make_agent, http_err};
+use crate::api::client::{http_err, make_agent};
 
 /// 本项目的发布仓库（唯一默认更新源）。
 pub const REPO_OWN: &str = "czcdr/NekoSportsWorldTool-antiban";
@@ -76,14 +76,19 @@ pub struct ReleaseInfo {
 /// 检查最新 Release；比当前新返回 Some，已是最新返回 None。
 /// 多仓库（Android）时取带资产且版本最新的候选。
 pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, String> {
-    let want = asset_name().ok_or_else(|| "当前平台没有对应的发布产物，无法自动更新".to_string())?;
+    let want =
+        asset_name().ok_or_else(|| "当前平台没有对应的发布产物，无法自动更新".to_string())?;
     let current = current_version();
     let mut best: Option<ReleaseInfo> = None;
     let mut last_err: Option<String> = None;
     for repo in repos() {
         match fetch_release(&repo, want, log) {
             Ok(Some(rel)) => {
-                if best.as_ref().map(|b| is_newer(&b.tag, &rel.tag)).unwrap_or(true) {
+                if best
+                    .as_ref()
+                    .map(|b| is_newer(&b.tag, &rel.tag))
+                    .unwrap_or(true)
+                {
                     best = Some(rel);
                 }
             }
@@ -115,7 +120,11 @@ pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, St
 }
 
 /// 拉取单仓库最新 Release 并匹配资产；Release 存在但无匹配资产 → Ok(None)。
-fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, String> {
+fn fetch_release(
+    repo: &str,
+    want: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<Option<ReleaseInfo>, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = make_agent()
         .get(&url)
@@ -123,27 +132,47 @@ fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Op
         .set("Accept", "application/vnd.github+json")
         .call()
         .map_err(http_err)?;
-    let text = resp.into_string().map_err(|e| format!("读取 Release 失败: {e}"))?;
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("读取 Release 失败: {e}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("解析 Release 失败: {e}"))?;
-    let tag = v.get("tag_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let tag = v
+        .get("tag_name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if tag.is_empty() {
         return Err("Release 缺少 tag".into());
     }
     let Some(asset) = pick_asset(&v, want) else {
         return Ok(None);
     };
-    log(&format!("[update] {repo} 最新 {tag}，匹配资产 {}", asset.name));
+    log(&format!(
+        "[update] {repo} 最新 {tag}，匹配资产 {}",
+        asset.name
+    ));
     Ok(Some(ReleaseInfo {
         repo: repo.to_string(),
         tag,
-        title: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        notes: v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        title: v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        notes: v
+            .get("body")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         asset_name: asset.name,
         asset_url: asset.url,
         asset_size: asset.size,
         asset_digest: asset.digest,
-        immutable: v.get("immutable").and_then(|x| x.as_bool()).unwrap_or(false),
+        immutable: v
+            .get("immutable")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     }))
 }
 
@@ -206,7 +235,10 @@ fn split_rev(v: &str) -> (Vec<u64>, Option<u64>) {
         Some((b, r)) => (b, r.rsplit('.').next().and_then(|n| n.parse().ok())),
         None => (v, None),
     };
-    let segs = base.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+    let segs = base
+        .split('.')
+        .map(|s| s.parse::<u64>().unwrap_or(0))
+        .collect();
     (segs, rev)
 }
 
@@ -225,8 +257,14 @@ fn download_with_limit(
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Vec<u8>, String> {
     let agent = crate::http::Agent::with_timeout(std::time::Duration::from_secs(300));
-    let resp = agent.get(url).set("User-Agent", UA).call().map_err(http_err)?;
-    let total = resp.header("Content-Length").and_then(|h| h.parse::<u64>().ok());
+    let resp = agent
+        .get(url)
+        .set("User-Agent", UA)
+        .call()
+        .map_err(http_err)?;
+    let total = resp
+        .header("Content-Length")
+        .and_then(|h| h.parse::<u64>().ok());
     if let Some(declared) = total {
         if declared > max {
             return Err(format!(
@@ -239,8 +277,8 @@ fn download_with_limit(
     let mut reader = resp.into_reader();
     let mut chunk = vec![0u8; 65536];
     loop {
-        let n = std::io::Read::read(&mut reader, &mut chunk)
-            .map_err(|e| format!("下载中断: {e}"))?;
+        let n =
+            std::io::Read::read(&mut reader, &mut chunk).map_err(|e| format!("下载中断: {e}"))?;
         if n == 0 {
             break;
         }
@@ -438,7 +476,11 @@ fn extract_zip_with_limits(
         std::io::Read::read_to_end(&mut limited, &mut out)
             .map_err(|e| format!("zip 解压失败: {e}"))?;
         if out.len() as u64 > max_entry {
-            return Err(format!("zip 条目 {} 实际解压超过上限 {} 字节", f.name(), max_entry));
+            return Err(format!(
+                "zip 条目 {} 实际解压超过上限 {} 字节",
+                f.name(),
+                max_entry
+            ));
         }
         total = total.saturating_add(out.len() as u64);
         if total > max_total {
@@ -478,7 +520,10 @@ fn extract_tar_gz_with_limits(
         }
         // tar 头里的 size 同样来自压缩包自身，先按它拦一道，再按实际读取量兜底。
         if e.size() > max_entry {
-            return Err(format!("tar 条目声明 {} 字节，超过单文件上限 {max_entry} 字节", e.size()));
+            return Err(format!(
+                "tar 条目声明 {} 字节，超过单文件上限 {max_entry} 字节",
+                e.size()
+            ));
         }
         let mut out = Vec::new();
         let mut limited = std::io::Read::take(&mut e, max_entry + 1);
@@ -504,14 +549,18 @@ fn extract_tar_gz_with_limits(
 pub fn apply(binary: &[u8]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("无法定位自身路径: {e}"))?;
     let dir = exe.parent().ok_or("无法定位 exe 目录")?;
-    let file = exe.file_name().and_then(|n| n.to_str()).ok_or("exe 文件名异常")?;
+    let file = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("exe 文件名异常")?;
     let new = dir.join(format!("{file}.new"));
     let old = dir.join(format!("{file}.old"));
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&new)
             .map_err(|e| format!("写入更新文件失败（目录可能只读）: {e}"))?;
-        f.write_all(binary).map_err(|e| format!("写入更新内容失败: {e}"))?;
+        f.write_all(binary)
+            .map_err(|e| format!("写入更新内容失败: {e}"))?;
         f.sync_all().map_err(|e| format!("落盘失败: {e}"))?;
     }
     #[cfg(unix)]
@@ -534,9 +583,13 @@ pub fn apply(binary: &[u8]) -> Result<(), String> {
 
 /// 清理上次更新残留的 .old/.new（旧进程未退出时会删不掉，静默跳过）。
 pub fn cleanup_residue() {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(dir) = exe.parent() else { return };
-    let Some(file) = exe.file_name().and_then(|n| n.to_str()) else { return };
+    let Some(file) = exe.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
     for suffix in [".old", ".new"] {
         let _ = std::fs::remove_file(dir.join(format!("{file}{suffix}")));
     }
@@ -575,23 +628,44 @@ mod tests {
                 })).collect::<Vec<_>>(),
             })
         };
-        let exact = pick_asset(&mk(&["NekoSportsWorldTool-win-x64.zip", "other.txt"]), "NekoSportsWorldTool-win-x64.zip");
+        let exact = pick_asset(
+            &mk(&["NekoSportsWorldTool-win-x64.zip", "other.txt"]),
+            "NekoSportsWorldTool-win-x64.zip",
+        );
         assert_eq!(exact.unwrap().name, "NekoSportsWorldTool-win-x64.zip");
         // 桌面产物必须精确匹配
         assert!(pick_asset(&mk(&["wrong.zip"]), "NekoSportsWorldTool-win-x64.zip").is_none());
         // APK 匹配：先精确，再「同平台族」；不再退化到任意 .apk
-        let apk = pick_asset(&mk(&["NekoSportsWorldTool-0.2.5-android.2-arm64.apk"]), "NekoSportsWorldTool-android-arm64.apk");
-        assert_eq!(apk.unwrap().name, "NekoSportsWorldTool-0.2.5-android.2-arm64.apk");
-        let fam = pick_asset(&mk(&["NekoSportsWorldTool-0.3.0-android-arm64.apk"]), "NekoSportsWorldTool-android-arm64.apk");
-        assert_eq!(fam.unwrap().name, "NekoSportsWorldTool-0.3.0-android-arm64.apk");
+        let apk = pick_asset(
+            &mk(&["NekoSportsWorldTool-0.2.5-android.2-arm64.apk"]),
+            "NekoSportsWorldTool-android-arm64.apk",
+        );
+        assert_eq!(
+            apk.unwrap().name,
+            "NekoSportsWorldTool-0.2.5-android.2-arm64.apk"
+        );
+        let fam = pick_asset(
+            &mk(&["NekoSportsWorldTool-0.3.0-android-arm64.apk"]),
+            "NekoSportsWorldTool-android-arm64.apk",
+        );
+        assert_eq!(
+            fam.unwrap().name,
+            "NekoSportsWorldTool-0.3.0-android-arm64.apk"
+        );
         // 别的架构/变体的包不能被当成这台机器的产物
         assert!(
-            pick_asset(&mk(&["app-arm64.apk", "plain.apk"]), "NekoSportsWorldTool-android-arm64.apk").is_none(),
+            pick_asset(
+                &mk(&["app-arm64.apk", "plain.apk"]),
+                "NekoSportsWorldTool-android-arm64.apk"
+            )
+            .is_none(),
             "任意 .apk 兜底必须被移除"
         );
-        assert!(
-            pick_asset(&mk(&["NekoSportsWorldTool-android-x86_64.apk"]), "NekoSportsWorldTool-android-arm64.apk").is_none()
-        );
+        assert!(pick_asset(
+            &mk(&["NekoSportsWorldTool-android-x86_64.apk"]),
+            "NekoSportsWorldTool-android-arm64.apk"
+        )
+        .is_none());
     }
 
     #[cfg(not(target_os = "android"))]
@@ -602,7 +676,11 @@ mod tests {
             let mut w = zip::ZipWriter::new(&mut buf);
             let opt = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("target/x86_64-pc-windows-msvc/release/nekosportsworldtool.exe", opt).unwrap();
+            w.start_file(
+                "target/x86_64-pc-windows-msvc/release/nekosportsworldtool.exe",
+                opt,
+            )
+            .unwrap();
             std::io::Write::write_all(&mut w, b"BIN_CONTENT").unwrap();
             w.start_file("readme.txt", opt).unwrap();
             std::io::Write::write_all(&mut w, b"ignore").unwrap();
@@ -610,7 +688,10 @@ mod tests {
         }
         let bytes = buf.into_inner();
         assert_eq!(extract_zip(&bytes).unwrap(), b"BIN_CONTENT");
-        assert_eq!(extract("NekoSportsWorldTool-win-x64.zip", &bytes).unwrap(), b"BIN_CONTENT");
+        assert_eq!(
+            extract("NekoSportsWorldTool-win-x64.zip", &bytes).unwrap(),
+            b"BIN_CONTENT"
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -625,12 +706,16 @@ mod tests {
             hdr.set_size(content.len() as u64);
             hdr.set_mode(0o755);
             hdr.set_cksum();
-            tar.append_data(&mut hdr, "nekosportsworldtool", content).unwrap();
+            tar.append_data(&mut hdr, "nekosportsworldtool", content)
+                .unwrap();
             let gz = tar.into_inner().unwrap();
             gz.finish().unwrap();
         }
         assert_eq!(extract_tar_gz(&bytes).unwrap(), b"BIN_CONTENT");
-        assert_eq!(extract("NekoSportsWorldTool-linux-x64.tar.gz", &bytes).unwrap(), b"BIN_CONTENT");
+        assert_eq!(
+            extract("NekoSportsWorldTool-linux-x64.tar.gz", &bytes).unwrap(),
+            b"BIN_CONTENT"
+        );
     }
 
     fn release_fixture(name: &str, size: u64, digest: Option<&str>) -> ReleaseInfo {
@@ -667,18 +752,38 @@ mod tests {
     fn verify_rejects_size_mismatch_and_unverified_payloads() {
         let payload = b"BIN_CONTENT";
         let good = format!("sha256:{:x}", sha2::Sha256::digest(payload));
-        assert!(verify(&release_fixture("a.zip", payload.len() as u64, Some(&good)), payload).is_ok());
+        assert!(verify(
+            &release_fixture("a.zip", payload.len() as u64, Some(&good)),
+            payload
+        )
+        .is_ok());
         // 声明大小不符 → 拒绝
-        assert!(verify(&release_fixture("a.zip", payload.len() as u64 + 1, Some(&good)), payload).is_err());
+        assert!(verify(
+            &release_fixture("a.zip", payload.len() as u64 + 1, Some(&good)),
+            payload
+        )
+        .is_err());
         // 桌面包没有摘要 → 拒绝自动替换
-        let err = verify(&release_fixture("a.zip", payload.len() as u64, None), payload).unwrap_err();
+        let err = verify(
+            &release_fixture("a.zip", payload.len() as u64, None),
+            payload,
+        )
+        .unwrap_err();
         assert!(err.contains("SHA-256"), "{err}");
         // APK 没有摘要同样拒绝：系统安装器只验签名，"签名对但内容不对"它拦不住
-        let err = verify(&release_fixture("a.apk", payload.len() as u64, None), payload).unwrap_err();
+        let err = verify(
+            &release_fixture("a.apk", payload.len() as u64, None),
+            payload,
+        )
+        .unwrap_err();
         assert!(err.contains("SHA-256"), "{err}");
         // 摘要与内容不符 → 拒绝
         let bad = format!("sha256:{}{}", '0', &good[8..]);
-        assert!(verify(&release_fixture("a.apk", payload.len() as u64, Some(&bad)), payload).is_err());
+        assert!(verify(
+            &release_fixture("a.apk", payload.len() as u64, Some(&bad)),
+            payload
+        )
+        .is_err());
     }
 
     /// 本机 pin：同一 tag/资产名的摘要被换掉时必须拒绝（账号被盗后替换老版本包）。
@@ -728,10 +833,18 @@ mod tests {
             w.finish().unwrap();
         }
         let zip_bytes = buf.into_inner();
-        assert!(extract_zip_with_limits(&zip_bytes, 1024, u64::MAX).is_err(), "单文件上限");
-        assert!(extract_zip_with_limits(&zip_bytes, 8192, 1024).is_err(), "累计上限");
+        assert!(
+            extract_zip_with_limits(&zip_bytes, 1024, u64::MAX).is_err(),
+            "单文件上限"
+        );
+        assert!(
+            extract_zip_with_limits(&zip_bytes, 8192, 1024).is_err(),
+            "累计上限"
+        );
         assert_eq!(
-            extract_zip_with_limits(&zip_bytes, 8192, u64::MAX).unwrap().len(),
+            extract_zip_with_limits(&zip_bytes, 8192, u64::MAX)
+                .unwrap()
+                .len(),
             4096
         );
 
@@ -744,14 +857,23 @@ mod tests {
             hdr.set_size(content.len() as u64);
             hdr.set_mode(0o755);
             hdr.set_cksum();
-            tar.append_data(&mut hdr, "nekosportsworldtool", content.as_slice()).unwrap();
+            tar.append_data(&mut hdr, "nekosportsworldtool", content.as_slice())
+                .unwrap();
             let gz = tar.into_inner().unwrap();
             gz.finish().unwrap();
         }
-        assert!(extract_tar_gz_with_limits(&tar_bytes, 1024, u64::MAX).is_err(), "单文件上限");
-        assert!(extract_tar_gz_with_limits(&tar_bytes, 8192, 1024).is_err(), "累计上限");
+        assert!(
+            extract_tar_gz_with_limits(&tar_bytes, 1024, u64::MAX).is_err(),
+            "单文件上限"
+        );
+        assert!(
+            extract_tar_gz_with_limits(&tar_bytes, 8192, 1024).is_err(),
+            "累计上限"
+        );
         assert_eq!(
-            extract_tar_gz_with_limits(&tar_bytes, 8192, u64::MAX).unwrap().len(),
+            extract_tar_gz_with_limits(&tar_bytes, 8192, u64::MAX)
+                .unwrap()
+                .len(),
             4096
         );
     }

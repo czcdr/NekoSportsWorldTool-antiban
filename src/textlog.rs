@@ -263,7 +263,10 @@ mod tests {
             "http://***@proxy.local:3128/path?x=1"
         );
         // 无凭据、无 scheme、超长嵌套 @ 的分支
-        assert_eq!(redact_url("socks5://10.0.0.1:1080"), "socks5://10.0.0.1:1080");
+        assert_eq!(
+            redact_url("socks5://10.0.0.1:1080"),
+            "socks5://10.0.0.1:1080"
+        );
         assert_eq!(redact_url("10.0.0.1:1080"), "10.0.0.1:1080");
         assert_eq!(redact_url("http://a@b@c:1080"), "http://***@c:1080");
         assert_eq!(redact_url("http://@host"), "http://***@host");

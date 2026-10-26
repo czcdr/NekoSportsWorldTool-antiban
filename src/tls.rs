@@ -62,7 +62,12 @@ fn provider() -> rustls::crypto::CryptoProvider {
     let base = rustls::crypto::ring::default_provider();
     let cipher_suites: Vec<rustls::SupportedCipherSuite> = CONSCRYPT_CIPHER_ORDER
         .iter()
-        .filter_map(|want| base.cipher_suites.iter().copied().find(|s| s.suite() == *want))
+        .filter_map(|want| {
+            base.cipher_suites
+                .iter()
+                .copied()
+                .find(|s| s.suite() == *want)
+        })
         .collect();
     let kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = CONSCRYPT_GROUP_ORDER
         .iter()
@@ -150,7 +155,11 @@ mod tests {
             .map(|s| format!("{s:?}"))
             .collect();
         assert_eq!(got, want, "密码套件顺序必须与 Conscrypt 一致");
-        assert_eq!(got.len(), 9, "Conscrypt 默认是 9 套，多一套少一套都是新特征");
+        assert_eq!(
+            got.len(),
+            9,
+            "Conscrypt 默认是 9 套，多一套少一套都是新特征"
+        );
     }
 
     /// EC 段（命名曲线）顺序。

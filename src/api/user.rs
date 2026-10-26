@@ -30,7 +30,10 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
     let home_page = client
         .call("GET", HOME_PAGE_INFO_PATH, "{}", &[])
         .map(|biz| parse_data_field(&biz))
-        .unwrap_or_else(|e| { errors.push(format!("主页：{e}")); Value::Null });
+        .unwrap_or_else(|e| {
+            errors.push(format!("主页：{e}"));
+            Value::Null
+        });
     if home_page.is_null() {
         log("⚠ [user] HomePageInfo 拉取失败");
     }
@@ -44,7 +47,10 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
             &[],
         )
         .map(|biz| parse_data_field(&biz))
-        .unwrap_or_else(|e| { errors.push(e); Value::Null });
+        .unwrap_or_else(|e| {
+            errors.push(e);
+            Value::Null
+        });
 
     let summary = client
         .call(
@@ -54,7 +60,10 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
             &[],
         )
         .map(|biz| parse_data_field(&biz))
-        .unwrap_or_else(|e| { errors.push(e); Value::Null });
+        .unwrap_or_else(|e| {
+            errors.push(e);
+            Value::Null
+        });
 
     // 学期完成状态需要最近一条记录的 rrid
     let completed = match super::records::fetch_records(client) {
@@ -66,20 +75,43 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
                 &[],
             )
             .map(|biz| parse_data_field(&biz))
-            .unwrap_or_else(|e| { errors.push(format!("完成状态：{e}")); Value::Null }),
-        Err(e) => { errors.push(format!("最近记录：{e}")); Value::Null },
+            .unwrap_or_else(|e| {
+                errors.push(format!("完成状态：{e}"));
+                Value::Null
+            }),
+        Err(e) => {
+            errors.push(format!("最近记录：{e}"));
+            Value::Null
+        }
         _ => Value::Null,
     };
 
-    MyInfo { errors, profile, home_page, personal_semester, summary, completed }
+    MyInfo {
+        errors,
+        profile,
+        home_page,
+        personal_semester,
+        summary,
+        completed,
+    }
 }
-
 
 impl MyInfo {
     pub fn refresh_message(&self) -> String {
         if !self.errors.is_empty() {
-            format!("⚠ [user] 个人数据刷新未全部成功：{}", self.errors.join("；"))
-        } else if [&self.home_page, &self.personal_semester, &self.summary, &self.completed].iter().all(|v| v.is_null()) {
+            format!(
+                "⚠ [user] 个人数据刷新未全部成功：{}",
+                self.errors.join("；")
+            )
+        } else if [
+            &self.home_page,
+            &self.personal_semester,
+            &self.summary,
+            &self.completed,
+        ]
+        .iter()
+        .all(|v| v.is_null())
+        {
             "[user] 未获取到新的个人数据；登录资料仅为缓存".into()
         } else {
             "√ [user] 我的页数据已更新".into()
@@ -92,7 +124,14 @@ mod refresh_tests {
     use super::*;
     #[test]
     fn cached_profile_and_failed_reads_cannot_claim_a_successful_refresh() {
-        let mut info = MyInfo { errors: vec![], profile: json!({"name":"cached"}), home_page: Value::Null, personal_semester: Value::Null, summary: Value::Null, completed: Value::Null };
+        let mut info = MyInfo {
+            errors: vec![],
+            profile: json!({"name":"cached"}),
+            home_page: Value::Null,
+            personal_semester: Value::Null,
+            summary: Value::Null,
+            completed: Value::Null,
+        };
         assert!(!info.refresh_message().contains("已更新"));
         info.home_page = json!({"count":1});
         info.errors.push("请求失败".into());

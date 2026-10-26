@@ -167,7 +167,11 @@ pub fn run_full_flow_cancellable(
     match client.bind_egress_for_city(&city)? {
         Some(entry) => log(&format!(
             "[net] 出口已绑定 {}（同城：{city}）",
-            if entry.id.is_empty() { &entry.url } else { &entry.id }
+            if entry.id.is_empty() {
+                &entry.url
+            } else {
+                &entry.id
+            }
         )),
         None => {
             if client.egress.is_some() {
@@ -340,7 +344,8 @@ pub fn run_full_flow_cancellable(
             match loaded {
                 Ok(mut net) => {
                     crate::track::generate_road::align_network(&mut net);
-                    let filtered = crate::track::generate_road::apply_fences(&net, &fences.polygons);
+                    let filtered =
+                        crate::track::generate_road::apply_fences(&net, &fences.polygons);
                     log("[manual] 沿道路按点位顺序串联；不要求经过策略必经点");
                     crate::track::generate_road::build_road(
                         params.dist,
@@ -351,9 +356,7 @@ pub fn run_full_flow_cancellable(
                         &[],
                         &filtered,
                     )
-                    .map_err(|e| {
-                        format!("自定义点位路由失败：{e}；可留空路网退回按点位连线")
-                    })?
+                    .map_err(|e| format!("自定义点位路由失败：{e}；可留空路网退回按点位连线"))?
                 }
                 Err(e) => {
                     log(&format!("[manual] 无可用路网（{e}），退回按点位连线"));
@@ -521,13 +524,22 @@ pub fn run_records(
     let rows = super::records::fetch_records(client)?;
     if let Some(session) = &client.login {
         let reconciliation = (|| {
-            let mut guard = super::submission_guard::Guard::open(session.uid, session.unid.parse().map_err(|_| "学校编号无效")?)?;
+            let mut guard = super::submission_guard::Guard::open(
+                session.uid,
+                session.unid.parse().map_err(|_| "学校编号无效")?,
+            )?;
             let found = guard.reconcile(&rows)?;
-            for id in found { log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交")); }
-            if guard.has_pending() { log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效"); }
+            for id in found {
+                log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交"));
+            }
+            if guard.has_pending() {
+                log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效");
+            }
             Ok::<_, String>(())
         })();
-        if let Err(error) = reconciliation { log(&format!("[record] 提交保护核对未完成：{error}")); }
+        if let Err(error) = reconciliation {
+            log(&format!("[record] 提交保护核对未完成：{error}"));
+        }
     }
     log(&format!("√ [records] {} 条记录", rows.len()));
     Ok(rows)
@@ -576,7 +588,9 @@ mod verification_tests {
         })));
         assert_eq!(v.failure_reasons(), vec!["里程未达标".to_string()]);
         // 没有 detail 时不编造原因
-        assert!(Verification::from_result(Err("offline".into())).failure_reasons().is_empty());
+        assert!(Verification::from_result(Err("offline".into()))
+            .failure_reasons()
+            .is_empty());
     }
 
     #[test]

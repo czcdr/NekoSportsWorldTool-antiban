@@ -235,7 +235,10 @@ mod tests {
         let p = mk(json!({"freezeRunTime": 172_800}));
         assert_eq!(p.freeze_text(), "还剩 2 天 00:00:00");
         // 不足一天不带天数前缀
-        assert_eq!(mk(json!({"freezeRunTime": 3725})).freeze_text(), "还剩 01:02:05");
+        assert_eq!(
+            mk(json!({"freezeRunTime": 3725})).freeze_text(),
+            "还剩 01:02:05"
+        );
     }
 
     #[test]
@@ -264,14 +267,20 @@ mod tests {
     #[test]
     fn face_rule_is_read_only_and_lenient() {
         let cases = [
-            (json!({"data":{"timestamp":1,"runRuleModel":{"faceEnable":true}}}), Some(true)),
+            (
+                json!({"data":{"timestamp":1,"runRuleModel":{"faceEnable":true}}}),
+                Some(true),
+            ),
             (json!({"data":{"timestamp":1,"faceCheck":1}}), Some(true)),
             (json!({"data":{"timestamp":1,"faceCheck":"0"}}), Some(false)),
             (
                 json!({"data":{"timestamp":1,"runFaceCheck":{"faceEnable":true,"faceVerifyType":2}}}),
                 Some(true),
             ),
-            (json!({"data":{"timestamp":1,"serverCheckStatus":"1"}}), Some(true)),
+            (
+                json!({"data":{"timestamp":1,"serverCheckStatus":"1"}}),
+                Some(true),
+            ),
         ];
         for (response, want) in cases {
             let policy = parse_response(&response).unwrap();

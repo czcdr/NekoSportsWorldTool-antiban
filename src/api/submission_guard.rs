@@ -178,10 +178,7 @@ impl Guard {
 
     /// 当前未决（结果未知）的提交条数。
     pub fn pending_count(&self) -> usize {
-        self.attempts
-            .iter()
-            .filter(|a| a.outcome.is_none())
-            .count()
+        self.attempts.iter().filter(|a| a.outcome.is_none()).count()
     }
 
     /// 用户核对过官方记录、确认这些提交没有入账后的**手动释放**。
