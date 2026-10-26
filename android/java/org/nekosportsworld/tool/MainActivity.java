@@ -397,8 +397,14 @@ public final class MainActivity extends NativeActivity {
         return out;
     }
 
-    /** 文件选择结果回调：path 与 error 二选一。 */
-    public native void nativePickedFile(String path, String error);
+    /**
+     * 文件选择结果回调：path 与 error 二选一。
+     *
+     * `requestId` 必须原样带回 —— Rust 侧只接受「当前这次请求」的回调，
+     * 晚到的旧结果会被丢弃（否则大文件复制期间再次选择/旧线程晚到会覆盖新结果）。
+     * 签名必须与 `src/android.rs::Java_..._nativePickedFile` 的 (jint, JString, JString) 一致。
+     */
+    public native void nativePickedFile(int requestId, String path, String error);
 
     /** 当前 APK 的 versionName（与 Release tag 对齐，供更新检查比较）。 */
     public String appVersionName() {
