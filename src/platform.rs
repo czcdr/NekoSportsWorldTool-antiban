@@ -19,11 +19,131 @@ pub fn data_dir() -> std::path::PathBuf {
     }
     #[cfg(not(target_os = "android"))]
     {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+        desktop_data_dir()
     }
+}
+
+/// 桌面的数据目录。
+///
+/// - Windows：**保持便携语义**（exe 同目录）——解压即用、可放 U 盘，这是既有行为。
+/// - Linux / macOS：走用户数据目录（`$XDG_DATA_HOME` / `~/.local/share` /
+///   `~/Library/Application Support`）。装在 `/usr/local/bin`、`/opt`、AppImage
+///   这类只读位置时，exe 同目录写不进去，登录态/身份/防重放状态会全部静默失效，
+///   而且违反 FHS。
+/// - `NSWT_DATA_DIR` 可强制指定（便携部署、多账号隔离、测试）。
+#[cfg(not(target_os = "android"))]
+fn desktop_data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("NSWT_DATA_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let path = std::path::PathBuf::from(dir);
+            if std::fs::create_dir_all(&path).is_ok() {
+                return path;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        exe_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        let exe = exe_dir();
+        let Some(root) = user_data_root() else {
+            return exe;
+        };
+        let target = root.join("nekosportsworldtool");
+        if std::fs::create_dir_all(&target).is_err() {
+            // 连用户目录都建不出来（无 HOME 的精简容器）：退回旧行为。
+            return exe;
+        }
+        migrate_legacy_data(&exe, &target);
+        target
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn exe_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// 用户数据根目录；无 HOME 时返回 None。
+#[cfg(not(any(windows, target_os = "android")))]
+fn user_data_root() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        Some(home.join("Library/Application Support"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            let path = std::path::PathBuf::from(&xdg);
+            // XDG 规范要求绝对路径；相对值视为未设置。
+            if path.is_absolute() {
+                return Some(path);
+            }
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        Some(home.join(".local/share"))
+    }
+}
+
+/// 旧版本把数据写在 exe 同目录；切到用户数据目录后**一次性搬运**已有文件。
+///
+/// 不搬 `identity.json` 的代价最大：它一丢，`device_id` 重新生成，服务端会把
+/// 同一部手机当成新设备（10121 风控）。所以这里按「缺什么补什么」复制，
+/// 且不删除原文件（回退旧版本仍能用）。
+#[cfg(not(any(windows, target_os = "android")))]
+fn migrate_legacy_data(from: &std::path::Path, to: &std::path::Path) {
+    if from == to {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let Some(name) = source.file_name() else { continue };
+        // 只搬本程序的数据文件，别把整个安装目录复制一遍。
+        let is_data = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+            || name == "school_roads";
+        if !is_data {
+            continue;
+        }
+        let target = to.join(name);
+        if target.exists() {
+            continue;
+        }
+        if source.is_dir() {
+            let _ = copy_tree(&source, &target);
+        } else {
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let source = entry.path();
+        let Some(name) = source.file_name() else { continue };
+        let target = to.join(name);
+        if source.is_dir() {
+            copy_tree(&source, &target)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn edit_text(id: u64, value: &str, kind: InputKind) {

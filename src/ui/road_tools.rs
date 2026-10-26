@@ -32,7 +32,9 @@ impl App {
                         confirmed: false,
                     });
                 }
-                let _ = crate::api::model::save_config(&self.config);
+                if let Err(e) = crate::ui::save_config(&self.config) {
+                    self.osm_page.status = e;
+                }
                 self.refresh_school_route(false);
             }
             if let Some(s) = self.config.school_campus.as_mut() {
@@ -40,7 +42,9 @@ impl App {
                     .checkbox(&mut s.confirmed, "已核对下方围栏属于当前校区")
                     .changed()
                 {
-                    let _ = crate::api::model::save_config(&self.config);
+                    if let Err(e) = crate::ui::save_config(&self.config) {
+                        self.osm_page.status = e;
+                    }
                 }
             }
         }
@@ -82,7 +86,9 @@ impl App {
                         {
                             if entry.fences.is_empty() {
                                 self.config.osm_path.clear();
-                                let _ = crate::api::model::save_config(&self.config);
+                                if let Err(e) = crate::ui::save_config(&self.config) {
+                                    self.osm_page.status = e;
+                                }
                                 self.refresh_school_route(true);
                             } else if let Some(c) = self.osm_page.campuses.iter().find(|c| {
                                 crate::api::school_roads::scope_key("", &c.polygons)
@@ -94,7 +100,9 @@ impl App {
                                     confirmed: false,
                                 });
                                 self.config.osm_path.clear();
-                                let _ = crate::api::model::save_config(&self.config);
+                                if let Err(e) = crate::ui::save_config(&self.config) {
+                                    self.osm_page.status = e;
+                                }
                                 self.refresh_school_route(true);
                             } else {
                                 self.osm_page.status =

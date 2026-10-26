@@ -87,6 +87,15 @@ impl Diagnosis {
         self.freeze_seconds.unwrap_or(0) > 0
     }
 
+    /// 冻结状态是否未知（策略接口没取到）。
+    ///
+    /// 这和「未冻结」不是一回事：`frozen()` 对未知返回 false 只适合**显示**，
+    /// 任何「要不要动手提交」的判断都必须先过这里，否则一次策略接口抖动
+    /// 就会被当成"没冻结"，在禁跑期里白白撞一次服务端拒绝并计入风控。
+    pub fn freeze_unknown(&self) -> bool {
+        self.freeze_seconds.is_none()
+    }
+
     /// 冻结倒计时文本。
     pub fn freeze_text(&self) -> String {
         match self.freeze_seconds {
@@ -115,6 +124,17 @@ impl Diagnosis {
                 "账号处于禁跑期（{}）。这期间服务端会独立拒绝提交，覆盖修复提交不进去 —— \
                  先等倒计时归零，再回来跑 recover --yes。已在禁跑期内的记录不会因为等待而变差，\
                  要保住的是到期后立刻把那几条未达标记录补掉（当前 {} 条待修）。",
+                self.freeze_text(),
+                self.abnormal.len()
+            );
+        }
+        // 拿不到策略 = 状态未知。未知不等于未冻结：结论必须先说"不确定"，
+        // 不能让用户以为可以直接 --yes（旧实现会落到下面「最可修」分支）。
+        if self.freeze_unknown() {
+            return format!(
+                "冻结状态未知（{}）：策略接口这次没取到，不能确认账号没被禁跑。\
+                 先重跑一次 recover 确认能读出倒计时，再考虑 --yes；\
+                 {} 条未达标记录先按「可修」看待，但覆盖提交要等状态确认之后。",
                 self.freeze_text(),
                 self.abnormal.len()
             );
@@ -402,13 +422,18 @@ mod tests {
         // 拿不到策略 = 状态未知，不能当成「未冻结」放行
         let unknown = Diagnosis {
             cheat: CheatReport::default(),
-            abnormal: vec![],
-            total_records: 0,
+            abnormal: vec![ab(1, 1200.0, 1)],
+            total_records: 3,
             freeze_seconds: None,
             freeze_message: String::new(),
         };
         assert!(!unknown.frozen());
+        assert!(unknown.freeze_unknown());
         assert!(unknown.freeze_text().contains("未知"));
+        let v = unknown.verdict();
+        assert!(v.contains("未知"), "未知状态必须点明，不能默认放行: {v}");
+        assert!(!v.contains("最可修"), "未知状态不该给「直接修」的结论: {v}");
+        assert!(!v.contains("禁跑期"), "还没确认禁跑，不该断言在禁跑期: {v}");
     }
 
     #[test]

@@ -937,7 +937,9 @@ impl App {
         self.config.manual_altitude = manual_altitude;
         self.config.manual_altitude_range = manual_altitude_range;
         self.config.route_mode = route_mode.as_str().into();
-        let _ = crate::api::model::save_config(&self.config);
+        if let Err(e) = crate::ui::save_config(&self.config) {
+            self.status = e;
+        }
 
         let identity = self.identity.clone();
         let session = match self.session.clone() {

@@ -3,7 +3,12 @@ use route_planner::RoadGraph;
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path, time::Duration};
 
-const MAX_BYTES: u64 = 24 * 1024 * 1024;
+/// 路网体积上限（下载与手动导入共用同一个额度）。
+///
+/// 两条入口给不同数值只会让用户遇到「自动下载能跑、手动导入闪退」这种自相矛盾的
+/// 失败，所以这里作为唯一真值：`generate_road::load_network_path` 与 Android 侧
+/// 的 `MAX_OSM_BYTES` 都必须跟着这个数字走。
+pub(crate) const MAX_BYTES: u64 = 24 * 1024 * 1024;
 const TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const ENDPOINT: &str = "https://overpass-api.de/api/interpreter";
 

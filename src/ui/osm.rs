@@ -371,7 +371,9 @@ impl App {
         self.osm_page.path.clear();
         self.config.route_mode = "road".into();
         self.run_page.route_mode = crate::track::generate_road::RouteMode::Road;
-        let _ = crate::api::model::save_config(&self.config);
+        if let Err(e) = crate::ui::save_config(&self.config) {
+            self.osm_page.status = e;
+        }
         self.refresh_school_route(force);
     }
 
@@ -385,7 +387,9 @@ impl App {
         self.osm_page.path = path.clone();
         self.osm_page.status = format!("加载中：{path} …");
         self.config.osm_path = path.clone();
-        let _ = crate::api::model::save_config(&self.config);
+        if let Err(e) = crate::ui::save_config(&self.config) {
+            self.osm_page.status = e;
+        }
         let tx = self.net_tx.clone();
         let control = self.osm_page.cancel.clone();
         std::thread::spawn(move || {

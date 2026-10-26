@@ -350,7 +350,14 @@ impl ApiClient {
         );
         let (decrypted, raw_head) = match decrypt_response(raw.as_bytes(), &key, &rsa_public_key()) {
             Ok(d) => (Some(d), String::new()),
-            Err(e) => (None, format!("{e} | 原文: {}", crate::textlog::truncate(&raw, 160))),
+            // 解密失败时这段「原文」会被拼进最终错误串，一路进终端、截图和 CI 日志。
+            // 它可能是网关报错页、明文 JSON 或带手机号/令牌的调试输出，
+            // 所以必须先过 `redact_snippet`（截断 + 结构化脱敏 + 令牌/手机号打码），
+            // 不能直接把原始响应切片塞进去。
+            Err(e) => (
+                None,
+                format!("{e} | 原文: {}", crate::textlog::redact_snippet(&raw, 160)),
+            ),
         };
         Ok(RequestOutcome { http_status: status, decrypted, raw_len, raw_head })
     }

@@ -5,7 +5,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($projectRoot))).Substring(0, 12)
+# Windows PowerShell 5.1（.NET Framework）没有 SHA256.HashData / Convert.ToHexString，
+# 用最老的可用 API：Create() + ComputeHash，5.1 与 7 都能跑。
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($projectRoot)) }
+finally { $sha.Dispose() }
+$digest = (-join ($hash | ForEach-Object { $_.ToString('x2') })).Substring(0, 12)
 $cacheRoot = Join-Path $env:TEMP "neko-android-$digest"
 $output = Join-Path $cacheRoot 'instrumentation'
 New-Item -ItemType Directory -Force -Path $output,(Join-Path $output 'classes'),(Join-Path $output 'dex') | Out-Null

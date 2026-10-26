@@ -184,7 +184,9 @@ impl App {
                     "check" => self.check_update(false),
                     "off" => {
                         self.config.update_check = "off".into();
-                        let _ = crate::api::model::save_config(&self.config);
+                        if let Err(e) = crate::ui::save_config(&self.config) {
+                            self.status = e;
+                        }
                     }
                     _ => {}
                 }

@@ -173,12 +173,25 @@ fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> 
 /// 直接 `fs::write` 会在崩溃/断电时留下半截 JSON，而读取端只能解析失败；
 /// 凭据与身份文件一旦这样坏掉，用户看到的是"设置被清空"。
 /// Unix 上把权限收紧到 0600（默认 umask 往往给同机其他用户留了读权限）。
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// 临时文件名必须**全局唯一**：只用 `文件名.PID.tmp` 时，同一进程里两个线程
+/// 同时保存同一目标会共同截断/写入同一个临时文件，再互相 rename —— 原子写承诺
+/// 就不成立了（写出来的可能是两段 JSON 的交错残片）。这里再拼上线程 id 与
+/// 进程内单调计数器，把这条竞争路径堵死。
+pub(crate) fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("neko-data");
-    let tmp = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}.{:?}.{}.tmp",
+        std::process::id(),
+        std::thread::current().id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let write = || -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -351,12 +364,65 @@ pub fn save_ai_sports(list: &[crate::api::ai::AiSport]) -> Result<(), String> {
     write_json("ai_sports.json", &list.to_vec())
 }
 
+/// 敏感字段落盘前的加密改写：`plain` 非空时写成 `sealed` 密文并清空明文。
+///
+/// 结构体本身不加密（内存里必须是明文才能登录），只有写盘这一层改写 JSON；
+/// 这样既不动 `Config`/`Session` 的字段，也不影响任何读代码 —— 迁移面最小。
+fn seal_field(v: &mut serde_json::Value, plain: &str, sealed: &str) {
+    let Some(value) = v.get(plain).and_then(|x| x.as_str()).map(str::to_string) else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    match crate::crypto::local_seal::seal(&value) {
+        Some(cipher) => {
+            v[sealed] = serde_json::Value::String(cipher);
+            v[plain] = serde_json::Value::String(String::new());
+        }
+        // 加密不可用（salt 写不进去）：保持旧行为，至少功能不中断。
+        None => eprintln!("[data] {plain} 未能加密保存（本地加密不可用）"),
+    }
+}
+
+/// 读取时把密文还原进明文字段；旧版明文文件原样可用（下次保存自动升级）。
+fn open_field(v: &mut serde_json::Value, plain: &str, sealed: &str) {
+    let existing = v.get(plain).and_then(|x| x.as_str()).unwrap_or("");
+    if !existing.is_empty() {
+        return;
+    }
+    let Some(cipher) = v.get(sealed).and_then(|x| x.as_str()).map(str::to_string) else {
+        return;
+    };
+    if cipher.is_empty() {
+        return;
+    }
+    match crate::crypto::local_seal::open(&cipher) {
+        Some(text) => {
+            v[plain] = serde_json::Value::String(text);
+            // 明文不该继续留在内存里的 Value 副本中
+            v[sealed] = serde_json::Value::String(String::new());
+        }
+        None => eprintln!(
+            "[data] {plain} 无法解密（换机器/改用户名/删了 local.salt），请重新登录或重新输入"
+        ),
+    }
+}
+
 pub fn load_session() -> Session {
-    read_json("session.json").unwrap_or_default()
+    match read_json::<serde_json::Value>("session.json") {
+        Some(mut v) => {
+            open_field(&mut v, "token", "token_sealed");
+            serde_json::from_value(v).unwrap_or_default()
+        }
+        None => Session::default(),
+    }
 }
 
 pub fn save_session(s: &Session) -> Result<(), String> {
-    write_json("session.json", s)
+    let mut v = serde_json::to_value(s).map_err(|e| format!("序列化 session.json 失败: {e}"))?;
+    seal_field(&mut v, "token", "token_sealed");
+    write_json("session.json", &v)
 }
 
 pub fn clear_session() {
@@ -364,11 +430,19 @@ pub fn clear_session() {
 }
 
 pub fn load_config() -> Config {
-    read_json("config.json").unwrap_or_default()
+    match read_json::<serde_json::Value>("config.json") {
+        Some(mut v) => {
+            open_field(&mut v, "password", "password_sealed");
+            serde_json::from_value(v).unwrap_or_default()
+        }
+        None => Config::default(),
+    }
 }
 
 pub fn save_config(c: &Config) -> Result<(), String> {
-    write_json("config.json", c)
+    let mut v = serde_json::to_value(c).map_err(|e| format!("序列化 config.json 失败: {e}"))?;
+    seal_field(&mut v, "password", "password_sealed");
+    write_json("config.json", &v)
 }
 
 #[cfg(test)]
@@ -877,5 +951,88 @@ mod points_cache_tests {
         let kept = load_identity_for_platform("android");
         assert_eq!(kept.platform, "ios", "用户显式选的 iOS 不该被改写");
         assert_eq!(kept.os_version, "17.6");
+    }
+
+    /// 凭据落盘不能是明文，且重新加载后仍能登录。
+    #[test]
+    fn credentials_are_sealed_on_disk_but_readable_after_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("neko-seal-cred-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+
+        let config = Config {
+            username: "13800000000".into(),
+            password: "s3cret-pass".into(),
+            remember: true,
+            ..Default::default()
+        };
+        save_config(&config).unwrap();
+        let raw = std::fs::read_to_string(directory.join("config.json")).unwrap();
+        assert!(
+            !raw.contains("s3cret-pass"),
+            "config.json 不能出现明文口令：{raw}"
+        );
+        assert!(raw.contains("password_sealed"), "{raw}");
+        let loaded = load_config();
+        assert_eq!(loaded.password, "s3cret-pass", "重新加载必须还原明文供登录用");
+        assert_eq!(loaded.username, "13800000000");
+        assert!(loaded.remember);
+
+        let session = Session {
+            uid: 7,
+            token: "tok-abcdef-1234".into(),
+            ..Default::default()
+        };
+        save_session(&session).unwrap();
+        let raw = std::fs::read_to_string(directory.join("session.json")).unwrap();
+        assert!(
+            !raw.contains("tok-abcdef-1234"),
+            "session.json 不能出现明文令牌：{raw}"
+        );
+        assert!(raw.contains("token_sealed"), "{raw}");
+        assert_eq!(load_session().token, "tok-abcdef-1234");
+        assert_eq!(load_session().uid, 7);
+    }
+
+    /// 旧版本留下的明文文件必须还能读（迁移是"下次保存时"发生，不是"读不出来"）。
+    #[test]
+    fn legacy_plaintext_credentials_still_load() {
+        let directory =
+            std::env::temp_dir().join(format!("neko-seal-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+
+        let plain = serde_json::json!({
+            "username": "13900000000",
+            "password": "legacy-plain",
+            "remember": true,
+        });
+        write_json("config.json", &plain).unwrap();
+        let loaded = load_config();
+        assert_eq!(loaded.password, "legacy-plain", "旧明文必须照读");
+        assert_eq!(loaded.username, "13900000000");
+
+        // 再存一次就升级成密文
+        save_config(&loaded).unwrap();
+        let raw = std::fs::read_to_string(directory.join("config.json")).unwrap();
+        assert!(!raw.contains("legacy-plain"), "{raw}");
+        assert_eq!(load_config().password, "legacy-plain");
     }
 }

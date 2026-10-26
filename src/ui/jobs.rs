@@ -4,8 +4,6 @@ use super::{
     App, AI_DETAIL, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE, RANK, RECORDS, RUN_DETAIL,
     SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
 };
-use crate::api::model;
-
 use crate::update::ReleaseInfo;
 
 impl App {
@@ -63,6 +61,7 @@ impl App {
                 let bytes = crate::update::download(&rel.asset_url, &mut report)?;
                 // 下载完先按 Release 元数据校验，再落盘/替换：内容不对就绝不写进程序目录。
                 crate::update::verify(&rel, &bytes)?;
+                crate::update::record_pin(&rel);
                 #[cfg(target_os = "android")]
                 {
                     let path = crate::platform::data_dir().join(crate::update::APK_NAME);
@@ -352,7 +351,9 @@ impl App {
             String::new()
         };
         self.config.remember = remember;
-        let _ = model::save_config(&self.config);
+        if let Err(e) = super::save_config(&self.config) {
+            self.status = e;
+        }
         self.renew_session_jobs();
         // Retire requests using the old token before a login worker can save a new session.
         self.osm_page.cancel.cancel();

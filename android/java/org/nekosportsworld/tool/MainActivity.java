@@ -185,14 +185,27 @@ public final class MainActivity extends NativeActivity {
         });
     }
 
-    /** 自更新：把私有目录里已下载的 update.apk 交给系统安装器。 */
+    /** 自更新：校验后把私有目录里已下载的 update.apk 交给系统安装器。 */
     public void installApk(String path) {
         runOnUiThread(() -> {
             try {
-                if (path == null || !new java.io.File(path).isFile()) {
+                java.io.File apk = new java.io.File(path == null ? "" : path);
+                if (path == null || !apk.isFile()) {
                     android.widget.Toast.makeText(this,
                         "安装包不存在，请重新检查更新",
                         android.widget.Toast.LENGTH_LONG).show();
+                    return;
+                }
+                // 更新包在交给系统安装器之前先自己核一遍：包名、签名、版本号。
+                // 系统只会拒绝"装不上"，不会告诉用户"这个包不是本应用的"；
+                // 而摘要缺失/接口异常时 Rust 侧的 fail-open 分支曾经放行过未校验的包。
+                String problem = verifyUpdatePackage(apk);
+                if (problem != null) {
+                    android.widget.Toast.makeText(this,
+                        "更新包校验失败：" + problem + "（已删除，请重新下载）",
+                        android.widget.Toast.LENGTH_LONG).show();
+                    //noinspection ResultOfMethodCallIgnored
+                    apk.delete();
                     return;
                 }
                 android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
@@ -208,10 +221,78 @@ public final class MainActivity extends NativeActivity {
         });
     }
 
+    /** 校验待安装包：包名一致、签名一致、versionCode 不低于当前。返回 null 表示通过。 */
+    private String verifyUpdatePackage(java.io.File apk) {
+        android.content.pm.PackageManager pm = getPackageManager();
+        int flags = android.os.Build.VERSION.SDK_INT >= 28
+            ? android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
+            : android.content.pm.PackageManager.GET_SIGNATURES;
+        android.content.pm.PackageInfo archive = pm.getPackageArchiveInfo(apk.getAbsolutePath(), flags);
+        if (archive == null) return "无法解析安装包（文件可能已损坏）";
+        if (!getPackageName().equals(archive.packageName)) {
+            return "包名不符（" + archive.packageName + "）";
+        }
+        android.content.pm.PackageInfo installed;
+        try {
+            installed = pm.getPackageInfo(getPackageName(), flags);
+        } catch (Exception error) {
+            return "读取当前版本信息失败：" + error.getMessage();
+        }
+        long incoming = android.os.Build.VERSION.SDK_INT >= 28
+            ? archive.getLongVersionCode()
+            : archive.versionCode;
+        long current = android.os.Build.VERSION.SDK_INT >= 28
+            ? installed.getLongVersionCode()
+            : installed.versionCode;
+        if (incoming < current) {
+            return "版本号低于已安装版本（" + incoming + " < " + current + "）";
+        }
+        if (!sameSigner(archive, installed)) {
+            return "签名与已安装版本不一致，系统会拒绝覆盖安装";
+        }
+        return null;
+    }
+
+    private static boolean sameSigner(
+        android.content.pm.PackageInfo a, android.content.pm.PackageInfo b) {
+        byte[] left = firstSignerDigest(a);
+        byte[] right = firstSignerDigest(b);
+        return left != null && right != null && java.util.Arrays.equals(left, right);
+    }
+
+    private static byte[] firstSignerDigest(android.content.pm.PackageInfo info) {
+        android.content.pm.Signature[] signatures = null;
+        if (android.os.Build.VERSION.SDK_INT >= 28 && info.signingInfo != null) {
+            signatures = info.signingInfo.hasMultipleSigners()
+                ? info.signingInfo.getApkContentsSigners()
+                : info.signingInfo.getSigningCertificateHistory();
+        }
+        if ((signatures == null || signatures.length == 0) && info.signatures != null) {
+            signatures = info.signatures;
+        }
+        if (signatures == null || signatures.length == 0) return null;
+        try {
+            return java.security.MessageDigest.getInstance("SHA-256")
+                .digest(signatures[0].toByteArray());
+        } catch (Exception error) {
+            return null;
+        }
+    }
+
     /** 路网文件选择：用系统文件选择器（SAF），把内容复制进私有目录后交给 Rust 解析。 */
     private static final int REQUEST_PICK_OSM = 0x0A51;
 
-    public void pickOsmFile() {
+    /**
+     * 本次选择请求的序号（由 Rust 侧生成并回传）。
+     *
+     * 结果回调是一条单槽通道：不带走序号时，大文件复制期间再次选择、
+     * Activity 重建或旧线程晚到都会覆盖新结果 —— 表现为「加载了上一次的文件」
+     * 或「取消把成功结果冲掉」。带上序号，Rust 侧只接受当前这次请求的回调。
+     */
+    private volatile int pendingPickId = 0;
+
+    public void pickOsmFile(int requestId) {
+        pendingPickId = requestId;
         runOnUiThread(() -> {
             try {
                 android.content.Intent intent =
@@ -220,7 +301,7 @@ public final class MainActivity extends NativeActivity {
                 intent.setType("*/*");
                 startActivityForResult(intent, REQUEST_PICK_OSM);
             } catch (Exception error) {
-                nativePickedFile("", "无法打开文件选择器：" + error.getMessage());
+                nativePickedFile(requestId, "", "无法打开文件选择器：" + error.getMessage());
             }
         });
     }
@@ -228,8 +309,9 @@ public final class MainActivity extends NativeActivity {
     @Override protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != REQUEST_PICK_OSM) return;
+        final int requestId = pendingPickId;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            nativePickedFile("", "已取消选择");
+            nativePickedFile(requestId, "", "已取消选择");
             return;
         }
         final android.net.Uri uri = data.getData();
@@ -252,10 +334,10 @@ public final class MainActivity extends NativeActivity {
                         }
                     }
                 }
-                // 先按声明大小拦一道：Rust 侧也有 64 MiB 上限，但那时文件已经写完，
-                // 手机上会先把私有存储占满（另一个后果是写入过程中 UI 卡顿）。
+                // 先按声明大小拦一道：Rust 侧也是同一个上限（24 MiB），但那时文件已经
+                // 写完，手机上会先把私有存储占满（另一个后果是写入过程中 UI 卡顿）。
                 if (declaredSize > MAX_OSM_BYTES) {
-                    nativePickedFile("", "文件过大（"
+                    nativePickedFile(requestId, "", "文件过大（"
                         + (declaredSize / (1024 * 1024)) + " MiB，上限 "
                         + (MAX_OSM_BYTES / (1024 * 1024)) + " MiB）；请先裁剪路网范围");
                     return;
@@ -279,22 +361,28 @@ public final class MainActivity extends NativeActivity {
                             out.close();
                             //noinspection ResultOfMethodCallIgnored
                             target.delete();
-                            nativePickedFile("", "文件过大（超过 "
+                            nativePickedFile(requestId, "", "文件过大（超过 "
                                 + (MAX_OSM_BYTES / (1024 * 1024)) + " MiB）；请先裁剪路网范围");
                             return;
                         }
                         out.write(buffer, 0, read);
                     }
                 }
-                nativePickedFile(target.getAbsolutePath(), "");
+                nativePickedFile(requestId, target.getAbsolutePath(), "");
             } catch (Exception error) {
-                nativePickedFile("", "读取所选文件失败：" + error.getMessage());
+                nativePickedFile(requestId, "", "读取所选文件失败：" + error.getMessage());
             }
         }).start();
     }
 
-    /** 路网文件上限，与 Rust 侧 `load_network_path` 的 64 MiB 保持一致。 */
-    private static final long MAX_OSM_BYTES = 64L * 1024 * 1024;
+    /**
+     * 路网文件上限。
+     *
+     * 必须与 Rust 侧 `load_network_path` / `school_roads::MAX_BYTES` 的 24 MiB 一致：
+     * 这里给 64 MiB 时，用户选 24–64 MiB 的文件会先被完整复制进私有存储，
+     * 再被 Rust 拒绝 —— 白占存储，提示还互相矛盾。
+     */
+    private static final long MAX_OSM_BYTES = 24L * 1024 * 1024;
 
     private static String sanitizeFileName(String name) {
         java.io.File base = new java.io.File(name);

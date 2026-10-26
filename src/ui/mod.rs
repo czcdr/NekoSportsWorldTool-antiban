@@ -48,6 +48,18 @@ pub const UPDATE_PROG: &str = "__UPDATE_PROG__";
 pub const UPDATE_DONE: &str = "__UPDATE_DONE__";
 pub const POINTS_DONE: &str = "__POINTS_DONE__";
 
+/// 保存配置并把失败原因交回调用方显示。
+///
+/// GUI 里大量 `let _ = save_config(..)` 会让磁盘满 / 目录只读 / 权限错误
+/// 变成「界面显示已保存，重启后设置全丢」。调用点统一改成这个助手，
+/// 由各自的状态栏把原因显示出来（CLI 侧早就这么做了）。
+pub(crate) fn save_config(config: &Config) -> Result<(), String> {
+    crate::api::model::save_config(config).map_err(|e| {
+        eprintln!("× 设置保存失败：{e}");
+        format!("设置保存失败：{e}（本次改动仅当前会话有效）")
+    })
+}
+
 /// 提交结果弹窗。
 pub struct PopupInfo {
     pub title: String,

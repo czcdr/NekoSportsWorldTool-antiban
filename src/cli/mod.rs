@@ -33,10 +33,11 @@ fn usage() {
   ai-records --sport <id>                  AI 运动记录（按天分组）
   semester                                 学期完成度
   cheat  [--page n]                        违规自查
-  recover [--yes] [--verify] [--only rrid] [--limit n] [--dist km] [--pace 秒/km]
+  recover [--yes] [--verify] [--only rrid] [--limit n] [--dist km] [--pace 秒/km] [--force]
                                            异常记录修复：默认只诊断（违规榜 + 未达标记录 +
                                            原因）；--yes 才用原开始时刻覆盖提交，默认一次最多 3 条；
-                                           --verify 修完复查（记录是否转绿、违规榜是否清）
+                                           --verify 修完复查（记录是否转绿、违规榜是否清）；
+                                           冻结状态读不到时默认停手，--force 才跳过该检查
   rank   main   --type 1|2|3 --sort 1|2 [--gender 0|1] [--date YYYY-MM-DD]
                                            排行榜（1个人 2班级 3院系；1日 2月）
   rank   indoor --range 1|2|3 [--gender 0|1]
@@ -54,17 +55,25 @@ pub(crate) fn parse_flags(rest: &[&str]) -> Vec<(String, String)> {
     let mut i = 0;
     while i < rest.len() {
         let k = rest[i].trim_start_matches('-').to_string();
+        // 单独一个 `-` 是「值从标准输入读」的约定写法（`login --pass -`）：
+        // 它必须以**值**的身份被取走，否则会被当成一个空名开关吞掉，
+        // `--pass` 只能拿到兜底值 "1"，安全输入路径整条不可达。
+        // 其余以 `-` 开头的一律当开关，不吃下一个 token。
         let v = rest
             .get(i + 1)
-            .filter(|n| !n.starts_with('-') && *n != &"")
+            .filter(|n| !n.is_empty() && (*n == &"-" || !n.starts_with('-')))
             .map(|s| s.to_string());
         match v {
             Some(v) => {
-                out.push((k, v));
+                if !k.is_empty() {
+                    out.push((k, v));
+                }
                 i += 2;
             }
             None => {
-                out.push((k, "1".into()));
+                if !k.is_empty() {
+                    out.push((k, "1".into()));
+                }
                 i += 1;
             }
         }
@@ -129,13 +138,22 @@ pub(crate) fn fmt_hms(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 只要 "YYYY-MM-DD HH:MM:SS" 的 "MM-DD HH:MM:SS" 部分。
+///
+/// `fmt_hms` 在时间戳无法格式化时返回**空串**，直接 `[5..]` 会 panic
+/// （伪造/异常的 `startTime` 就能让整个 `records` 崩掉）。按字符边界取，取不到就原样返回。
+pub(crate) fn short_stamp(stamp: &str) -> &str {
+    stamp.get(5..).unwrap_or(stamp)
+}
+
 pub(crate) fn print_rows(rows: &[RecordRow]) {
     println!(
         "{:<16} {:>8} {:>8} {:>6} {:>6} {:>4} rrid",
         "时间", "距离m", "时长", "配速", "步频", "达标"
     );
     for r in rows {
-        let t = fmt_hms(r.start_time)[5..].to_string();
+        let stamp = fmt_hms(r.start_time);
+        let t = short_stamp(&stamp);
         let pace = if r.total_dis > 0.0 && r.total_time > 0 {
             let p = r.total_time as f64 / (r.total_dis / 1000.0);
             format!("{}:{:02}", (p / 60.0) as i64, (p as i64) % 60)
@@ -176,5 +194,76 @@ pub(crate) fn parse_pace(v: &str) -> f32 {
         m.parse::<f32>().unwrap_or(0.0) * 60.0 + s.parse::<f32>().unwrap_or(0.0)
     } else {
         v.parse().unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(rest: &[&str]) -> Vec<(String, String)> {
+        parse_flags(rest)
+    }
+
+    /// 回归：`--pass -` 必须把 "-" 当作**值**取走，而不是兜底成 "1"。
+    #[test]
+    fn dash_is_consumed_as_a_value() {
+        assert_eq!(
+            pairs(&["--user", "13800000000", "--pass", "-", "--remember"]),
+            vec![
+                ("user".to_string(), "13800000000".to_string()),
+                ("pass".to_string(), "-".to_string()),
+                ("remember".to_string(), "1".to_string()),
+            ]
+        );
+        // 前面没有 flag 的裸 "-" 不再产生空名开关（也不会把后面的 token 当值留下）
+        assert!(pairs(&["-", "Secret"]).is_empty());
+        assert_eq!(pairs(&["--pass", "-"]), vec![("pass".to_string(), "-".to_string())]);
+    }
+
+    #[test]
+    fn ordinary_flags_and_values_still_parse() {
+        assert_eq!(
+            pairs(&["--dist", "1.2", "--pace", "6:30", "--face", "0"]),
+            vec![
+                ("dist".to_string(), "1.2".to_string()),
+                ("pace".to_string(), "6:30".to_string()),
+                ("face".to_string(), "0".to_string()),
+            ]
+        );
+        // 空字符串不是值；后续 token 仍是开关
+        assert_eq!(
+            pairs(&["--route", "", "--seed", "7"]),
+            vec![
+                ("route".to_string(), "1".to_string()),
+                ("seed".to_string(), "7".to_string()),
+            ]
+        );
+        // 以 '-' 开头的长选项不会被当成上一个选项的值
+        assert_eq!(
+            pairs(&["--only", "--yes"]),
+            vec![
+                ("only".to_string(), "1".to_string()),
+                ("yes".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_returns_first_match() {
+        let f = pairs(&["--user", "a", "--user", "b"]);
+        assert_eq!(get(&f, "user"), Some("a"));
+        assert_eq!(get(&f, "missing"), None);
+    }
+
+    /// 回归：时间戳无效时 `fmt_hms` 返回空串，短格式不能 panic。
+    #[test]
+    fn short_stamp_survives_invalid_timestamp() {
+        assert_eq!(short_stamp(""), "");
+        assert_eq!(short_stamp("2026-03-05 07:30:00"), "03-05 07:30:00");
+        assert_eq!(short_stamp("abc"), "abc");
+        // 非法毫秒值走 fmt_hms 的真实路径
+        assert_eq!(fmt_hms(i64::MAX), "");
+        assert_eq!(short_stamp(&fmt_hms(i64::MAX)), "");
     }
 }

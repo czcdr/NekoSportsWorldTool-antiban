@@ -82,9 +82,15 @@ pub fn redact_text(text: &str) -> String {
             break;
         };
         // 回溯到 scheme 起点：把前面连续的 scheme 字符（字母数字/+-.）算进来。
+        //
+        // 必须用 `char_indices`：`rfind` 返回的是**字节**下标，直接 `+1` 会落到
+        // 多字节字符内部（"错误http://…" 中 '误' 占 3..6 字节，+1 = 4 不是字符边界），
+        // 随后切片 panic —— 错误处理路径自己崩溃，会把可恢复的网络错误变成进程退出。
         let scheme_start = rest[..pos]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map(|i| i + 1)
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         out.push_str(&rest[..scheme_start]);
         let tail = &rest[scheme_start..];
@@ -96,6 +102,53 @@ pub fn redact_text(text: &str) -> String {
         rest = &tail[end..];
     }
     out
+}
+
+/// 把「一整段不确定内容的响应开头」压成可以安全打印的摘要。
+///
+/// 解密失败的原始响应可能是网关报错页、明文 JSON、甚至一段带手机号/令牌的
+/// 调试输出 —— 这类内容一旦拼进错误串就会进终端回滚区、截图和 CI 日志。
+/// 三步处理：按字符截断（不劈多字节），能当 JSON 解析就走结构化脱敏，
+/// 再统一遮掉内嵌 URL 凭据、11 位手机号与超长令牌串。
+pub fn redact_snippet(raw: &str, n: usize) -> String {
+    let cut: String = raw.chars().take(n).collect();
+    let text = match serde_json::from_str::<serde_json::Value>(&cut) {
+        Ok(v) => redact_json(&v).to_string(),
+        Err(_) => redact_text(&cut),
+    };
+    mask_tokens(&text)
+}
+
+/// 遮掉手机号（1[3-9]xxxxxxxxx）与长度 ≥40 的字母数字串（token / 会话 id / 摘要）。
+fn mask_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            token.push(ch);
+        } else {
+            flush_token(&mut token, &mut out);
+            out.push(ch);
+        }
+    }
+    flush_token(&mut token, &mut out);
+    out
+}
+
+fn flush_token(token: &mut String, out: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    let t = std::mem::take(token);
+    let bytes = t.as_bytes();
+    let all_digits = t.chars().all(|c| c.is_ascii_digit());
+    if t.len() == 11 && all_digits && bytes[0] == b'1' && (b'3'..=b'9').contains(&bytes[1]) {
+        out.push_str(&format!("{}****{}", &t[..3], &t[7..]));
+    } else if t.len() >= 40 && t.chars().all(|c| c.is_ascii_alphanumeric()) {
+        out.push_str(&mask(&t));
+    } else {
+        out.push_str(&t);
+    }
 }
 
 /// 递归掩码敏感键的字符串值，键名忽略大小写；保留原业务数据。
@@ -232,5 +285,41 @@ mod tests {
         // 多个 URL 的文本全部处理
         let two = redact_text("a http://u:p@h1/ b http://u:p@h2/");
         assert!(!two.contains("u:p"), "{two}");
+    }
+
+    /// 回归：URL 紧跟多字节字符时，scheme 回溯不能切在字符中间（曾 panic）。
+    #[test]
+    fn test_redact_text_multibyte_prefix_does_not_panic() {
+        for prefix in ["错误", "× 网络错误", "⚠连接失败", "🦀", "a中"] {
+            let raw = format!("{prefix}http://user:pass@proxy.local:3128");
+            let out = redact_text(&raw);
+            assert!(!out.contains("pass"), "凭据必须被打码：{out}");
+            assert!(out.starts_with(prefix), "前缀必须原样保留：{out}");
+            assert!(out.contains("***@proxy.local:3128"), "{out}");
+        }
+        // 纯多字节前缀 + 无 URL 的文本原样返回（不 panic）
+        assert_eq!(redact_text("中文错误信息"), "中文错误信息");
+        assert_eq!(redact_text("🦀x"), "🦀x");
+    }
+
+    #[test]
+    fn test_redact_snippet_masks_phone_token_and_json() {
+        // 手机号
+        let phone = redact_snippet("登录失败 user=13800001111 密码错误", 200);
+        assert!(!phone.contains("13800001111"), "{phone}");
+        assert!(phone.contains("138****1111"), "{phone}");
+        // 令牌串（≥40 位）
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let masked = redact_snippet(&format!("token={token}"), 200);
+        assert!(!masked.contains(token), "{masked}");
+        assert!(masked.contains("****"), "{masked}");
+        // JSON 走结构化脱敏
+        let json = redact_snippet(r#"{"token":"abcdefghijkl","msg":"ok"}"#, 200);
+        assert!(json.contains("abcd****ijkl"), "{json}");
+        assert!(json.contains("\"ok\""), "{json}");
+        // 截断按字符，不劈多字节
+        let long = "中".repeat(50);
+        let cut = redact_snippet(&long, 10);
+        assert_eq!(cut.chars().count(), 10);
     }
 }

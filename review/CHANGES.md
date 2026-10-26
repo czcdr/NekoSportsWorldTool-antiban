@@ -615,3 +615,144 @@ cargo check -p route-planner --target aarch64-linux-android   Finished
 
 
 
+
+---
+
+## O. 0.4.1-antiban：第三方审计（v0.4.0 全仓）的逐条核实与修复
+
+依据：外部审计报告 `NekoSportsWorldTool-v0.4.0-audit`（基线提交 `ab10001`）。审计列了 3 高 / 8 中 / 6 低，
+本轮逐条核实，**全部按报告建议处理**；另外用 WSL2 里的 Ubuntu 22.04 独立构建/测试了一遍 Linux 侧，
+又发现两个审计没覆盖的 Linux 专属缺陷（O.10）。审计中"未执行"的项（Rust 测试、Android 构建、脚本运行）
+本轮给出了可复核的结果或明确的"仍未验证"。
+
+### O.1 H1 网络与 TLS 依赖的已知公告（`chore(deps)`）
+
+| 包 | 旧 | 新 | 对应公告 |
+|---|---|---|---|
+| `rustls` | 0.23.44 | **0.23.46** | RUSTSEC-2026-0285/0348/0349/0346 |
+| `rustls-webpki` | 0.103.15 | **0.103.16** | RUSTSEC-2026-0382 / CVE-2026-111943 |
+| `webpki-roots` | 1.0.9 | **1.0.10** | RUSTSEC-2026-0381（eM Sign 中间证书） |
+
+只改了 `Cargo.lock`（`Cargo.toml` 用的是 `0.23` / `1` 宽范围），`cargo tree` 里
+`reqwest → hyper-rustls → rustls` 与 `src/tls.rs` 的 preconfigured TLS 仍是同一份 0.23.x，
+`use_preconfigured_tls` 的类型契约没变（有既有测试 `http::tests::reqwest_accepts_our_preconfigured_rustls_config` 守着）。
+
+### O.2 H2 `login --pass -` 根本不可达（`fix(cli)`）
+
+`parse_flags` 原来对所有 `-` 开头的 token 一律当开关，于是 `--pass -` 被解析成
+`("pass","1")` + 一个空名开关，`read_password` 里 `value == "-"` 的分支永远进不去 ——
+"避免密码进 shell 历史"的安全设计等于没有。
+
+- `src/cli/mod.rs`：单独一个 `-` 现在按**值**取走；空名开关不再产出。
+- 回归测试 4 条：`dash_is_consumed_as_a_value`、`ordinary_flags_and_values_still_parse`、
+  `get_returns_first_match`、`short_stamp_survives_invalid_timestamp`。
+
+### O.3 H3 本地 Android 发布脚本（`fix(android)`）
+
+- `$version -split '\.'` 直接 `[int]` 在 `0.4.0-antiban` 上会抛异常，且**抛在盖章之前**，整条本地发布链不可用。
+  现在先切掉 `-suffix`，逐段取前导数字，并给 `versionName` 用去掉尾巴的基线（与 CI 的
+  `0.4.0-android.N` 一致，不再出现 `0.4.0-antiban-android.4` 这种写法）。
+- 默认 `$Repo` 从 `hb-degithub/NekoSportsWorldTool` 改为 **`czcdr/NekoSportsWorldTool-antiban`**
+  （`src/update.rs::REPO_OWN`）。原来即使修好解析，产物也会发到客户端不看的地方。
+
+### O.4 M1/M8 自更新：fail-closed + 本机 pin + 安装前校验
+
+| 项 | 旧行为 | 现在 |
+|---|---|---|
+| 资产无 `digest` | 桌面包拒绝、**APK 放行**（"系统安装器会验签名"） | **两条路都拒绝**：安装器只保证"签名是本 App 的"，不保证"内容是本 App 该有的" |
+| APK 资产匹配 | 精确 → 任意含 arm64 → **任意 .apk** | 精确 → `*-arm64.apk` 且含 `android`；匹配不到就当"本平台无产物"（不更新、不报错） |
+| 同一 tag 的资产被替换 | 无感（摘要与资产来自同一个 API） | `update_pins.json` 记录首次摘要，**同 tag/资产名摘要变化即拒绝**并提示核对 Release |
+| Release 不可变 | 未识别 | 读取 `immutable`；置位时摘要由服务端保证，跳过 pin |
+| Android 安装前 | 直接交系统安装器 | `MainActivity.verifyUpdatePackage`：**包名 + 签名指纹(SHA-256) + versionCode 不得低于已装**，不符即删包提示 |
+
+残余风险照旧写清：pin 是 TOFU（首次仍信任首次），发布账号被盗且**首次**就换包这条路只有发布侧签名能挡；
+本轮没有引入签名密钥流程（那需要把私钥放进 CI Secret 并改发布脚本，属于独立工程）。
+
+### O.5 M2 凭据不再明文落盘（`feat(crypto)`）
+
+新增 `src/crypto/local_seal.rs`：`AES-256-CBC + PKCS7`，密钥 = `SHA-256(用户 + 主机标识 + 数据目录 + 每安装随机 salt)`，
+salt 首次生成即 0600。`save_config`/`save_session` 落盘前把 `password`/`token` 换成
+`password_sealed`/`token_sealed` 并清空明文；读取时还原进明文字段（**结构体不动，迁移面最小**）。
+
+- 旧明文文件原样可读（迁移发生在"下次保存"），测试 `legacy_plaintext_credentials_still_load` 守着；
+- 换机器/改用户名/删 salt 解不开时，走"提示重新登录"而不是把配置当损坏清空；
+- 边界写进模块注释：salt 与密文同机同存储，**同账户进程仍可解**。这挡的是"文件被拷走/同步/截图"，不是本机被入侵。
+
+### O.6 M3/M4 日志脱敏（`fix(textlog)`）
+
+- `redact_text` 的 scheme 回溯用 `rfind` 拿**字节**下标再 `+1`，URL 紧跟中文时切在多字节字符内部 →
+  `byte index 4 is not a char boundary` panic。改用 `char_indices().rev()` + `len_utf8()`，
+  回归测试 `test_redact_text_multibyte_prefix_does_not_panic`（5 种前缀 + 纯多字节文本）。
+- 解密失败的 `raw_head` 原来直接 `truncate(&raw,160)` 拼进错误串（含手机号/令牌/网关页）。
+  新增 `redact_snippet`：按字符截断 → 能解析 JSON 就 `redact_json` → 统一遮 URL 凭据、
+  11 位手机号、≥40 位令牌串。`client.rs` 的 `RequestOutcome.raw_head` 与 `call_host` 的错误串都走它。
+
+### O.7 M5 路网上限统一到 24 MiB
+
+`generate_road::load_network_path` 的常量改为引用 `school_roads::MAX_BYTES`（唯一真值），
+错误文案同步；`MainActivity.MAX_OSM_BYTES` 64 MiB → **24 MiB**，注释也改成"与 Rust 侧一致"。
+现在不会出现"先复制 24–64 MiB 再被 Rust 拒绝"。
+
+### O.8 M6 `recover` 在冻结状态未知时停手（`fix(recover)`）
+
+- `Diagnosis::freeze_unknown()` 新增；`verdict()` 在 `freeze_seconds == None` 时**先说"未知"**，
+  不再落到"最可修"分支。
+- `cmd_recover`：`--yes` 时若策略接口没取到，**默认拒绝提交**并给出下一步；`--force` 才跳过（并打印警告）。
+  usage 同步。
+
+### O.9 M7/L2 原子写与冷却状态（`fix(captcha)`）
+
+- `captcha_guard` 原来"读-改-写"裸奔、写失败被 `let _ =` 吞掉。现在：进程内 `Mutex` + 跨进程
+  `create_new` 锁文件（最多等 500 ms 后放行，不阻塞登录）+ 原子写；写失败打 stderr。
+- `write_secret_file` 的临时文件名从 `名字.PID.tmp` 改成 `名字.PID.线程.计数器.tmp`：
+  同进程两线程保存同一目标时不会再互相截断（L2）。
+
+### O.10 Linux 专属缺陷（WSL2 实跑发现，审计未覆盖）
+
+| 缺陷 | 证据 | 修复 |
+|---|---|---|
+| `data_dir()` = **exe 所在目录** | `src/platform.rs` 原实现；WSL 里跑一次 GUI 就在 `target/release/` 生成 `identity.json`；装到 `/usr/local/bin`、`/opt`、AppImage 只读位置时登录态/身份/防重放全部静默失效，且违反 FHS | Windows 保持便携（exe 同目录）；Linux/macOS 走 `$XDG_DATA_HOME`/`~/Library/Application Support` 下的 `nekosportsworldtool/`；`NSWT_DATA_DIR` 可覆盖；切换时**一次性搬运**旧文件（尤其 `identity.json`，丢了 `device_id` 会触发 10121） |
+| `GT4_PROBE_DUMP` 用 `format!("{dir}\\…")` | `src/api/gt4.rs` | 改 `Path::join`，Linux 下不再生成"名字里带反斜杠"的文件 |
+| GUI 运行期依赖未声明（缺 `libxkbcommon-x11.so` 直接 panic） | `WINIT_UNIX_BACKEND=x11` → `Library libxkbcommon-x11.so could not be loaded` | 不改代码：官方 Linux 产物是 `mode: cli`（`--no-default-features`），GUI 不在 Linux 发布面；在此记录，避免以后再当"编译通过就等于能跑" |
+
+### O.11 L1/L4/L5/L6
+
+- **L1**：GUI 里 9 处 `let _ = save_config(...)` 统一换成 `ui::save_config(&config) -> Result`，
+  失败原因写进各自状态栏（`jobs`/`run`/`osm`/`road_tools`/`about`）。
+- **L4**：`print_rows` 的 `fmt_hms(..)[5..]` 在时间戳非法（`fmt_hms` 返回空串）时会 panic，
+  改用 `short_stamp`（`get(5..)` + 兜底），测试覆盖 `i64::MAX`。
+- **L5**：`android/test.ps1` 的 `SHA256.HashData`/`Convert.ToHexString`（PowerShell 7 only）
+  改为 `SHA256::Create()` + `ComputeHash`，5.1 与 7 都能跑。
+- **L6**：`cargo fmt`（54 文件），单独一个 `style:` 提交，与功能改动分开审。
+
+### O.12 验证（实测）
+
+```
+cargo test --release --lib                                  269 passed / 0 failed / 1 ignored（0.4.0 为 257，净增 12）
+cargo test -p route-planner                                  16 passed（lib）+ 7 passed（tests/basic.rs）
+cargo fmt --check                                            无差异
+（clippy / check --all-targets 结果见提交信息）
+```
+
+**Linux 独立验证**（WSL2 Ubuntu 22.04，非本机 Windows 侧）：
+
+```
+cargo build --release --no-default-features         Finished（纯 CLI）
+cargo build --release（默认 features = GUI）        Finished，21.7 MB ELF（GUI 在 Linux 也能编）
+cargo test --release --lib --no-default-features    202 passed / 0 failed
+cargo test --release --lib（含 GUI 测试）           263 passed / 0 failed
+cargo test -p route-planner --release                16 + 7 passed
+cargo clippy --release --lib --no-default-features    0 error
+./nekosportsworldtool --help / records               帮助正常；records 报"未登录"（预期）
+```
+
+**仍未验证的**（不冒充）：
+- Android 真机构建/覆盖安装/签名连续性 —— 本机无 SDK/NDK/设备；由 tag 触发的 `apk.yml` 在 CI 上编译 Java 并出包；
+- `MainActivity` 新增的签名/versionCode 校验只做了 javac 语法检查（缺 `android.jar`，符号级靠 CI）；
+- 服务端行为（禁跑、覆盖提交、`freezeRunTime` 归零是否等于解冻）—— 未登录、未发请求；
+- GUI 在 Linux 桌面的实际启动 —— 只有编译与"缺库会 panic"的证据。
+
+### O.13 0.4.0 遗留的旧 API 风险（未动，仅记录）
+
+`Config.password` 与 `Session.token` 在**内存里**仍是 `String`（登录/请求必须用它），
+进程内存转储不在本轮威胁模型内；如需覆盖，应改用 `secrecy`/`zeroize` 一类包装，属于独立改动。

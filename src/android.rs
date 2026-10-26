@@ -1,7 +1,7 @@
 //! Thin Android host: application storage, native IME editing, screen policy.
 
 use android_activity::AndroidApp;
-use jni::{objects::{JObject, JString, JValue}, sys::jlong, JNIEnv, JavaVM};
+use jni::{objects::{JObject, JString, JValue}, sys::{jint, jlong}, JNIEnv, JavaVM};
 use std::{collections::HashMap, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock}};
 use winit::platform::android::EventLoopBuilderExtAndroid;
 
@@ -14,6 +14,10 @@ static SAFE_INSETS: Mutex<[i32; 4]> = Mutex::new([0; 4]);
 static DEVICE_INFO: Mutex<Option<DeviceInfoReply>> = Mutex::new(None);
 /// 文件选择器结果（路径 或 错误文本）。
 static PICKED: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+/// 文件选择请求序号：每次 `pick_file()` 递增，Java 回调时带回。
+static PICK_SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// 当前等待回调的请求序号；`None` 表示没有在途请求。
+static PICK_PENDING: Mutex<Option<i32>> = Mutex::new(None);
 
 pub(crate) struct DeviceInfoReply {
     pub initial: bool,
@@ -207,11 +211,22 @@ pub(crate) fn set_keep_screen_on(enabled: bool) {
 
 /// 打开系统文件选择器（SAF）。结果经 `nativePickedFile` 回到 `take_picked_file`。
 /// 返回 false 表示连选择器都没能唤起（调用失败）。
+///
+/// 每次调用分配一个递增序号并一起下发给 Java，回调时必须带回同一个序号：
+/// 结果通道只有一个槽位，大文件复制期间再次选择 / Activity 重建 / 旧线程晚到
+/// 都会覆盖新结果（表现为「加载了上一次的文件」或「取消冲掉了成功结果」）。
+/// Rust 侧只接受**当前这次**请求的回调，晚到的一律丢弃。
 pub(crate) fn pick_file() -> bool {
-    with_activity(|env, activity| {
-        env.call_method(activity, "pickOsmFile", "()V", &[])?;
+    let id = PICK_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    *PICK_PENDING.lock().unwrap() = Some(id);
+    let ok = with_activity(|env, activity| {
+        env.call_method(activity, "pickOsmFile", "(I)V", &[JValue::Int(id)])?;
         Ok(())
-    })
+    });
+    if !ok {
+        *PICK_PENDING.lock().unwrap() = None;
+    }
+    ok
 }
 
 /// 取文件选择结果：`Some(Ok(路径))` 选中并已复制进私有目录，`Some(Err)` 失败/取消。
@@ -221,10 +236,15 @@ pub(crate) fn take_picked_file() -> Option<Result<String, String>> {
 
 #[no_mangle]
 pub extern "system" fn Java_org_nekosportsworld_tool_MainActivity_nativePickedFile(
-    mut env: JNIEnv<'_>, _activity: JObject<'_>, path: JString<'_>, error: JString<'_>,
+    mut env: JNIEnv<'_>, _activity: JObject<'_>, request_id: jint, path: JString<'_>, error: JString<'_>,
 ) {
     let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
     let error: String = env.get_string(&error).map(|s| s.into()).unwrap_or_default();
+    // 只接受当前请求的回调：序号不符说明是上一次选择晚到的结果，丢弃。
+    let current = PICK_PENDING.lock().unwrap().take();
+    if current != Some(request_id) {
+        return;
+    }
     let reply = if error.is_empty() && !path.is_empty() {
         Ok(path)
     } else {

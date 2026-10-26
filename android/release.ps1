@@ -10,13 +10,15 @@
 签名变化后手机上无法覆盖安装，卸载重装还会丢 identity.json / session.json。
 
 .EXAMPLE
-./android/release.ps1 -AndroidRev 4                        # 发到 fork
-./android/release.ps1 -AndroidRev 4 -Repo YanamiNeko/NekoSportsWorldTool -Notes "修复"
+./android/release.ps1 -AndroidRev 4                        # 发到默认仓库（客户端更新源）
+./android/release.ps1 -AndroidRev 4 -Repo owner/other -Notes "修复"   # 显式指定别的仓库
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][ValidateRange(1, 99)][int]$AndroidRev,
-    [string]$Repo = 'hb-degithub/NekoSportsWorldTool',
+    # 默认必须是客户端更新源（src/update.rs 的 REPO_OWN）：发到别的仓库时
+    # Release 照样成功，但所有已装用户永远收不到更新。
+    [string]$Repo = 'czcdr/NekoSportsWorldTool-antiban',
     [string]$Notes = '',
     [switch]$Draft,
     [switch]$SkipBuild
@@ -31,12 +33,22 @@ $manifest = Join-Path $PSScriptRoot 'AndroidManifest.xml'
 $cargoToml = Get-Content (Join-Path $projectRoot 'Cargo.toml') -Raw
 if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'Cargo.toml 中找不到 version' }
 $version = $Matches[1]
-$parts = $version -split '\.' | ForEach-Object { [int]$_ }
+# Cargo 版本可以带预发布尾巴（`0.4.0-antiban`），AndroidManifest 的 versionCode
+# 只能吃数字：先切掉 `-suffix`，再逐段取前导数字。直接 [int]'0-antiban' 会抛
+# "Cannot convert value"，脚本会在盖章之前就中止（本地发布链路整条不可用）。
+$base = ($version -split '-')[0]
+$parts = @()
+foreach ($segment in ($base -split '\.')) {
+    if ($segment -notmatch '^(\d+)') { throw "版本号段无法解析：$version（段 '$segment'）" }
+    $parts += [int]$Matches[1]
+}
 if ($parts.Count -lt 3) { throw "版本号格式异常：$version" }
-$versionName = "$version-android.$AndroidRev"
+# versionName 用去掉预发布尾巴的基线（`0.4.0-android.N`），与 CI（apk.yml）一致；
+# 否则同一版本会同时存在 `0.4.0-antiban-android.4` 和 `0.4.0-android.1` 两种写法。
+$versionName = "$base-android.$AndroidRev"
 # 沿用现有编码 0.2.5-android.3 = 20503（major*1e6 + minor*1e4 + patch*1e2 + rev）
 $versionCode = $parts[0] * 1000000 + $parts[1] * 10000 + $parts[2] * 100 + $AndroidRev
-Write-Output "版本：$versionName（versionCode $versionCode）→ $Repo"
+Write-Output "版本：$versionName（versionCode $versionCode，基线 $base）→ $Repo"
 
 # ── 盖章 AndroidManifest ─────────────────────────────────────
 $manifestText = Get-Content $manifest -Raw

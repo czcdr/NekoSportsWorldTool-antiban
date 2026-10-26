@@ -478,12 +478,15 @@ mod tests {
         let (dist, score) = get_distance_checked(&bg_png, &slice_png, ypos)?;
         println!("[diag] 识别 distance={dist} 相似度={score:.4}");
 
-        // 落盘：bg + 标注图（红=识别结果），人工核对缺口位置用
+        // 落盘：bg + 标注图（红=识别结果），人工核对缺口位置用。
+        // 路径必须走 Path::join：`format!("{dir}\\...")` 在 Linux/macOS 上会写出一个
+        // 名字里带反斜杠的文件，看起来就像"诊断图没生成"。
         if let Ok(dir) = std::env::var("GT4_PROBE_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
             let _ = std::fs::create_dir_all(&dir);
             let stamp = format!("{:x}", crate::crypto::envelope::now_ms());
-            let _ = std::fs::write(format!("{dir}\\{stamp}-bg.png"), &bg_png);
-            let _ = std::fs::write(format!("{dir}\\{stamp}-slice.png"), &slice_png);
+            let _ = std::fs::write(dir.join(format!("{stamp}-bg.png")), &bg_png);
+            let _ = std::fs::write(dir.join(format!("{stamp}-slice.png")), &slice_png);
             if let Ok(mut canvas) = image::load_from_memory(&bg_png).map(|i| i.to_rgba8()) {
                 let h = canvas.height();
                 if dist < canvas.width() as usize {
@@ -491,9 +494,9 @@ mod tests {
                         canvas.put_pixel(dist as u32, y, image::Rgba([255u8, 0, 0, 255]));
                     }
                 }
-                let _ = canvas.save(format!("{dir}\\{stamp}-mark.png"));
+                let _ = canvas.save(dir.join(format!("{stamp}-mark.png")));
             }
-            println!("[diag] 已落盘 {dir}\\{stamp}-*.png");
+            println!("[diag] 已落盘 {}/{stamp}-*.png", dir.display());
         }
 
         let mut logf = |_s: &str| {};

@@ -72,14 +72,16 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
     }
     // 手机上的路网是从系统文件选择器挑的，可能是任意大小；先按体积挡住，
     // 否则一个几百 MB 的 .osm 会在解析阶段把内存吃光（手机上就是闪退）。
-    // 与下载路径（`school_roads::MAX_BYTES`）保持同一个上限：两条入口给不同额度，
-    // 只会让用户遇到「自动下载能跑、手动导入却闪退」这种自相矛盾的失败。
-    const MAX_OSM_BYTES: u64 = 24 * 1024 * 1024;
+    // 上限直接引用下载路径的常量：两条入口给不同额度，只会让用户遇到
+    // 「自动下载能跑、手动导入却闪退」这种自相矛盾的失败（文案也必须跟着它走，
+    // 否则用户按提示把文件裁到 24–64 MiB 仍会被拒）。
+    const MAX_OSM_BYTES: u64 = crate::api::school_roads::MAX_BYTES;
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_OSM_BYTES {
             return Err(format!(
-                "路网文件过大（{:.1} MiB，上限 64 MiB）；请导出更小的范围",
-                meta.len() as f64 / (1024.0 * 1024.0)
+                "路网文件过大（{:.1} MiB，上限 {} MiB）；请导出更小的范围",
+                meta.len() as f64 / (1024.0 * 1024.0),
+                MAX_OSM_BYTES / (1024 * 1024)
             ));
         }
     }

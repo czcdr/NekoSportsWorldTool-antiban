@@ -773,6 +773,8 @@ fn cmd_recover(rest: &[&str]) -> i32 {
     let flags = parse_flags(rest);
     let yes = get(&flags, "yes").is_some();
     let verify = get(&flags, "verify").is_some();
+    // 策略接口读不到时默认停手；`--force` 是知情者的显式逃生门。
+    let force = get(&flags, "force").is_some();
     let only: Option<i64> = get(&flags, "only").and_then(|v| v.parse().ok());
     let limit: usize = get(&flags, "limit")
         .and_then(|v| v.parse().ok())
@@ -855,6 +857,20 @@ fn cmd_recover(rest: &[&str]) -> i32 {
             diag.freeze_text()
         );
         return 1;
+    }
+    // 拿不到策略 ≠ 没冻结：默认停手。旧实现在这里直接放行，策略接口抖动一次
+    // 就会在禁跑期里提交，白挨一次风控计数。
+    if diag.freeze_unknown() && !force {
+        eprintln!(
+            "冻结状态未知（策略接口本次没取到），无法确认账号没被禁跑。\
+             已停止覆盖提交以免撞服务端拒绝。\n\
+             · 先重跑一次 `recover` 确认能读出「禁跑状态」；\n\
+             · 若确认账号可正常跑步，加 --force 跳过这道检查（风险自负）。"
+        );
+        return 1;
+    }
+    if diag.freeze_unknown() {
+        eprintln!("⚠ 已按 --force 跳过冻结检查：冻结状态仍未确认，本次提交可能与服务端拒绝相撞。");
     }
     if diag.abnormal.is_empty() {
         println!("没有需要修复的记录。");
@@ -1046,6 +1062,7 @@ fn cmd_update(rest: &[&str]) -> i32 {
             println!("× {e}");
             return 1;
         }
+        crate::update::record_pin(&rel);
         let bin = match crate::update::extract(&rel.asset_name, &bytes) {
             Ok(b) => b,
             Err(e) => {

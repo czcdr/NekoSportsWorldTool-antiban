@@ -64,9 +64,13 @@ pub struct ReleaseInfo {
     pub asset_url: String,
     pub asset_size: u64,
     /// 资产摘要，形如 `sha256:<hex>`（GitHub Release API 的 `assets[].digest`）。
-    /// 老接口/老资产可能没有，此时桌面端拒绝自动替换。
+    /// 老接口/老资产可能没有，此时**任何平台都不再自动替换**（fail-closed）。
     #[serde(default)]
     pub asset_digest: Option<String>,
+    /// Release 是否为 GitHub「不可变发布」：开启后资产创建即不可替换/删除。
+    /// 为真时资产摘要由服务端保证，不需要本机 pin 兜底。
+    #[serde(default)]
+    pub immutable: bool,
 }
 
 /// 检查最新 Release；比当前新返回 Some，已是最新返回 None。
@@ -139,6 +143,7 @@ fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Op
         asset_url: asset.url,
         asset_size: asset.size,
         asset_digest: asset.digest,
+        immutable: v.get("immutable").and_then(|x| x.as_bool()).unwrap_or(false),
     }))
 }
 
@@ -149,7 +154,11 @@ struct AssetPick {
     digest: Option<String>,
 }
 
-/// 资产匹配：桌面产物要求名字完全一致；APK 先精确后模糊（兼容历史命名）。
+/// 资产匹配：桌面产物要求名字完全一致；APK 允许退到「同平台族」（`*-android-arm64.apk`）。
+///
+/// 旧实现在 APK 上还会一路退化到**任意** `.apk`：一个只有 x86 模拟器包、
+/// 或者别的变体包的 Release 也会被接受，装上去不是这台机器的架构版本。
+/// 现在最多退到 arm64 这条线，再匹配不到就当「本平台没有产物」处理（不更新，不报错）。
 fn pick_asset(v: &serde_json::Value, want: &str) -> Option<AssetPick> {
     let assets = v.get("assets")?.as_array()?;
     let find = |pred: &dyn Fn(&str) -> bool| -> Option<AssetPick> {
@@ -171,9 +180,10 @@ fn pick_asset(v: &serde_json::Value, want: &str) -> Option<AssetPick> {
         })
     };
     if want.ends_with(".apk") {
+        // 同平台族的命名仍兼容：`…-android-arm64.apk`、`…-android.2-arm64.apk`；
+        // 必须同时含 android 且以 -arm64.apk 结尾，别的架构/变体的包不算。
         find(&|n| n == want)
-            .or_else(|| find(&|n| n.ends_with(".apk") && n.contains("arm64")))
-            .or_else(|| find(&|n| n.ends_with(".apk")))
+            .or_else(|| find(&|n| n.ends_with("-arm64.apk") && n.contains("android")))
     } else {
         find(&|n| n == want)
     }
@@ -243,11 +253,15 @@ fn download_with_limit(
     Ok(buf)
 }
 
-/// 下载后校验：声明的字节数 + Release 元数据里的 SHA-256。
+/// 下载后校验：声明的字节数 + Release 元数据里的 SHA-256 + 本机记住的首次摘要。
 ///
 /// 摘要来自 GitHub Release API（同一 HTTPS 通道），能挡住"资产被替换/下载被
-/// 篡改/连错仓库"这类问题；它防不了发布账号本身被控制 —— 那需要发布侧签名，
-/// 本项目没有签署流程，这点必须如实说明。
+/// 篡改/连错仓库"这类问题；它防不了发布账号本身被控制（恶意包和对应摘要可以
+/// 一起被替换）。为压住这条残余风险，这里再做两层：
+/// 1. `immutable` 的 Release（GitHub 不可变发布）资产创建后不可替换，直接采信；
+/// 2. 其余情况走**本机 TOFU pin**：同一个 `tag/资产名` 第一次见到的摘要被记到
+///    `update_pins.json`，以后摘要变了就拒绝 —— 账号被盗后"悄悄换掉老版本资产"
+///    这条路就被堵住了（首次仍是信任首次，这点必须在文档里说清）。
 pub fn verify(rel: &ReleaseInfo, bytes: &[u8]) -> Result<(), String> {
     if rel.asset_size > 0 && bytes.len() as u64 != rel.asset_size {
         return Err(format!(
@@ -256,16 +270,86 @@ pub fn verify(rel: &ReleaseInfo, bytes: &[u8]) -> Result<(), String> {
             bytes.len()
         ));
     }
-    match rel.asset_digest.as_deref() {
-        Some(digest) => verify_sha256(bytes, digest),
-        None if rel.asset_name.ends_with(".apk") => {
-            // APK 由系统安装器校验签名：签名不符会被系统拒绝，风险相对可控。
-            eprintln!("[update] 该资产没有摘要，依赖 APK 签名校验兜底");
-            Ok(())
-        }
-        None => Err(
+    // 没有摘要 = 无从校验。旧实现只在桌面包上拒绝，APK 走「系统安装器会验签名」
+    // 就放过了 —— 但那只保证"签名是本 App 的"，不保证"内容是本 App 该有的"。
+    // 现在两条路一样严格（GitHub 自 2025 起对全部资产提供 digest）。
+    let Some(digest) = rel.asset_digest.as_deref() else {
+        return Err(
             "更新包没有 SHA-256 摘要，无法确认完整性；请到 Release 页面手动下载核对".into(),
-        ),
+        );
+    };
+    verify_sha256(bytes, digest)?;
+    // 不可变发布（GitHub immutable releases）的资产创建后不可替换/删除，摘要由服务端
+    // 保证，不需要本机 pin；其余情况才用 TOFU pin 兜"悄悄换掉老版本资产"。
+    if !rel.immutable {
+        check_pin(rel, digest)?;
+    }
+    Ok(())
+}
+
+// ── 本机 pin：同一 tag/资产名 的摘要不允许中途改变 ──────────────
+
+fn pin_path() -> std::path::PathBuf {
+    crate::platform::data_dir().join("update_pins.json")
+}
+
+fn pin_key(rel: &ReleaseInfo) -> String {
+    format!("{}/{}", rel.tag, rel.asset_name)
+}
+
+fn load_pins() -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(pin_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// 摘要归一：去掉 `sha256:` 前缀、转小写。记录与比较必须用同一种形式。
+fn normalize_digest(digest: &str) -> String {
+    digest
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(digest.trim())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// 摘要与上次记录不一致 → 拒绝。首次见到该 tag/资产则放行。
+fn check_pin(rel: &ReleaseInfo, digest: &str) -> Result<(), String> {
+    let pins = load_pins();
+    let Some(known) = pins.get(&pin_key(rel)) else {
+        return Ok(());
+    };
+    let want = normalize_digest(digest);
+    if known.eq_ignore_ascii_case(&want) {
+        return Ok(());
+    }
+    Err(format!(
+        "同一版本 {} 的资产摘要与上次记录不一致（已记录 {known}，本次 {want}）。\
+         这类改动通常意味着发布账号被用于替换包；已停止更新，请到 Release 页面核对",
+        rel.tag
+    ))
+}
+
+/// 校验通过后记录摘要（幂等）。不可变发布无需记录。
+pub fn record_pin(rel: &ReleaseInfo) {
+    if rel.immutable {
+        return;
+    }
+    let Some(digest) = rel.asset_digest.as_deref() else {
+        return;
+    };
+    let key = pin_key(rel);
+    let mut pins = load_pins();
+    let value = normalize_digest(digest);
+    if pins.get(&key) == Some(&value) {
+        return;
+    }
+    pins.insert(key, value);
+    if let Ok(text) = serde_json::to_string_pretty(&pins) {
+        if let Err(e) = crate::api::model::write_secret_file(&pin_path(), text.as_bytes()) {
+            eprintln!("[update] 更新摘要未能记录：{e}");
+        }
     }
 }
 
@@ -495,11 +579,19 @@ mod tests {
         assert_eq!(exact.unwrap().name, "NekoSportsWorldTool-win-x64.zip");
         // 桌面产物必须精确匹配
         assert!(pick_asset(&mk(&["wrong.zip"]), "NekoSportsWorldTool-win-x64.zip").is_none());
-        // APK 模糊匹配：先精确、再 arm64、再任意 apk
+        // APK 匹配：先精确，再「同平台族」；不再退化到任意 .apk
         let apk = pick_asset(&mk(&["NekoSportsWorldTool-0.2.5-android.2-arm64.apk"]), "NekoSportsWorldTool-android-arm64.apk");
         assert_eq!(apk.unwrap().name, "NekoSportsWorldTool-0.2.5-android.2-arm64.apk");
-        let any = pick_asset(&mk(&["app-arm64.apk", "plain.apk"]), "NekoSportsWorldTool-android-arm64.apk");
-        assert_eq!(any.unwrap().name, "app-arm64.apk");
+        let fam = pick_asset(&mk(&["NekoSportsWorldTool-0.3.0-android-arm64.apk"]), "NekoSportsWorldTool-android-arm64.apk");
+        assert_eq!(fam.unwrap().name, "NekoSportsWorldTool-0.3.0-android-arm64.apk");
+        // 别的架构/变体的包不能被当成这台机器的产物
+        assert!(
+            pick_asset(&mk(&["app-arm64.apk", "plain.apk"]), "NekoSportsWorldTool-android-arm64.apk").is_none(),
+            "任意 .apk 兜底必须被移除"
+        );
+        assert!(
+            pick_asset(&mk(&["NekoSportsWorldTool-android-x86_64.apk"]), "NekoSportsWorldTool-android-arm64.apk").is_none()
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -551,6 +643,7 @@ mod tests {
             asset_url: "https://example.invalid/x".into(),
             asset_size: size,
             asset_digest: digest.map(|d| d.to_string()),
+            immutable: false,
         }
     }
 
@@ -571,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_size_mismatch_and_unverified_desktop_payloads() {
+    fn verify_rejects_size_mismatch_and_unverified_payloads() {
         let payload = b"BIN_CONTENT";
         let good = format!("sha256:{:x}", sha2::Sha256::digest(payload));
         assert!(verify(&release_fixture("a.zip", payload.len() as u64, Some(&good)), payload).is_ok());
@@ -580,8 +673,46 @@ mod tests {
         // 桌面包没有摘要 → 拒绝自动替换
         let err = verify(&release_fixture("a.zip", payload.len() as u64, None), payload).unwrap_err();
         assert!(err.contains("SHA-256"), "{err}");
-        // APK 没有摘要 → 交给系统签名校验兜底
-        assert!(verify(&release_fixture("a.apk", payload.len() as u64, None), payload).is_ok());
+        // APK 没有摘要同样拒绝：系统安装器只验签名，"签名对但内容不对"它拦不住
+        let err = verify(&release_fixture("a.apk", payload.len() as u64, None), payload).unwrap_err();
+        assert!(err.contains("SHA-256"), "{err}");
+        // 摘要与内容不符 → 拒绝
+        let bad = format!("sha256:{}{}", '0', &good[8..]);
+        assert!(verify(&release_fixture("a.apk", payload.len() as u64, Some(&bad)), payload).is_err());
+    }
+
+    /// 本机 pin：同一 tag/资产名的摘要被换掉时必须拒绝（账号被盗后替换老版本包）。
+    #[test]
+    fn tofupin_rejects_replaced_digest_for_same_tag() {
+        // pin 落盘走 platform::data_dir，测试期用独立临时目录，避免污染真实数据目录
+        let dir = std::env::temp_dir().join(format!(
+            "neko-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        crate::platform::TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = Some(dir.clone()));
+
+        let payload = b"BIN_CONTENT";
+        let good = format!("sha256:{:x}", sha2::Sha256::digest(payload));
+        let rel = release_fixture("a.zip", payload.len() as u64, Some(&good));
+        // 首次见到该 tag/资产 → 放行并且记账
+        assert!(check_pin(&rel, &good).is_ok());
+        record_pin(&rel);
+        assert!(check_pin(&rel, &good).is_ok(), "同一摘要第二次仍然通过");
+        // 换成另一份内容（模拟资产被替换）
+        let other = b"REPLACED";
+        let other_digest = format!("sha256:{:x}", sha2::Sha256::digest(other));
+        let err = check_pin(&rel, &other_digest).unwrap_err();
+        assert!(err.contains("不一致"), "{err}");
+        // 不影响别的 tag
+        let mut next = rel.clone();
+        next.tag = "v9.9.10".into();
+        assert!(check_pin(&next, &other_digest).is_ok());
+
+        crate::platform::TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(target_os = "android"))]

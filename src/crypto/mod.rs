@@ -3,4 +3,5 @@
 pub mod decrypt;
 pub mod envelope;
 pub mod header;
+pub mod local_seal;
 pub mod sign;
