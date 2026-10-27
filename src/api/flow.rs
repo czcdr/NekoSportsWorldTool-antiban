@@ -217,6 +217,23 @@ fn server_skew_ms(server_ts: i64) -> i64 {
     server_ms.saturating_sub(crate::crypto::envelope::now_ms())
 }
 
+/// A7：给「整分」的起点补上真随机的秒与毫秒（仍落在同一分钟内）。
+///
+/// `ui::run::specified_time` 产出的时刻秒与毫秒都是 0；不补的话 `startTime` 恒为
+/// 「秒 ∈ 0-4、ms = 0」，而它是 flag / beginTime / gainTime 的基准 —— 一次跑步几十个窗、
+/// 连点几次提交，整条时间轴都带着同一条机器痕迹。
+///
+/// - 只在**整分**（`ms % 60_000 == 0`）时补，也就是「指定时刻」模式：随机模式本来是
+///   均匀抽样、自带毫秒，再平移反而会破坏它与 7:00–20:00 窗口的对齐；
+/// - 增量 < 60s：分钟由用户选，不跨分钟/不跨日，`totalTime` 与 10s 窗口径都不受影响；
+/// - 用 `draw` 传入随机数，方便测试可复现。
+fn second_precision_start(base_ms: i64, draw: u32) -> i64 {
+    if base_ms.rem_euclid(60_000) != 0 {
+        return base_ms;
+    }
+    base_ms + (draw % 60_000) as i64
+}
+
 /// 跑步全链。
 pub fn run_full_flow(
     client: &mut ApiClient,
@@ -252,7 +269,17 @@ pub fn run_full_flow_cancellable(
     crate::safety::check_timezone(&safety, chrono::Local::now().offset().local_minus_utc())?;
     // 0-4 秒抖动先落定，再按**最终开始时间**占位：否则午夜边界会把额度记到
     // 前一天，而提交的轨迹落在后一天（关掉深夜拦截时就会真的错位）。
-    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
+    // A7（审计 medium）：指定时刻模式下 `run.rs::specified_time` 用 `with_ymd_and_hms(..., 0)`
+    // 把秒与毫秒都钉成 0，原来这里只补 `0..4` 秒 —— 于是 `startTime` 恒为「秒 ∈ 0-4、ms = 0」，
+    // 而它同时是每个点的 `flag`、每个窗的 `beginTime`、`gainTime` 的基准，整条时间轴
+    // 都带着这条机器痕迹（连续多次提交尤其明显）。
+    //
+    // 现在把秒与毫秒都取真随机，但仍**落在用户选的那一分钟内**（< 60s：不跨日、不改时长、
+    // 不动 10s 窗口径）。值在 `reserve_run` 之前落定：护栏看到的、写进轨迹与报文的是同一个
+    // `start_ms`，flag/beginTime/gainTime 全部由它派生，不各算各的。
+    //
+    // 随机模式的时刻本来就是均匀抽样（带毫秒），原样保留，不再二次平移。
+    let start_ms = second_precision_start(params.start_ms, rand::random::<u32>());
     let reservation = crate::safety::reserve_run(&safety, start_ms)?;
 
     // 出口与轨迹同城：策略 / 点位 / 提交 / OBS / 详情整条链路共用同一出口 IP。
@@ -659,9 +686,36 @@ mod verification_tests {
         ));
         assert_eq!(contradictory.complete, Some(false));
     }
+    /// A7：整分起点要补真随机的秒/毫秒，且不能跨分钟、不能动随机模式。
     #[test]
-    fn server_skew_handles_seconds_and_millis() {
-        let now = crate::crypto::envelope::now_ms();
+    fn specified_start_gets_real_seconds_and_millis() {
+        let minute = 1_792_730_760_000_i64; // 某个整分（= 29878846 * 60_000）
+        assert_eq!(minute % 60_000, 0, "样本必须是整分");
+        let draws: Vec<i64> = [0_u32, 7_321, 59_999, 30_000]
+            .iter()
+            .map(|d| second_precision_start(minute, *d))
+            .collect();
+        // ① 落在同一分钟内：分钟不变、仍属于这一分钟。
+        for value in &draws {
+            assert_eq!(value / 60_000, minute / 60_000, "跨分钟了：{value}");
+            assert!(*value >= minute && *value < minute + 60_000);
+        }
+        // ② 秒与毫秒都不再恒定 0。
+        assert!(draws.iter().any(|v| (v % 60_000) / 1000 != 0), "秒仍是 0");
+        assert!(draws.iter().any(|v| v % 1000 != 0), "毫秒仍是 0");
+        // ③ 不同抽样给出不同时刻（不是固定偏移）。
+        assert!(
+            draws.windows(2).any(|w| w[0] != w[1]),
+            "不同抽样得到相同起点：{draws:?}"
+        );
+
+        // ④ 随机模式（非整分）原样保留，避免破坏与 7:00–20:00 窗口的对齐。
+        let sampled = minute + 12_345;
+        assert_eq!(second_precision_start(sampled, 30_000), sampled);
+    }
+
+    #[test]
+    fn server_skew_handles_seconds_and_millis() {        let now = crate::crypto::envelope::now_ms();
         // 毫秒级
         let skew = server_skew_ms(now + 10_000);
         assert!((skew - 10_000).abs() <= 2, "毫秒单位换算有误: {skew}");
