@@ -68,6 +68,15 @@ pub struct SafetyPolicy {
     /// 默认 `false`：设备时区不是北京时间时直接拒绝发请求。只警告不拦会把
     /// 「今天/昨天」与深夜判定错开一天，也把补签的日期分桶弄歪。
     pub allow_timezone_mismatch: bool,
+    /// 同账号两次**成功提交**之间的最小间隔（秒）。
+    ///
+    /// A13（审计 low）：`daily_submits` 只把批量从 N 压到 2，两条之间只有流程里的
+    /// 1.5–5s `sleep_jitter` —— 「一次坐着补两天」的形态还在。这里加一道速率闸：
+    /// 默认 3 分钟，够把「连着补」变成「分几次来」。
+    ///
+    /// 与 `daily_*` 的 0 语义不同：这里 0 = **关闭**这道闸（它只是速率限制，不涉及
+    /// 计数正确性），不想等就显式写 0；不写则用默认 180s。
+    pub min_submit_interval_secs: u64,
 }
 
 impl Default for SafetyPolicy {
@@ -84,6 +93,8 @@ impl Default for SafetyPolicy {
             batch_per_day: 2,
             batch_max_records: 6,
             allow_timezone_mismatch: false,
+            // 3 分钟：比「同一分钟内连补两条」宽，又比「等一小时」实用。
+            min_submit_interval_secs: 180,
         }
     }
 }
@@ -139,6 +150,9 @@ struct DayCount {
 struct State {
     #[serde(default)]
     days: BTreeMap<String, DayCount>,
+    /// 上一次**被服务端接受**的跑步提交时刻（毫秒）。A13 的最小间隔闸用它。
+    #[serde(default)]
+    last_submit_ms: i64,
 }
 
 impl State {
@@ -288,10 +302,19 @@ pub struct RunReservation {
     now_day: String,
     committed: bool,
     enabled: bool,
+    /// A13：占位前记录的 `last_submit_ms`。没提交成功就还回去 —— 间隔闸只认
+    /// 「被服务端接受」的那一次，失败后的重试不该被自己的失败挡住。
+    previous_last_submit_ms: i64,
+    /// 本次占位的时刻；提交成功时写成新的 `last_submit_ms`。
+    now_ms: i64,
 }
 
 impl RunReservation {
     /// 提交已被服务端接受：保留这次计数。
+    ///
+    /// A13 的间隔基准 `last_submit_ms` 在**占位时**就写好了（同一次加锁写入），
+    /// 没提交成功由 `Drop` 还原成上一次成功的时刻 —— 这样既不额外多一次写盘
+    /// （会改变 `.bak` 的内容），也保证「失败后的立即重试」不被自己的失败挡住。
     pub fn commit(mut self) {
         self.committed = true;
     }
@@ -310,6 +333,8 @@ impl Drop for RunReservation {
             if let Some(day) = state.days.get_mut(&self.now_day) {
                 day.submits = day.submits.saturating_sub(1);
             }
+            // A13：本次没有提交成功 → 间隔基准恢复成上一次成功的时刻。
+            state.last_submit_ms = self.previous_last_submit_ms;
             Ok(())
         });
     }
@@ -339,6 +364,8 @@ fn reserve_run_at(
             now_day: String::new(),
             committed: false,
             enabled: false,
+            previous_last_submit_ms: 0,
+            now_ms,
         });
     }
     // 开始时间和提交时刻都要看：只改其中一个字段仍能绕过去。
@@ -357,7 +384,7 @@ fn reserve_run_at(
     let (day, _) = cst_parts(start_ms);
     let key = day.clone();
     let (now_day, _) = cst_parts(now_ms);
-    with_lock(root, |state| {
+    let previous_last_ms = with_lock(root, |state| {
         let submits = state.get(&now_day).submits;
         if submits >= policy.daily_submits {
             return Err(format!(
@@ -376,9 +403,32 @@ fn reserve_run_at(
                 policy.daily_runs
             ));
         }
+        // A13（审计 low）：两次提交之间的最小间隔。
+        //
+        // 放在每日配额之后：配额是更具体的原因（「今天已经跑过/交过」比「请等 3 分钟」
+        // 更能解释现状），应该先报。基准 `last_submit_ms` 在**占位时**写下，
+        // 没提交成功由 Drop 还原成上一次成功的时刻 —— 失败后的立即重试不受影响。
+        if policy.min_submit_interval_secs > 0 && state.last_submit_ms > 0 {
+            let need = (policy.min_submit_interval_secs as i64).saturating_mul(1000);
+            let elapsed = now_ms.saturating_sub(state.last_submit_ms);
+            if elapsed < need {
+                let wait = (need - elapsed + 999) / 1000;
+                return Err(format!(
+                    "安全护栏：距上次提交只过了 {}s，同一账号两次提交至少要隔 {}s（还差 {}s）。\n\
+                     短时间内连着提交、日期却各不相同，是「批量补签」最直接的形态。\n\
+                     确需提交：把 config.json 的 safety.min_submit_interval_secs 调小，或设 safety.enabled=false。",
+                    elapsed / 1000,
+                    policy.min_submit_interval_secs,
+                    wait
+                ));
+            }
+        }
+        let previous = state.last_submit_ms;
         state.bump(&key, |c| c.runs = c.runs.saturating_add(1));
         state.bump(&now_day, |c| c.submits = c.submits.saturating_add(1));
-        Ok(())
+        // A13：这次占位也算「刚刚提交过」；没成功的话由 Drop 还原成 previous。
+        state.last_submit_ms = now_ms;
+        Ok(previous)
     })?;
     Ok(RunReservation {
         root: root.to_path_buf(),
@@ -386,6 +436,8 @@ fn reserve_run_at(
         now_day,
         committed: false,
         enabled: true,
+        previous_last_submit_ms: previous_last_ms,
+        now_ms,
     })
 }
 
@@ -630,7 +682,12 @@ mod tests {
     /// 正是补签特征，所以记录日与提交日两套计数必须一起看。
     #[test]
     fn backfill_counts_per_record_day_but_caps_one_sitting() {
-        let p = SafetyPolicy::default();
+        // 本用例测的是「按记录日 / 提交日分桶」的语义；A13 的 3 分钟间隔闸会挡住
+        // 「同一分钟连续占位」，这里显式关掉（间隔闸另有专门用例）。
+        let p = SafetyPolicy {
+            min_submit_interval_secs: 0,
+            ..Default::default()
+        };
         let dir = tmp();
         let now = at(12);
         for days_ago in [3i64, 2] {
@@ -651,8 +708,10 @@ mod tests {
     /// 同一记录日的第二条仍受 `daily_runs` 约束（两条上限各管一层）。
     #[test]
     fn same_record_day_still_capped_by_daily_runs() {
+        // 只验证 daily_runs 的分桶；间隔闸（A13）在这里关掉，免得它比 daily_runs 先拦。
         let p = SafetyPolicy {
             daily_submits: 9,
+            min_submit_interval_secs: 0,
             ..SafetyPolicy::default()
         };
         let dir = tmp();
@@ -678,6 +737,63 @@ mod tests {
             "失败后应能重试"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A13：同账号两次提交之间的最小间隔闸。
+    ///
+    /// 三个行为都要成立：① 3 分钟内第二次被拒且说明还差多久；② 失败的提交不启动
+    /// 间隔（否则一次网络失败会把自己挡 3 分钟）；③ 时间过了就放行，配 0 则完全关闭。
+    #[test]
+    fn submissions_are_throttled_by_a_minimum_interval() {
+        let p = SafetyPolicy {
+            daily_runs: 9,
+            daily_submits: 9,
+            min_submit_interval_secs: 180,
+            ..Default::default()
+        };
+        let dir = tmp();
+        let now = at(12);
+        reserve_run_at(&dir, &p, now, now).unwrap().commit();
+
+        // ① 60 秒后再提交：拒绝，并说清还差多久。
+        let err =
+            reserve_run_at(&dir, &p, now + 60_000, now + 60_000).expect_err("间隔不足应当拒绝");
+        assert!(err.contains("至少要隔 180s"), "{err}");
+        assert!(err.contains("还差 120s"), "{err}");
+        assert!(
+            err.contains("min_submit_interval_secs"),
+            "要给出可操作出口：{err}"
+        );
+
+        // ② 失败的那次（不 commit）不启动间隔：紧接着重试应当放行。
+        {
+            let _failed = reserve_run_at(&dir, &p, now + 200_000, now + 200_000).unwrap();
+        }
+        assert!(
+            reserve_run_at(&dir, &p, now + 200_100, now + 200_100).is_ok(),
+            "失败的提交不该让自己被间隔闸挡住"
+        );
+
+        // ③ 过了间隔：放行。
+        let later = now + 181_000;
+        assert!(
+            reserve_run_at(&dir, &p, later, later).is_ok(),
+            "180s 后应放行"
+        );
+
+        // ④ 配 0 = 关闭这道闸（其余护栏不动）。
+        let off = SafetyPolicy {
+            min_submit_interval_secs: 0,
+            ..p.clone()
+        };
+        let dir2 = tmp();
+        reserve_run_at(&dir2, &off, now, now).unwrap().commit();
+        assert!(
+            reserve_run_at(&dir2, &off, now + 1_000, now + 1_000).is_ok(),
+            "min_submit_interval_secs=0 应当关闭间隔闸"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir2).unwrap();
     }
 
     /// 占位必须在锁内完成：第二次占位要看到第一次的计数，而不是同时读到 0。
@@ -720,7 +836,11 @@ mod tests {
     /// 崩溃留下的半截 JSON 应能靠 .bak 自动恢复，而不是永久拒绝提交。
     #[test]
     fn broken_state_recovers_from_backup() {
-        let p = SafetyPolicy::default();
+        // 本用例连写两次状态以生成 .bak；间隔闸（A13）会先拦住第二次，故关掉。
+        let p = SafetyPolicy {
+            min_submit_interval_secs: 0,
+            ..Default::default()
+        };
         let dir = tmp();
         let reservation = reserve_run_at(&dir, &p, day(2, 12), at(12)).unwrap();
         reservation.commit();
@@ -819,9 +939,10 @@ mod tests {
 
     #[test]
     fn state_keeps_only_recent_days() {
-        // 这里只验证保留窗口，不受提交日配额影响。
+        // 这里只验证保留窗口，不受提交日配额与 A13 间隔闸影响。
         let p = SafetyPolicy {
             daily_submits: 100,
+            min_submit_interval_secs: 0,
             ..SafetyPolicy::default()
         };
         let dir = tmp();
