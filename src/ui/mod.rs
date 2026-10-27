@@ -9,6 +9,7 @@
 
 pub mod about;
 pub mod ai;
+pub mod captcha;
 pub mod data;
 pub mod device;
 pub mod fonts;
@@ -25,6 +26,7 @@ pub mod run;
 pub mod theme;
 pub mod user;
 
+use crate::api::login::CaptchaMode;
 use crate::api::model::{self, Config, HeaderIdentity, Session};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender};
@@ -109,6 +111,13 @@ pub struct App {
     pub username: String,
     pub password: String,
     pub remember: bool,
+    /// 手动过码：后台登录线程 → 界面（挑战图）。
+    captcha_tx: Sender<captcha::CaptchaRequest>,
+    captcha_rx: Receiver<captcha::CaptchaRequest>,
+    /// 手动过码：界面这一侧的状态（待拖的图）。
+    pub captcha: captcha::CaptchaUi,
+    /// 后台线程催重绘用的上下文副本（`App::new` 里 clone 一份存起来）。
+    captcha_ctx: egui::Context,
     pub login_busy: bool,
     pub auth_expired: bool,
     pub run_busy: bool,
@@ -152,6 +161,8 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
+        // 先收挑战图：这一帧就要把它画出来（登录线程正阻塞等答案）。
+        self.poll_captcha();
         #[cfg(target_os = "android")]
         self.poll_device_info();
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
@@ -182,13 +193,18 @@ impl eframe::App for App {
                 self.popup = None;
             }
         }
+        // 过码弹窗最后画：它压在标签页与普通弹窗之上，且不管当前停在哪个页面
+        // 都要出现（登录线程可能是在任意页面上被点下去的）。
         self.draw_update_windows(ctx);
+        self.draw_captcha_window(ctx);
         crate::platform::sync_clipboard(ctx);
     }
 }
 
 impl App {
     fn draw_shell(&mut self, ctx: &egui::Context) {
+        // 过码方式被改过一次就记在这里，面板画完再落盘（面板内部只动内存值）。
+        let mut captcha_mode_changed: Option<CaptchaMode> = None;
         // ── 顶栏 ────────────────────────────────────────────────
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -235,6 +251,16 @@ impl App {
                             .id_salt("compact_account")
                             .max_height((ctx.screen_rect().height() * 0.3).min(200.0))
                             .show(ui, |ui| {
+                                // 过码方式放在折叠区最上面：手机上登录前就要能改，
+                                // 不动滚动条也看得见。
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(mode) = captcha::captcha_mode_selector(
+                                        ui,
+                                        &mut self.config.captcha_mode,
+                                    ) {
+                                        captcha_mode_changed = Some(mode);
+                                    }
+                                });
                                 ui.label(format!("设备：{}", self.identity.device_id));
                                 ui.add_space(4.0);
                                 ui.label("账号：");
@@ -298,6 +324,22 @@ impl App {
                             .clicked();
                         ui.end_row();
                     });
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(mode) =
+                        captcha::captcha_mode_selector(ui, &mut self.config.captcha_mode)
+                    {
+                        captcha_mode_changed = Some(mode);
+                    }
+                    if self.config.resolved_captcha_mode() == CaptchaMode::Manual {
+                        ui.colored_label(theme::text_dim(), "（登录时会弹窗，由你拖滑块）");
+                    }
+                });
+            }
+            if let Some(mode) = captcha_mode_changed {
+                // 选择器只改内存里的字符串；落盘 + 状态提示统一走这里，
+                // 这样桌面与手机两条布局的切换行为完全一致。
+                self.set_captcha_mode(mode);
             }
             if login_clicked {
                 if logged {
@@ -400,6 +442,7 @@ impl App {
         let remember = config.remember;
 
         let (auth_tx, auth_rx) = std::sync::mpsc::channel();
+        let (captcha_tx, captcha_rx) = std::sync::mpsc::channel();
         Self {
             #[cfg(test)]
             route_fixture: None,
@@ -419,6 +462,10 @@ impl App {
             username,
             password,
             remember,
+            captcha_tx,
+            captcha_rx,
+            captcha: captcha::CaptchaUi::default(),
+            captcha_ctx: ctx.clone(),
             login_busy: false,
             auth_expired: false,
             run_busy: false,

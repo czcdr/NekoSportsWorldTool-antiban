@@ -53,6 +53,12 @@ pub struct Config {
     pub password: String,
     #[serde(default)]
     pub remember: bool,
+    /// 过码方式：auto（自动识别缺口）/ manual（人工拖滑块）。
+    ///
+    /// 老配置里没有这个字段、或者值被手改坏（"hand2"、大小写混写）都按 auto ——
+    /// 认不出就当手动会让登录卡在「等界面拖动」，比自动识别错一次严重得多。
+    #[serde(default = "default_captcha_mode")]
+    pub captcha_mode: String,
     #[serde(default = "default_f32")]
     pub dist_min: f32,
     #[serde(default = "default_f32")]
@@ -91,6 +97,10 @@ fn default_route_mode() -> String {
     "legacy".into()
 }
 
+fn default_captcha_mode() -> String {
+    "auto".into()
+}
+
 fn default_f32() -> f32 {
     1.0
 }
@@ -117,6 +127,7 @@ impl Default for Config {
             username: String::new(),
             password: String::new(),
             remember: false,
+            captcha_mode: default_captcha_mode(),
             dist_min: 1.0,
             dist_max: 1.5,
             pace_min: default_pace_min(),
@@ -131,6 +142,16 @@ impl Default for Config {
             route_mode: default_route_mode(),
             safety: crate::safety::SafetyPolicy::default(),
         }
+    }
+}
+
+impl Config {
+    /// 过码方式（认不出的值按自动）。
+    ///
+    /// 收口在一处：界面选择、登录线程、加载归一都用它，避免三处各写一套
+    /// 大小写/别名规则、最后「界面显示手动、登录却按自动跑」。
+    pub fn resolved_captcha_mode(&self) -> crate::api::login::CaptchaMode {
+        crate::api::login::CaptchaMode::parse(&self.captcha_mode)
     }
 }
 
@@ -476,13 +497,17 @@ pub fn clear_session() {
 }
 
 pub fn load_config() -> Config {
-    match read_json::<serde_json::Value>("config.json") {
+    let mut config = match read_json::<serde_json::Value>("config.json") {
         Some(mut v) => {
             open_field(&mut v, "password", "password_sealed");
             deserialize_lenient(v, "config.json")
         }
         None => Config::default(),
-    }
+    };
+    // 认不出的过码方式当场归一成 "auto"：否则拼错的值会被原样写回磁盘，
+    // 每次启动都要重新解析一遍才变回自动，配置文件里也永远留着那个坏值。
+    config.captcha_mode = config.resolved_captcha_mode().as_str().to_string();
+    config
 }
 
 pub fn save_config(c: &Config) -> Result<(), String> {
@@ -687,6 +712,79 @@ mod storage_tests {
         clear_session();
         assert!(!directory.join("session.json").exists());
         assert_eq!(load_session().uid, 0);
+    }
+
+    /// 过码方式的落盘往返 + 老配置兼容。
+    ///
+    /// 三个失败形态各对应一次「用户以为设置生效了」的事故：
+    /// 缺字段时不能变成手动（会卡在等界面拖动）、写死的坏值不能原样留着、
+    /// 存下去的值重启后必须还在。
+    #[test]
+    fn captcha_mode_defaults_to_auto_and_survives_a_save_load_round_trip() {
+        let directory = std::env::temp_dir().join(format!("neko-captcha-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&directory);
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+
+        // 全新配置：自动。
+        assert_eq!(Config::default().captcha_mode, default_captcha_mode());
+        assert_eq!(
+            Config::default().resolved_captcha_mode(),
+            crate::api::login::CaptchaMode::Auto
+        );
+
+        // 手动落盘 → 读回还是手动（重启后保持）。
+        let manual = crate::api::login::CaptchaMode::Manual.as_str().to_string();
+        let config = Config {
+            captcha_mode: manual.clone(),
+            ..Config::default()
+        };
+        assert!(save_config(&config).is_ok());
+        assert_eq!(load_config().captcha_mode, manual);
+        assert_eq!(
+            load_config().resolved_captcha_mode(),
+            crate::api::login::CaptchaMode::Manual
+        );
+
+        // 老配置缺字段 / 值被手改坏：都按自动，并且加载时就把坏值归一。
+        for raw in [
+            r#"{"username":"alice","remember":true}"#,
+            r#"{"username":"alice","captcha_mode":"hand2"}"#,
+            r#"{"username":"alice","captcha_mode":""}"#,
+        ] {
+            assert!(std::fs::write(directory.join("config.json"), raw).is_ok());
+            let loaded = load_config();
+            assert_eq!(
+                loaded.captcha_mode,
+                default_captcha_mode(),
+                "raw={raw} 必须按自动处理"
+            );
+            assert_eq!(
+                loaded.resolved_captcha_mode(),
+                crate::api::login::CaptchaMode::Auto
+            );
+        }
+
+        // 逐字段探针式反序列化（load_config 的容错路径）里，这一个字段也必须
+        // 活下来：否则「切到手动」每次启动都会被丢掉、永远回落自动。
+        assert!(std::fs::write(
+            directory.join("config.json"),
+            r#"{"captcha_mode":"manual"}"#
+        )
+        .is_ok());
+        let loaded = load_config();
+        assert_eq!(loaded.captcha_mode, "manual");
+        assert_eq!(
+            loaded.resolved_captcha_mode(),
+            crate::api::login::CaptchaMode::Manual
+        );
     }
 
     #[test]

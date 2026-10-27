@@ -2,8 +2,9 @@
 
 use super::about::FinishAction;
 use super::{
-    App, PopupInfo, AI_DETAIL, AI_DONE, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE, POINTS_DONE,
-    RANK, RECORDS, RUN_DETAIL, RUN_DONE, SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
+    captcha, App, PopupInfo, AI_DETAIL, AI_DONE, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE,
+    POINTS_DONE, RANK, RECORDS, RUN_DETAIL, RUN_DONE, SEMESTER, UPDATE_CHK, UPDATE_DONE,
+    UPDATE_PROG, USER,
 };
 use crate::api::model;
 use chrono::TimeZone;
@@ -342,11 +343,14 @@ impl App {
                 self.refresh_ai_list();
                 self.refresh_points();
             } else {
-                self.status = format!(
-                    "登录失败：{}",
-                    val["message"].as_str().unwrap_or("未知错误")
-                );
+                // 取消验证码不是失败：文案由 captcha::failure_status 决定，
+                // 避免在这里再写一份「已取消验证码」的判断。
+                let message = val["message"].as_str().unwrap_or("未知错误");
+                self.status = captcha::failure_status(message);
             }
+            // 登录线程已经收工：任何还挂着的挑战图都不会再被回答，
+            // 留着它只会让用户面对一个点了没反应的弹窗。
+            self.captcha.abandon();
         }
         if let Some(v) = done_run {
             self.run_busy = false;
@@ -741,5 +745,53 @@ mod result_tests {
         assert!(second.contains("详情读取：失败"));
         assert!(second.contains("服务端达标判定：未知"));
         assert!(!second.contains("点位未经过"));
+    }
+}
+
+#[cfg(test)]
+mod login_done_tests {
+    use super::*;
+    use crate::api::model::{Config, HeaderIdentity, Session};
+
+    fn fixture_app() -> App {
+        let ctx = eframe::egui::Context::default();
+        App::from_state(
+            &ctx,
+            HeaderIdentity::default(),
+            Session::default(),
+            Config::default(),
+        )
+    }
+
+    fn deliver_login_done(app: &mut App, payload: serde_json::Value) {
+        assert!(app.tx.send(format!("{LOGIN_DONE}{payload}")).is_ok());
+        app.poll_messages();
+    }
+
+    /// 取消验证码走 LOGIN_DONE 的失败分支，但状态栏不能写成「登录失败」。
+    #[test]
+    fn cancelled_captcha_is_not_reported_as_a_login_failure() {
+        let mut app = fixture_app();
+        app.login_busy = true;
+        deliver_login_done(
+            &mut app,
+            serde_json::json!({"ok": false, "message": captcha::CANCELLED_STATUS}),
+        );
+        assert_eq!(app.status, captcha::CANCELLED_STATUS);
+        assert!(!app.login_busy, "取消后登录必须立刻结束");
+        assert!(app.session.is_none());
+    }
+
+    /// 普通失败仍然带「登录失败：」前缀（不能因为取消分支把失败话术也改掉）。
+    #[test]
+    fn ordinary_login_failure_keeps_the_failure_prefix() {
+        let mut app = fixture_app();
+        app.login_busy = true;
+        deliver_login_done(
+            &mut app,
+            serde_json::json!({"ok": false, "message": "账号或密码错误"}),
+        );
+        assert_eq!(app.status, "登录失败：账号或密码错误");
+        assert!(!app.login_busy);
     }
 }

@@ -4,6 +4,7 @@ use super::{
     App, AI_DETAIL, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE, RANK, RECORDS, RUN_DETAIL,
     SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
 };
+use crate::api::login::CaptchaMode;
 use crate::update::ReleaseInfo;
 
 impl App {
@@ -421,12 +422,39 @@ impl App {
         self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
         self.osm_page.busy = false;
         self.run_page.preview_cancel.cancel();
+        let captcha_mode = self.config.resolved_captcha_mode();
+        let captcha_ctx = self.captcha_ctx.clone();
+        let captcha_tx = self.captcha_tx.clone();
         self.login_busy = true;
-        self.status = format!("登录中（{username}）…");
+        self.status = match captcha_mode {
+            CaptchaMode::Manual => format!("登录中（{username}，手动过码）…"),
+            CaptchaMode::Auto => format!("登录中（{username}）…"),
+        };
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, None);
-            let msg = match crate::api::login::login(&mut client, &username, &password, &mut log) {
+            let outcome = match captcha_mode {
+                // 自动过码：走原来的 login(...)，请求序列与重试策略一个字节都不动。
+                CaptchaMode::Auto => {
+                    crate::api::login::login(&mut client, &username, &password, &mut log)
+                }
+                // 手动过码：界面回调就地构造 —— 它借的是本线程的 &mut，不能提前
+                // 造好放在 UI 线程上再搬进来。
+                CaptchaMode::Manual => {
+                    let mut solver = super::captcha::solver_for(captcha_ctx, captcha_tx);
+                    crate::api::login::login_with(
+                        &mut client,
+                        &username,
+                        &password,
+                        crate::api::login::LoginOptions {
+                            captcha: CaptchaMode::Manual,
+                            solver: Some(&mut solver),
+                        },
+                        &mut log,
+                    )
+                }
+            };
+            let msg = match outcome {
                 Ok(sess) => {
                     log(&format!(
                         "√ 登录成功 uid={} unid={} name={}",
@@ -445,7 +473,13 @@ impl App {
                     format!("{LOGIN_DONE}{payload}")
                 }
                 Err(e) => {
-                    log(&format!("× 登录失败: {e}"));
+                    // 用户自己按了「取消」：不是失败，日志里也不写成「登录失败」，
+                    // 状态栏由 msgs 的 LOGIN_DONE 分支单独处理。
+                    if super::captcha::is_cancelled(&e) {
+                        log("[login] 已取消验证码，本次登录结束");
+                    } else {
+                        log(&format!("× 登录失败: {e}"));
+                    }
                     format!(
                         "{LOGIN_DONE}{}",
                         serde_json::json!({"ok": false, "message": e})
