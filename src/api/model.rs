@@ -82,6 +82,9 @@ pub struct Config {
     /// 启动时检查更新：silent（静默，发现新版才弹窗）/ ask（每次询问）/ off
     #[serde(default = "default_update_check")]
     pub update_check: String,
+    /// 自定义 Overpass 端点（留空 = 用内置镜像列表，见 `school_roads::OVERPASS_MIRRORS`）。
+    #[serde(default)]
+    pub osm_endpoint: String,
     /// OSM 路网文件路径（真实道路路由用）。
     #[serde(default)]
     pub osm_path: String,
@@ -194,6 +197,7 @@ impl Default for Config {
             ai_minutes: default_ai_minutes(),
             ai_reps: default_ai_reps(),
             update_check: default_update_check(),
+            osm_endpoint: String::new(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
             safety: crate::safety::SafetyPolicy::default(),

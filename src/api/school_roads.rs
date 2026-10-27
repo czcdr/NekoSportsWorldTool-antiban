@@ -11,6 +11,101 @@ use std::{io::Read, path::Path, time::Duration};
 pub(crate) const MAX_BYTES: u64 = 24 * 1024 * 1024;
 const TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const ENDPOINT: &str = "https://overpass-api.de/api/interpreter";
+/// Overpass 公开镜像，按顺序回退。
+///
+/// 主站在不少网络下不可达（用户实测：`error sending request for url
+/// (https://overpass-api.de/api/interpreter)`），而路网拿不到就等于 Road/Tiles
+/// 全废。这里给三个常用实例，逐个试，全部失败才报错。
+pub const OVERPASS_MIRRORS: [&str; 3] = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+];
+/// 单个镜像的超时：25s 是 Overpass 对 [timeout:25] 查询的常见上限，再长就是干等。
+const MIRROR_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// 本次要试的端点顺序：自定义端点（非空）优先，其余按内置顺序，去重。
+pub fn endpoint_order(custom: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let custom = custom.trim();
+    if !custom.is_empty() {
+        out.push(custom.to_string());
+    }
+    for mirror in OVERPASS_MIRRORS {
+        if !out.iter().any(|e| e == mirror) {
+            out.push(mirror.to_string());
+        }
+    }
+    out
+}
+
+/// 配置里的自定义 Overpass 端点（空 = 用内置镜像）。
+fn custom_endpoint() -> String {
+    crate::api::model::load_config().osm_endpoint
+}
+
+/// 逐个镜像尝试，全部失败才报错。
+///
+/// `per_endpoint` 是可注入的单次请求（离线测试用假实现），`log` 写每个镜像的
+/// 结果与耗时 —— 用户的日志里就能看出是"某个镜像慢"还是"整片网络都不通"。
+pub fn download_with(
+    query: &str,
+    custom: &str,
+    per_endpoint: &mut dyn FnMut(&str, &str) -> Result<Vec<u8>, String>,
+    control: &dyn Fn() -> Result<(), String>,
+    log: &mut dyn FnMut(&str),
+) -> Result<Vec<u8>, String> {
+    let endpoints = endpoint_order(custom);
+    let mut failures: Vec<String> = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        control()?;
+        let host = endpoint
+            .split("//")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(endpoint);
+        if index > 0 {
+            log(&format!("[osm] 回退到第 {} 个镜像：{host}", index + 1));
+        }
+        let started = std::time::Instant::now();
+        match per_endpoint(endpoint, query) {
+            Ok(bytes) => {
+                log(&format!(
+                    "√ [osm] {host} 成功（{} ms，{} KiB）",
+                    started.elapsed().as_millis(),
+                    bytes.len() / 1024
+                ));
+                return Ok(bytes);
+            }
+            Err(error) => {
+                let elapsed = started.elapsed().as_millis();
+                eprintln!("[osm] 镜像 {host} 失败（{elapsed} ms）：{error}");
+                log(&format!("⚠ [osm] {host} 失败（{elapsed} ms）"));
+                failures.push(format!("{host}：{}", shorten(&error, 120)));
+            }
+        }
+    }
+    // 面向用户的文案只说人话：底层报错（error sending request for url (...)）对用户没有意义；
+    // 逐镜像结果与耗时已写进日志/eprintln，排查时看那里。
+    for failure in &failures {
+        eprintln!("[osm] 逐镜像结果：{failure}");
+    }
+    Err(format!(
+        "无法连接 OpenStreetMap 路网服务（已试 {} 个镜像）：可能是网络限制，\
+         可到「路网」页用『选择 OSM 文件』人工导入本地 .osm 文件，或稍后重试。\
+         各镜像的结果与耗时见日志。",
+        endpoints.len()
+    ))
+}
+
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
 
 pub fn validate_fences(fences: &[Vec<(f64, f64)>]) -> Result<(), String> {
     if fences.is_empty() {
@@ -105,13 +200,14 @@ fn parse(bytes: &[u8]) -> Result<RoadGraph, String> {
     Ok(net)
 }
 
-fn download(query: &str) -> Result<Vec<u8>, String> {
-    let agent = crate::http::Agent::with_timeout(Duration::from_secs(45));
+/// 向单个端点发一次 Overpass 查询（超时 25s，响应上限 24 MiB）。
+fn download_from(endpoint: &str, query: &str) -> Result<Vec<u8>, String> {
+    let agent = crate::http::Agent::with_timeout(MIRROR_TIMEOUT);
     let response = agent
-        .post(ENDPOINT)
+        .post(endpoint)
         .set("User-Agent", "NekoSportsWorldTool/0.3.0 (school-road-map)")
         .send_form(&[("data", query)])
-        .map_err(|e| format!("自动获取学校路网失败：{e}"))?;
+        .map_err(|e| format!("{e}"))?;
     let mut bytes = Vec::new();
     response
         .into_reader()
@@ -119,6 +215,16 @@ fn download(query: &str) -> Result<Vec<u8>, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| format!("读取学校路网失败：{e}"))?;
     Ok(bytes)
+}
+
+/// 按镜像顺序下载（自定义端点优先）。`control` 在每次尝试前检查，可取消。
+fn download_mirrors(
+    query: &str,
+    control: &dyn Fn() -> Result<(), String>,
+    log: &mut dyn FnMut(&str),
+) -> Result<Vec<u8>, String> {
+    let custom = custom_endpoint();
+    download_with(query, &custom, &mut download_from, control, log)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -142,10 +248,28 @@ fn cached_network(
     fences: &[Vec<(f64, f64)>],
     refresh: bool,
     now: i64,
-    fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+    fetch: impl FnOnce(&str, &mut dyn FnMut(&str)) -> Result<Vec<u8>, String>,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
     cached_route_network(dir, school, fences, &[], refresh, now, fetch, log)
+}
+
+/// 读缓存文件（**忽略 TTL**）：网络失败时用它兜底，返回（缓存岁数 ms, 路网）。
+///
+/// 只认 key 相同的缓存 —— 换学校/换围栏范围后旧缓存本来就不该用。
+fn stale_cache(file: &Path, key: &str, now: i64) -> Option<(i64, RoadGraph)> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let cache: Cache = serde_json::from_str(&text).ok()?;
+    if cache.key != key {
+        return None;
+    }
+    let net = parse(cache.xml.as_bytes()).ok()?;
+    let age = now - cache.loaded_ms;
+    if age < 0 {
+        // 缓存时间在「未来」（时钟回拨）：不能当可用数据。
+        return None;
+    }
+    Some((age, net))
 }
 
 fn cached_route_network(
@@ -155,7 +279,7 @@ fn cached_route_network(
     points: &[(f64, f64)],
     refresh: bool,
     now: i64,
-    fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+    fetch: impl FnOnce(&str, &mut dyn FnMut(&str)) -> Result<Vec<u8>, String>,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
     if school.trim().is_empty() {
@@ -185,7 +309,20 @@ fn cached_route_network(
         }
     }
     log("[road] 正在下载当前学校区域的 OpenStreetMap 路网…");
-    let bytes = fetch(&q)?;
+    // 缓存优先 + 镜像回退：网络失败时不丢弃可用数据，只提示「未刷新」。
+    let bytes = match fetch(&q, &mut *log) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if let Some((age_ms, cached)) = stale_cache(&file, &key, now) {
+                let hours = (age_ms as f64 / 3_600_000.0).max(0.1);
+                log(&format!(
+                    "⚠ [road] 本次未刷新，仍在使用 {hours:.1} 小时前的缓存路网（{error}）"
+                ));
+                return Ok(cached);
+            }
+            return Err(error);
+        }
+    };
     let net = parse(&bytes)?;
     // Reject empty in-school coverage before accepting a download into the cache.
     let mut aligned = net.clone();
@@ -361,9 +498,9 @@ pub fn load_for_school_cancellable(
         fences,
         refresh,
         crate::crypto::envelope::now_ms(),
-        |q| {
+        |q, log| {
             control.check()?;
-            let bytes = download(q)?;
+            let bytes = download_mirrors(q, &|| control.check(), log)?;
             control.check()?;
             Ok(bytes)
         },
@@ -394,9 +531,9 @@ pub fn load_for_route_cancellable(
         points,
         refresh,
         crate::crypto::envelope::now_ms(),
-        |q| {
+        |q, log| {
             control.check()?;
-            let bytes = download(q)?;
+            let bytes = download_mirrors(q, &|| control.check(), log)?;
             control.check()?;
             Ok(bytes)
         },
@@ -444,7 +581,7 @@ mod tests {
                     fences,
                     refresh,
                     now,
-                    |_| bytes.ok_or("offline".into()),
+                    |_, _| bytes.ok_or("offline".into()),
                     &mut |_| {},
                 )
             };
@@ -454,13 +591,139 @@ mod tests {
         let mut changed = f.clone();
         changed[0][0].0 -= 0.00001;
         assert!(get("a", &changed, false, 1001, None).is_err());
-        assert!(get("a", &f, false, 1000 + TTL_MS, None).is_err());
+        // 缓存优先：TTL 过了但网络失败 → 仍返回旧缓存（只提示「未刷新」）
+        assert!(get("a", &f, false, 1000 + TTL_MS, None).is_ok());
         assert!(get("a", &f, false, 999, None).is_err());
-        assert!(get("a", &f, true, 1001, None).is_err());
+        // 用户点「刷新」但网络失败：仍旧用缓存 + 提示「本次未刷新」（不清空可用数据）
+        assert!(get("a", &f, true, 1001, None).is_ok());
         assert!(get("a", &f, true, 1002, Some(xml)).is_ok());
         assert!(get("a", &f, false, 1002 + TTL_MS - 1, None).is_ok());
         assert!(parse(b"<osm></osm>").is_err());
         assert!(parse(b"<osm><remark>timeout</remark></osm>").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 镜像回退：按顺序试，成功即停；全部失败才报错，且文案是「人话」。
+    #[test]
+    fn mirrors_are_tried_in_order_and_all_failures_produce_a_human_message() {
+        // ① 前两个失败、第三个成功 → 依次访问三个端点，最终拿到数据
+        let mut visited = Vec::new();
+        let mut logs = Vec::new();
+        let mut per = |endpoint: &str, _q: &str| -> Result<Vec<u8>, String> {
+            visited.push(endpoint.to_string());
+            if endpoint.contains("overpass-api.de") {
+                Err("error sending request for url (…)".into())
+            } else if endpoint.contains("kumi") {
+                Err("connection reset".into())
+            } else {
+                Ok(b"<osm/>".to_vec())
+            }
+        };
+        let got = download_with("q", "", &mut per, &|| Ok(()), &mut |line: &str| {
+            logs.push(line.to_string())
+        })
+        .expect("第三个镜像应成功");
+        assert_eq!(got, b"<osm/>".to_vec());
+        assert_eq!(visited, OVERPASS_MIRRORS.to_vec(), "必须按内置顺序逐个试");
+        assert!(logs.iter().any(|l| l.contains("回退到第 2 个镜像")));
+        assert!(logs.iter().any(|l| l.contains("成功")));
+
+        // ② 全部失败 → 只报一次错，且说明试了几个镜像 + 给人工导入的出路
+        let mut visited = Vec::new();
+        let mut per = |endpoint: &str, _q: &str| -> Result<Vec<u8>, String> {
+            visited.push(endpoint.to_string());
+            Err("error sending request for url (…) ".to_string())
+        };
+        let err = download_with("q", "", &mut per, &|| Ok(()), &mut |_| {}).unwrap_err();
+        assert_eq!(visited.len(), OVERPASS_MIRRORS.len(), "每个镜像都要试一次");
+        assert!(err.contains("已试 3 个镜像"), "{err}");
+        assert!(err.contains("网络限制"), "{err}");
+        assert!(err.contains("人工导入"), "必须给下一步：{err}");
+        assert!(
+            !err.contains("error sending request for url ("),
+            "不要把底层报错原样抛给用户：{err}"
+        );
+
+        // ③ 取消：第一次尝试前就取消 → 立刻返回、一个请求都不发
+        let mut visited = 0usize;
+        let mut per = |_e: &str, _q: &str| -> Result<Vec<u8>, String> {
+            visited += 1;
+            Ok(vec![1u8; 1024])
+        };
+        let err =
+            download_with("q", "", &mut per, &|| Err("已取消".into()), &mut |_| {}).unwrap_err();
+        assert!(err.contains("已取消"), "{err}");
+        assert_eq!(visited, 0);
+    }
+
+    /// 自定义端点排在内置镜像之前。
+    #[test]
+    fn custom_endpoint_takes_priority() {
+        let order = endpoint_order("https://my.overpass.example/api/interpreter");
+        assert_eq!(order[0], "https://my.overpass.example/api/interpreter");
+        assert_eq!(order.len(), OVERPASS_MIRRORS.len() + 1);
+        assert_eq!(endpoint_order("  "), OVERPASS_MIRRORS.to_vec());
+        // 与内置重复时去重
+        let dedup = endpoint_order(OVERPASS_MIRRORS[1]);
+        assert_eq!(dedup.len(), OVERPASS_MIRRORS.len());
+
+        let mut visited = Vec::new();
+        let mut per = |endpoint: &str, _q: &str| -> Result<Vec<u8>, String> {
+            visited.push(endpoint.to_string());
+            Ok(vec![7u8; 1024])
+        };
+        download_with(
+            "q",
+            "https://my.overpass.example/api/interpreter",
+            &mut per,
+            &|| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            visited,
+            vec!["https://my.overpass.example/api/interpreter".to_string()],
+            "自定义端点成功就不该再试内置镜像"
+        );
+    }
+
+    /// 缓存优先：网络全挂时不清空可用数据，只提示「仍在用 X 小时前的缓存」。
+    #[test]
+    fn expired_cache_survives_a_total_network_failure_with_an_age_notice() {
+        let dir = std::env::temp_dir().join(format!("school-stale-{}", uuid::Uuid::new_v4()));
+        let (fences, xml) = fixture();
+        cached_network(
+            &dir,
+            "s",
+            &fences,
+            false,
+            1_000,
+            |_, _| Ok(xml.clone()),
+            &mut |_| {},
+        )
+        .unwrap();
+        // 8 天后（TTL 过期）用户点刷新，但网络全挂
+        let mut logs: Vec<String> = Vec::new();
+        let net = cached_network(
+            &dir,
+            "s",
+            &fences,
+            true,
+            1_000 + TTL_MS + 3_600_000,
+            |_, _| Err("无法连接 OpenStreetMap 路网服务（已试 3 个镜像）".into()),
+            &mut |line: &str| logs.push(line.to_string()),
+        )
+        .expect("有缓存时不该因为网络失败而报错");
+        assert!(net.graph.edge_count() > 0, "旧缓存必须仍然可用");
+        let notice = logs
+            .iter()
+            .find(|l| l.contains("未刷新"))
+            .unwrap_or_else(|| panic!("缺少『未刷新』提示：{logs:?}"));
+        assert!(notice.contains("小时前的缓存"), "{notice}");
+        assert!(
+            notice.contains("已试 3 个镜像"),
+            "要把失败原因带上：{notice}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -477,7 +740,7 @@ mod tests {
             &points,
             false,
             1000,
-            |q| {
+            |q, _log| {
                 assert!(q.contains("39.8980000,116.3980000,39.9030000,116.4030000"));
                 Ok(xml)
             },
@@ -500,14 +763,15 @@ mod tests {
                 pts,
                 false,
                 now,
-                |_| Err("offline".into()),
+                |_, _| Err("offline".into()),
                 &mut |_| {},
             )
         };
         assert!(cached("a", &points, 1001).is_ok());
         assert!(cached("b", &points, 1001).is_err());
         assert!(cached("a", &points[..1], 1001).is_err());
-        assert!(cached("a", &points, 1000 + TTL_MS).is_err());
+        // 缓存优先：TTL 过了但网络失败 → 仍返回旧缓存（只是提示「未刷新」）
+        assert!(cached("a", &points, 1000 + TTL_MS).is_ok());
         assert!(query_coordinates(&[], 0.002).is_err());
         assert!(query_coordinates(&[(f64::NAN, 116.4)], 0.002).is_err());
         assert!(query_coordinates(&[(39., 116.), (40., 116.)], 0.002).is_err());
@@ -544,7 +808,7 @@ mod tests {
             &fences,
             false,
             1000,
-            |_| Ok(xml),
+            |_, _| Ok(xml),
             &mut |_| {},
         )
         .unwrap();

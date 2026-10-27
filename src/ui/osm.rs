@@ -138,6 +138,20 @@ impl App {
             "https://www.openstreetmap.org/copyright",
         );
         ui.label("手动导入支持 OSM XML（.osm/.xml），无需登录；PBF/JSON 请先转换为 OSM XML。路线预览另需登录刷新策略和点位。");
+        // 网络不可达时的出路：自动下载走 Overpass 镜像，全挂了就用本地文件。
+        ui.colored_label(
+            theme::text_dim(),
+            "自动获取会依次尝试 3 个 Overpass 镜像；如果都被网络挡住，就用下面的「手动 OSM 文件」导入本地 .osm（免登录、离线可用）。\
+             也可以把自建/镜像端点填进 config.json 的 osm_endpoint，它会排在最前面。",
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Overpass 端点（可选）：");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.config.osm_endpoint)
+                    .hint_text("留空 = 内置镜像（overpass-api.de → kumi.systems → private.coffee）")
+                    .desired_width(340.0),
+            );
+        });
         ui.label("无学校围栏时也可沿道路闭环重复里程，但无法保证路线在校内；服务端仍按实际规则判定成绩。");
         ui.horizontal_wrapped(|ui| {
             ui.label("手动 OSM 文件：");
