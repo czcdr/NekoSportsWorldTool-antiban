@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "nekosportsworldtool"
-version = "0.6.0-antiban"
+version = "0.6.1-antiban"
 dependencies = [
  "aes",
  "android-activity",

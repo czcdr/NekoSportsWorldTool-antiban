@@ -2,7 +2,7 @@
 name = "nekosportsworldtool"
 # 与发布 tag / AndroidManifest 保持一致：桌面端 current_version() 用这个值
 # 与 Release tag 比较，停在 0.3.0 会让更新后的程序仍然提示"有新版本"。
-version = "0.6.0-antiban"
+version = "0.6.1-antiban"
 edition = "2021"
 description = "NekoSportsWorldTool：运动世界校园版协议自动化工具（GUI + CLI）"
 license = "CC-BY-NC-4.0"
