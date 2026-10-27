@@ -19,6 +19,20 @@ const PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// 用户取消验证码时后台线程回报的那句话（与 `Gt4Error::Cancelled` 的文案一致）。
 pub const CANCELLED_STATUS: &str = "已取消验证码";
+/// 登录线程已经不在时（panic / 退出）再点弹窗按钮要给的提示。
+pub const LOGIN_GONE_STATUS: &str = "登录线程已结束，请重新登录";
+
+/// 解码上限：GT4 的图只有几百像素宽，超过这个尺寸一定是坏数据或被换过的图。
+/// `max_alloc` 限的是解码期的分配（正常图不到 1 MB），32 MB 足够容错。
+const MAX_IMAGE_WIDTH: u32 = 4_096;
+const MAX_IMAGE_HEIGHT: u32 = 4_096;
+const MAX_IMAGE_ALLOC: u64 = 32 * 1024 * 1024;
+
+/// 弹窗里图片之外要占的高度：标题 + 说明 + 滑杆 + 微调行 + 按钮行 + 间距。
+/// 算缩放时要先把它从可用高度里扣掉，否则「图塞得下、按钮在屏外」。
+const CONTROLS_RESERVE: f32 = 150.0;
+/// 窗口与屏幕边缘之间留的余量（贴边 + 内边距）。
+const WINDOW_MARGIN: f32 = 32.0;
 
 /// 后台线程 → 界面：一张待拖的挑战图。
 pub struct CaptchaRequest {
@@ -122,9 +136,11 @@ fn await_answer(
                 ctx.request_repaint();
                 // 超时没人动就当放弃，别让登录线程一直挂着。
                 if started.elapsed() > patience {
-                    return ManualOutcome::Cancel;
+                    return ManualOutcome::Timeout;
                 }
             }
+            // 界面那边把请求丢了（App 退出 / 收尾清理）：没有人在看结果，
+            // 退回取消语义即可 —— 这条路本来就没有能被读到的文案。
             Err(RecvTimeoutError::Disconnected) => return ManualOutcome::Cancel,
         }
     }
@@ -145,6 +161,8 @@ pub struct PendingCaptcha {
     /// 第一次按下去的时刻 —— `passtime` 从这一刻起算。
     drag_started: Option<std::time::Instant>,
     decode_error: Option<String>,
+    /// 首帧是否已经清过输入焦点（只做一次，之后用户自己点哪儿就归哪儿）。
+    focus_cleared: bool,
 }
 
 /// 界面这一帧得出的动作。
@@ -163,6 +181,7 @@ impl PendingCaptcha {
             offset: 0.0,
             drag_started: None,
             decode_error: None,
+            focus_cleared: false,
         }
     }
 
@@ -227,12 +246,44 @@ pub fn failure_status(message: &str) -> String {
     }
 }
 
+/// 解码上限。`Limits` 是 `#[non_exhaustive]`，只能从 `default()` 起改。
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_WIDTH);
+    limits.max_image_height = Some(MAX_IMAGE_HEIGHT);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    limits
+}
+
+/// 图片在弹窗里的显示缩放：宽、高都要塞得下，且不放大（放大只会让像素对齐更难）。
+fn fit_scale(bg_w: f32, bg_h: f32, avail_w: f32, avail_h: f32) -> f32 {
+    if bg_w < 1.0 || bg_h < 1.0 {
+        // 尺寸读不出来（理论上不会：解码成功就有尺寸）—— 按原尺寸画，
+        // 别在这里除出 NaN 把一个还能看的弹窗整没。
+        return 1.0;
+    }
+    let by_w = avail_w.max(1.0) / bg_w;
+    let by_h = avail_h.max(1.0) / bg_h;
+    by_w.min(by_h).min(1.0)
+}
+
+/// 解码一张挑战图。
+///
+/// 走带上限的 reader：这张图来自服务端（中间人也够得着），`load_from_memory`
+/// 会在 UI 线程上无上限地按声明的尺寸分配。超限/坏图都落到 `decode_error`，
+/// 由弹窗给出「换一张 / 取消」两条出口。
 fn decode_texture(
     ctx: &egui::Context,
     name: &str,
     png: &[u8],
 ) -> Result<egui::TextureHandle, String> {
-    let image = image::load_from_memory(png)
+    // 只按 PNG 解：GT4 给的就是 PNG，让解码器自己猜格式等于把不可信字节
+    // 交给一串别的解码器。
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png);
+    reader.limits(decode_limits());
+    let image = reader
+        .decode()
         .map_err(|e| format!("图片解码失败：{e}"))?
         .to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
@@ -242,8 +293,18 @@ fn decode_texture(
 
 impl App {
     /// 收取后台线程送来的挑战图。
+    ///
+    /// `LOGIN_DONE` 与挑战图可能同时躺在队列里（弱网 + 切后台时最典型：
+    /// 后台线程 5 分钟超时后发了 LOGIN_DONE，回来第一帧 poll_messages 先把
+    /// 登录判死，紧接着这里又把那张已经没人会回答的图收成 pending）。
+    /// 收下就是给用户一个「拖完点提交没反应」的僵尸弹窗，所以只收登录还活着
+    /// 的请求；丢掉的请求随 responder 一起断开，后台线程那边立刻收到 Disconnected。
     pub(crate) fn poll_captcha(&mut self) {
         while let Ok(request) = self.captcha_rx.try_recv() {
+            if !self.login_busy {
+                drop(request);
+                continue;
+            }
             self.captcha.pending = Some(PendingCaptcha::new(request));
             self.status = "滑块验证：把方块拖进缺口，然后点「提交」".into();
         }
@@ -264,28 +325,52 @@ impl App {
         match action {
             None => self.captcha.pending = Some(pending),
             Some(Action::Cancel) => {
-                let _ = pending.request.responder.send(CaptchaAnswer::Cancel);
-                self.status = "已取消验证码".into();
+                self.send_answer(pending, CaptchaAnswer::Cancel, CANCELLED_STATUS.to_string());
             }
             Some(Action::Retry) => {
-                let _ = pending.request.responder.send(CaptchaAnswer::Retry);
-                self.status = "换一张图…".into();
+                self.send_answer(pending, CaptchaAnswer::Retry, "换一张图…".to_string());
             }
             Some(Action::Submit {
                 set_left,
                 passtime_ms,
             }) => {
-                let _ = pending.request.responder.send(CaptchaAnswer::Slide {
-                    set_left,
-                    passtime_ms,
-                });
-                self.status = format!("已提交滑块位置 {set_left}px，正在校验…");
+                self.send_answer(
+                    pending,
+                    CaptchaAnswer::Slide {
+                        set_left,
+                        passtime_ms,
+                    },
+                    format!("已提交滑块位置 {set_left}px，正在校验…"),
+                );
             }
         }
+    }
+
+    /// 把答案送回登录线程。
+    ///
+    /// 发送失败说明后台线程已经不在了（panic / 被退出）：这时还显示「正在校验…」
+    /// 就是在撒谎，而且登录按钮会永远灰着。改成明说登录线程已经结束。
+    fn send_answer(&mut self, pending: PendingCaptcha, answer: CaptchaAnswer, status: String) {
+        if pending.request.responder.send(answer).is_err() {
+            self.login_busy = false;
+            self.status = LOGIN_GONE_STATUS.into();
+            return;
+        }
+        self.status = status;
     }
 }
 
 fn draw_modal(ctx: &egui::Context, pending: &mut PendingCaptcha) -> Option<Action> {
+    if !pending.focus_cleared {
+        pending.focus_cleared = true;
+        // 弹窗打开时焦点往往还留在密码框里：拖动的第一下会被当成文本框点击，
+        // 手机上软键盘也不收（`adjustResize` 会把窗口压矮，把按钮挤出屏幕）。
+        // 注意不能 dispatch_focus 到弹窗自己的 id —— `surrender_focus` 只在传入的
+        // id 正好是当前焦点时才生效，所以这里清的是「当前焦点」。
+        if let Some(focused) = ctx.memory(|m| m.focused()) {
+            ctx.memory_mut(|m| m.surrender_focus(focused));
+        }
+    }
     if pending.bg.is_none() && pending.decode_error.is_none() {
         match decode_texture(ctx, "gt4-captcha-bg", &pending.request.bg_png) {
             Ok(texture) => pending.bg = Some(texture),
@@ -328,9 +413,12 @@ fn draw_modal(ctx: &egui::Context, pending: &mut PendingCaptcha) -> Option<Actio
 
             let bg_w = pending.request.bg_width as f32;
             let bg_h = pending.request.bg_height as f32;
-            let avail = ui.available_width().max(120.0);
-            // 不放大（放大只会让像素对齐更难），只按窗口宽度缩小。
-            let scale = (avail / bg_w).min(1.0);
+            let avail_w = ui.available_width().max(120.0);
+            // 高度也必须参与：窗口一矮（分屏、键盘顶起、桌面把窗口拉小）时，
+            // 只按宽度缩会把底部那行「提交/取消」裁到屏幕外 —— 那是唯一的逃生口。
+            // 不套 ScrollArea：图上是 Sense::drag，滚动会和拖动抢手势。
+            let avail_h = (ctx.screen_rect().height() - WINDOW_MARGIN - CONTROLS_RESERVE).max(80.0);
+            let scale = fit_scale(bg_w, bg_h, avail_w, avail_h);
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(bg_w * scale, bg_h * scale), egui::Sense::drag());
             let painter = ui.painter_at(rect);
@@ -476,6 +564,48 @@ mod tests {
             HeaderIdentity::default(),
             Session::default(),
             Config::default(),
+        )
+    }
+
+    /// 一张真 PNG：弹窗要能画出来，才能验「按钮在不在屏内」。
+    fn png_fixture(w: u32, h: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 120, 40, 255]));
+        let mut bytes = Vec::new();
+        let written = image::DynamicImage::ImageRgba8(image).write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        );
+        assert!(written.is_ok(), "测试用的 PNG 要能编码");
+        bytes
+    }
+
+    /// 把一张「真图」请求塞进队列并收进界面（调用方负责先置 login_busy）。
+    fn pending_with_png(app: &mut App, id: u64) -> Receiver<CaptchaAnswer> {
+        let (responder, answers) = std::sync::mpsc::channel();
+        let request = CaptchaRequest {
+            id,
+            bg_png: png_fixture(600, 300),
+            slice_png: png_fixture(100, 100),
+            bg_width: 600,
+            bg_height: 300,
+            slice_width: 100,
+            slice_height: 100,
+            ypos: 120,
+            max_offset: 500,
+            responder,
+        };
+        assert!(app.captcha_tx.clone().send(request).is_ok());
+        app.poll_captcha();
+        answers
+    }
+
+    fn run_modal_frame(app: &mut App, ctx: &egui::Context, w: f32, h: f32) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
+                ..Default::default()
+            },
+            |ctx| app.draw_captcha_window(ctx),
         )
     }
 
@@ -640,9 +770,10 @@ mod tests {
         );
     }
 
-    /// 没人动：等满耐心值就放弃（不让登录线程永远挂着）。
+    /// 没人动：等满耐心值就放弃（不让登录线程永远挂着），并且要能和
+    /// 「用户自己点了取消」区分开 —— 否则状态栏会冤枉用户误触。
     #[test]
-    fn unanswered_challenge_gives_up_after_patience() {
+    fn unanswered_challenge_times_out_distinctly_from_cancel() {
         let (tx, requests) = std::sync::mpsc::channel::<CaptchaRequest>();
         let (responder, answers) = std::sync::mpsc::channel();
         let request = fixture_request(responder, 250);
@@ -660,7 +791,10 @@ mod tests {
             std::time::Duration::from_millis(10),
         );
         let _ = ui.join();
-        assert!(matches!(outcome, ManualOutcome::Cancel));
+        assert!(
+            matches!(outcome, ManualOutcome::Timeout),
+            "等待超时必须和取消区分开，实际 {outcome:?}"
+        );
     }
 
     /// 登录线程收工后，界面不能留着一个永远等不到答案的弹窗。
@@ -668,6 +802,7 @@ mod tests {
     fn pending_challenge_is_dropped_when_the_login_thread_ends() {
         let ctx = egui::Context::default();
         let mut app = fixture_app(&ctx);
+        app.login_busy = true;
         let (responder, answers) = std::sync::mpsc::channel();
         assert!(app
             .captcha_tx
@@ -685,7 +820,163 @@ mod tests {
             .is_err());
     }
 
-    /// 「取消」不是失败：状态栏不能出现「登录失败：」。
+    /// R1：登录已经判死之后才到的挑战图必须丢弃，不能再弹出一个
+    /// 「拖完点提交没反应」的僵尸弹窗。
+    #[test]
+    fn stale_challenge_is_dropped_after_the_login_ended() {
+        let ctx = egui::Context::default();
+        let mut app = fixture_app(&ctx);
+        let (responder, answers) = std::sync::mpsc::channel();
+        assert!(app
+            .captcha_tx
+            .clone()
+            .send(fixture_request(responder, 250))
+            .is_ok());
+        // 后台线程已经收工（超时/失败/取消），LOGIN_DONE 已把 login_busy 放下。
+        app.login_busy = false;
+        app.poll_captcha();
+        assert!(
+            app.captcha.pending.is_none(),
+            "登录已结束，这张图没人会回答，不能收成 pending"
+        );
+        // 丢掉请求的同时 responder 断开，后台线程不会挂在那儿等。
+        assert!(answers
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+    }
+
+    /// R6：后台线程已经不在了（panic/退出）时点弹窗按钮，不能装作「正在校验」。
+    #[test]
+    fn dead_login_thread_is_reported_instead_of_stuck_in_checking() {
+        let ctx = egui::Context::default();
+        let mut app = fixture_app(&ctx);
+        app.login_busy = true;
+        let (responder, answers) = std::sync::mpsc::channel();
+        assert!(app
+            .captcha_tx
+            .clone()
+            .send(fixture_request(responder, 250))
+            .is_ok());
+        app.poll_captcha();
+        let Some(pending) = app.captcha.pending.take() else {
+            assert!(false, "请求要能被界面收下");
+            return;
+        };
+        // 登录线程没了：接收端随栈解开被丢掉。
+        drop(answers);
+        app.send_answer(pending, CaptchaAnswer::Cancel, CANCELLED_STATUS.to_string());
+        assert!(!app.login_busy, "登录线程已结束就必须放开登录按钮");
+        assert_eq!(app.status, LOGIN_GONE_STATUS);
+    }
+
+    /// R8：弹窗首帧要把输入焦点从密码框上拿走（否则手机上软键盘不收，
+    /// 拖动的第一下也落在文本框里）。
+    #[test]
+    fn opening_the_modal_releases_input_focus() {
+        let ctx = egui::Context::default();
+        let mut app = fixture_app(&ctx);
+        app.login_busy = true;
+        let field = egui::Id::new("login_password");
+        ctx.memory_mut(|m| m.request_focus(field));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(field), "先造出焦点");
+        let (responder, _answers) = std::sync::mpsc::channel();
+        assert!(app
+            .captcha_tx
+            .clone()
+            .send(fixture_request(responder, 250))
+            .is_ok());
+        app.poll_captcha();
+        let _ = run_modal_frame(&mut app, &ctx, 900.0, 700.0);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "弹窗打开时必须让出焦点");
+    }
+
+    /// R4：窗口再矮也要够得着三个按钮（取消是唯一逃生口）。
+    #[test]
+    fn challenge_modal_keeps_every_button_on_screen() {
+        for (w, h) in [(640.0f32, 360.0f32), (360.0, 640.0)] {
+            let ctx = egui::Context::default();
+            let mut app = fixture_app(&ctx);
+            app.login_busy = true;
+            let _answers = pending_with_png(&mut app, 11);
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+            let mut output = run_modal_frame(&mut app, &ctx, w, h);
+            // 窗口要一两帧才摆到居中位置。
+            for _ in 0..3 {
+                output = run_modal_frame(&mut app, &ctx, w, h);
+            }
+            for label in ["提交验证", "换一张", "取消"] {
+                let Some(at) = label_position(&output, label) else {
+                    assert!(false, "{w}x{h} 下「{label}」必须画得出来（不被裁掉）");
+                    continue;
+                };
+                assert!(
+                    screen.contains(at),
+                    "{w}x{h} 下「{label}」跑到屏幕外了：{at:?}"
+                );
+            }
+        }
+    }
+
+    /// R4 的缩放规则本身：宽、高都要满足，且永不放大。
+    #[test]
+    fn scale_respects_both_axes_and_never_upscales() {
+        // 宽受限
+        assert!((fit_scale(600.0, 300.0, 300.0, 1_000.0) - 0.5).abs() < 1e-6);
+        // 高受限（正是 R4 的回归点：只除宽会让底部按钮出屏）
+        assert!((fit_scale(600.0, 300.0, 1_000.0, 150.0) - 0.5).abs() < 1e-6);
+        // 都不放大
+        assert!((fit_scale(100.0, 100.0, 1_000.0, 1_000.0) - 1.0).abs() < 1e-6);
+        // 尺寸坏掉时不产生 NaN（会整块画不出来）
+        assert!(fit_scale(0.0, 0.0, 500.0, 500.0).is_finite());
+        assert!(fit_scale(600.0, 0.0, 500.0, 500.0).is_finite());
+    }
+
+    /// R5：解码有上限；坏图走 decode_error → 弹窗给「换一张/取消」的出口。
+    #[test]
+    fn decoding_is_bounded_and_failures_land_in_the_retry_exit() {
+        let ctx = egui::Context::default();
+        let limits = decode_limits();
+        assert_eq!(limits.max_image_width, Some(MAX_IMAGE_WIDTH));
+        assert_eq!(limits.max_image_height, Some(MAX_IMAGE_HEIGHT));
+        assert_eq!(limits.max_alloc, Some(32 * 1024 * 1024));
+
+        // 正常尺寸能解。
+        assert!(decode_texture(&ctx, "t-small", &png_fixture(64, 32)).is_ok());
+        // 超宽（> MAX_IMAGE_WIDTH）必须拒绝，而不是照尺寸分配。
+        assert!(
+            decode_texture(&ctx, "t-wide", &png_fixture(MAX_IMAGE_WIDTH + 16, 8)).is_err(),
+            "超过解码宽度上限的图必须被拒绝"
+        );
+        // 不是 PNG 的字节同样拒绝。
+        assert!(decode_texture(&ctx, "t-garbage", &[0x89, b'P', b'N', b'G', 0, 1, 2]).is_err());
+
+        // 坏图进弹窗：落到 decode_error，而不是卡在「正在解码图片…」。
+        let mut app = fixture_app(&ctx);
+        app.login_busy = true;
+        let (responder, _answers) = std::sync::mpsc::channel();
+        assert!(app
+            .captcha_tx
+            .clone()
+            .send(fixture_request(responder, 250))
+            .is_ok());
+        app.poll_captcha();
+        // 窗口要一两帧才知道自己的尺寸（首帧的位置判定用的是上一帧的矩形）。
+        let mut output = run_modal_frame(&mut app, &ctx, 640.0, 480.0);
+        for _ in 0..3 {
+            output = run_modal_frame(&mut app, &ctx, 640.0, 480.0);
+        }
+        let error = app
+            .captcha
+            .pending
+            .as_ref()
+            .and_then(|p| p.decode_error.clone());
+        assert!(error.is_some(), "坏图必须落到 decode_error 分支");
+        // 该分支的两个出口都在屏上。
+        assert!(label_position(&output, "换一张").is_some());
+        assert!(label_position(&output, "取消").is_some());
+    }
+
+    /// 「取消」不是失败：状态栏不能出现「登录失败：」，超时也不能被当成取消。
     #[test]
     fn cancel_status_never_reads_as_a_login_failure() {
         assert_eq!(failure_status(CANCELLED_STATUS), CANCELLED_STATUS);
@@ -693,6 +984,11 @@ mod tests {
         assert!(!is_cancelled("验证码校验未通过"));
         assert_eq!(failure_status("账号或密码错误"), "登录失败：账号或密码错误");
         assert!(!failure_status("账号或密码错误").starts_with(CANCELLED_STATUS));
+        // R3：等待超时不是「用户取消」，必须说真实原因。
+        let timeout = "验证码未能完成：验证码等待超时（5 分钟未操作）";
+        assert!(!is_cancelled(timeout), "超时不能被当成取消");
+        assert!(failure_status(timeout).contains("等待超时"));
+        assert!(!failure_status(timeout).contains(CANCELLED_STATUS));
     }
 
     /// 落盘失败（本地加密不可用 → save_config 拒绝写明文）时不能显示「已保存」。

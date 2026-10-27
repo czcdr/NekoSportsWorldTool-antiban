@@ -205,3 +205,36 @@ UI 线程 (egui)                              登录线程 (spawn_job)
 - 弹窗里的图片按窗口宽度等比缩小（不放大），像素级对齐靠 `±1px` 与像素读数；未做缩放级别的
   子像素对齐（真机是 1:1 显示，当前实现放大率上限 1.0）。
 - 手动过码仍受 `captcha_guard` 的**既有**冷却约束（那是 `login.rs` 定稿行为，本任务不改）。
+
+---
+
+## 10. 第 2 轮修复（t3 评审 R1–R8）
+
+评审结论是 `needs_revision`；本轮逐条处理。除 R1/R2 的实质修复外都是小改。
+
+| # | 结论 | 落点 |
+|---|---|---|
+| R1 僵尸弹窗 | **已修**：`poll_captcha` 只收「登录还活着」的请求，`if !self.login_busy { drop(request); continue; }`；丢弃即断开 responder，后台线程立刻收手 | `src/ui/captcha.rs::poll_captcha`；回归用例 `stale_challenge_is_dropped_after_the_login_ended` |
+| R2 无节流 | **已修**：① 每轮 `load_challenge` 前 `sleep(200–600ms)` 随机抖动（换一张不再零间隔）；② 3 轮耗尽后记一次 `captcha_guard::record_rejection()`（单张拖歪走 `continue`，到不了这里） | `src/api/gt4.rs::solve_gt4_manual`（**只动这一个函数 + `ManualOutcome` 加一个变体**，`solve_once`/`solve_gt4`/`load_challenge`/`submit_challenge` 零改动，见 §11） |
+| R3 原因被吞 | **已修**：新增 `ManualOutcome::Timeout`，映射成 `Unreliable("验证码等待超时（5 分钟未操作）")`；状态栏显示「登录失败：验证码未能完成：验证码等待超时（5 分钟未操作）」，日志不再写「已取消」；`is_cancelled` 只认「已取消验证码」 | `gt4.rs` + `captcha.rs::await_answer`；用例 `unanswered_challenge_times_out_distinctly_from_cancel`、`cancel_status_never_reads_as_a_login_failure`（超时不算取消） |
+| R4 矮窗够不到按钮 | **已修**：`fit_scale()` 双轴取缩放 `min(avail_w/bg_w, avail_h/bg_h, 1.0)`，`avail_h = 屏高 - 32(边距) - 150(控件预留)`；**没有**套 `ScrollArea`（会和 `Sense::drag` 抢手势） | `captcha.rs::{fit_scale, CONTROLS_RESERVE, WINDOW_MARGIN}`；用例 `challenge_modal_keeps_every_button_on_screen`（640×360 与 360×640 下「提交验证/换一张/取消」都在屏内）、`scale_respects_both_axes_and_never_upscales` |
+| R5 无上限解码 | **已修**：`image::ImageReader::with_format(Png)` + `limits(Limits{ max_image_width/height: 4096, max_alloc: 32MiB })`（该版本的上限接口是 `limits()`，`Reader::with_limits` 不存在），超限/坏图落到 `decode_error` →「换一张 / 取消」 | `captcha.rs::{decode_limits, decode_texture}`；用例 `decoding_is_bounded_and_failures_land_in_the_retry_exit`（>4096 宽的图被拒、坏字节被拒、弹窗给出两个出口） |
+| R6 线程 panic 后按钮静默失效 | **已修（前半）**：三处 `send` 收敛成 `App::send_answer`，失败时 `login_busy=false` + 状态「登录线程已结束，请重新登录」。**未做** `spawn_job` 的 `catch_unwind`：`src/ui/jobs.rs` 本轮不在 inScope，且补发失败消息需要每种 job 自己的协议（另开一轮） | `captcha.rs::send_answer`；用例 `dead_login_thread_is_reported_instead_of_stuck_in_checking` |
+| R7 成功分支不 `abandon` | **已满足**（无需改）：`abandon()` 原本就在 `LOGIN_DONE` 的 `if/else` 之外（成功与失败都走），R1 的 guard 再覆盖一层 | `src/ui/msgs.rs` 现状 + 用例 `pending_challenge_is_dropped_when_the_login_thread_ends` |
+| R8 不释放输入焦点 | **已修**：弹窗首帧清掉「当前焦点」（`surrender_focus(当前焦点 id)`；对弹窗自己的 id 调用是空操作，因为它并不是焦点持有者） | `captcha.rs::draw_modal`（`focus_cleared` 只做一次）；用例 `opening_the_modal_releases_input_focus` |
+
+## 11. 第 2 轮对 `src/api/gt4.rs` 的改动边界（自查用）
+
+```
+git diff 94de1f0..HEAD -- src/api/gt4.rs
+```
+
+只应有 5 个 hunk，且全部落在两处：
+
+1. `pub enum ManualOutcome` —— 新增 `Timeout` 变体（R3 需要后台线程能区分「超时」与「用户取消」；
+   若只靠 UI 侧计时，App 在后台不渲染帧时根本追不上后台线程的超时，原因仍会被吞）。
+2-5. `solve_gt4_manual`（含其文档注释）—— 抖动、`Timeout` 分支、三张全废后的 `record_rejection`。
+
+`solve_once` / `solve_gt4` / `load_challenge` / `submit_challenge` **一个字节都没动**
+（上面 5 个 hunk 的上下文行都不落在它们体内），自动路径仍与 `94de1f0` 一致。
+

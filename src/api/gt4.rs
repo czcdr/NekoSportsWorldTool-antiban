@@ -294,6 +294,12 @@ pub enum ManualOutcome {
     Retry,
     /// 用户取消本次登录。
     Cancel,
+    /// 界面等满了耐心值也没等到操作（人走开了）。
+    ///
+    /// 与 `Cancel` 必须分开：两者都会结束这次登录，但「你自己点了取消」和
+    /// 「5 分钟没人动」是两件不同的事，混成一句话会让用户以为自己误触了，
+    /// 排障时也拿不到线索。
+    Timeout,
 }
 
 /// 手动过码的界面回调。
@@ -446,7 +452,10 @@ fn submit_challenge(
 /// 手动过码：把每张图交给 `solver`，用户拖完再交卷。
 ///
 /// 与自动模式的差别只在「怎么得到 set_left」：拖动由人完成，所以
-/// - 拖动没对上（极验判错）不触发验证码冷却，换一张图再拖（最多 3 张）；
+/// - 单张拖歪（极验判错）不触发验证码冷却，换一张图再拖（最多 3 张）；
+/// - 3 张全部失败才算「反复整轮失败」，这时才记一次 `record_rejection`：
+///   冷却的用意是拦住「过不去就连点登录」的人，而连点每一次都会再拿 3 张图，
+///   不记账就等于把唯一的客户端节流整段绕开；
 /// - 用户取消立刻返回 `Cancelled`，一个额外请求都不发。
 pub fn solve_gt4_manual(
     captcha_id: &str,
@@ -456,6 +465,11 @@ pub fn solve_gt4_manual(
 ) -> Result<Value, Gt4Error> {
     let mut last: Option<Gt4Error> = None;
     for round in 1..=3u32 {
+        // 每轮取图前抖一下：自动路径在取图后有 0.9–1.9s 的「看图」时间，
+        // 手动路径的「换一张」如果零间隔，两次 /load 之间就只剩网络 RTT，
+        // 一串固定节奏的请求本身就是脚本证据。
+        let jitter = rand::thread_rng().gen_range(200u64..=600);
+        std::thread::sleep(std::time::Duration::from_millis(jitter));
         let challenge = load_challenge(captcha_id, client, log)?;
         log(&format!(
             "[gt4] 手动过码：第 {round}/3 张图（{}x{}，可移动 0..={}），请拖动",
@@ -468,6 +482,12 @@ pub fn solve_gt4_manual(
             match solver.solve(&challenge) {
                 ManualOutcome::Cancel => {
                     return Err(Gt4Error::Cancelled("已取消验证码".into()));
+                }
+                // 等待超时不是「用户取消」：文案要说出真实原因，也不能进冷却。
+                ManualOutcome::Timeout => {
+                    return Err(Gt4Error::Unreliable(
+                        "验证码等待超时（5 分钟未操作）".into(),
+                    ));
                 }
                 ManualOutcome::Retry => {
                     log("[gt4] 按要求换一张图");
@@ -509,7 +529,14 @@ pub fn solve_gt4_manual(
             }
         }
     }
-    Err(last.unwrap_or_else(|| Gt4Error::Fatal("GT4 未执行".into())))
+    let last = last.unwrap_or_else(|| Gt4Error::Fatal("GT4 未执行".into()));
+    // 三张全废：这才叫「反复失败」，记一次判错 —— 连点登录每次都会再拿 3 张图，
+    // 不记账就等于把唯一的客户端节流整段绕开。单张拖歪走的是上面的 continue，
+    // 到不了这里，所以「拖歪一次不锁十分钟」的原意没变；取图阶段的网络失败
+    // 更是在 `load_challenge(...)?` 就返回了，同样到不了这行。
+    log("[gt4] 本次手动过码三张图未通过，记一次判错（反复整轮失败会升级为冷却）");
+    let _ = super::captcha_guard::record_rejection();
+    Err(last)
 }
 
 fn solve_once(
