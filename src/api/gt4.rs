@@ -46,18 +46,25 @@ pub enum Gt4Error {
     Unreliable(String),
     Rejected(String),
     Fatal(String),
+    /// 用户主动取消（只在手动过码里出现）。既不是判错，也不该进验证码冷却。
+    Cancelled(String),
 }
 
 impl Gt4Error {
     pub fn message(&self) -> &str {
         match self {
-            Self::Unreliable(m) | Self::Rejected(m) | Self::Fatal(m) => m,
+            Self::Unreliable(m) | Self::Rejected(m) | Self::Fatal(m) | Self::Cancelled(m) => m,
         }
     }
 
     /// 是否值得换一张图再试一次。
     pub fn retryable(&self) -> bool {
-        !matches!(self, Self::Rejected(_))
+        matches!(self, Self::Unreliable(_) | Self::Fatal(_))
+    }
+
+    /// 是否属于「用户自己停下的」，调用方据此决定要不要进冷却。
+    pub fn cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
     }
 }
 
@@ -192,12 +199,14 @@ fn jsonp_value(text: &str) -> Result<Value, String> {
     serde_json::from_str(&text[start + 1..end]).map_err(|e| format!("JSONP JSON 解析失败: {e}"))
 }
 
-/// 完整 GT4 求解。返回 {lotNumber, captchaOutput, passToken, genTime}。
+/// 完整 GT4 求解（自动过码）。返回 {lotNumber, captchaOutput, passToken, genTime}。
 ///
 /// 重试策略按**失败原因**分域（实测同一出口连错会把极验对该会话的容忍度打掉：
 /// 12 轮里 11 对 → 之后 2/16、0/8）：
 /// - 图没认准 / 网络抖动：最多 2 张图，间隔 3–6s；
 /// - 极验明确判错：立刻停手，不重试（重试只是再确认一次「客户端不会动」）。
+///
+/// 手动过码走 [`solve_gt4_manual`]，两者共用 `load_challenge` / `submit_challenge`。
 pub fn solve_gt4(
     captcha_id: &str,
     client: &mut super::client::ApiClient,
@@ -240,12 +249,67 @@ fn parse_ypos(value: &Value) -> Option<usize> {
         .map(|v| v as usize)
 }
 
-fn solve_once(
+/// 一张已经下载好的 GT4 挑战图。
+///
+/// 自动过码自己认缺口，手动过码把这份内容交给界面让人拖 —— 两条路之后的
+/// `w` 计算与 `/verify` 完全共用同一份代码，避免两套实现各错一处。
+pub struct Gt4Challenge {
+    pub captcha_id: String,
+    pub lot_number: String,
+    payload: String,
+    process_token: String,
+    pow_detail: Value,
+    /// 背景图 PNG 原始字节（界面直接解码显示）。
+    pub bg_png: Vec<u8>,
+    /// 缺口切片 PNG 原始字节。
+    pub slice_png: Vec<u8>,
+    pub bg_width: usize,
+    pub bg_height: usize,
+    pub slice_width: usize,
+    pub slice_height: usize,
+    /// `/load` 给的切片纵向位置（背景图坐标）；服务端没给时为 None。
+    pub ypos: Option<usize>,
+    /// 取图时刻，用于把「看图 + 拖动」的真实耗时算进 `passtime`。
+    started: std::time::Instant,
+}
+
+impl Gt4Challenge {
+    /// 切片在背景图上可移动的最大横向位移（图像像素）。
+    pub fn max_offset(&self) -> usize {
+        self.bg_width.saturating_sub(self.slice_width)
+    }
+
+    /// 从取到图到现在过了多少毫秒。
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
+/// 手动过码的结果。
+#[derive(Debug, Clone, Copy)]
+pub enum ManualOutcome {
+    /// 用户拖完了：`set_left` 为切片左缘在背景图上的像素位置。
+    Slide { set_left: usize, passtime_ms: u64 },
+    /// 用户要求换一张图。
+    Retry,
+    /// 用户取消本次登录。
+    Cancel,
+}
+
+/// 手动过码的界面回调。
+///
+/// 由 UI 层实现：把图送进界面 → 等用户拖动 → 把结果送回来。
+/// `solve_gt4_manual` 在后台线程里调用它并阻塞等待，界面线程不受影响。
+pub trait ManualSolver {
+    fn solve(&mut self, challenge: &Gt4Challenge) -> ManualOutcome;
+}
+
+/// 取一张挑战图（`/load` + 下载两张图 + 解码尺寸）。
+fn load_challenge(
     captcha_id: &str,
     client: &mut super::client::ApiClient,
     log: &mut dyn FnMut(&str),
-) -> Result<Value, Gt4Error> {
-    // 从 /load 到 /verify 的真实耗时，就是「人看图 + 拖动」的时间。
+) -> Result<Gt4Challenge, Gt4Error> {
     let started = std::time::Instant::now();
     // 复用调用方那只 agent（带同城出口）。极验侧能同时看到「验证码来自 IP A」
     // 和「App 业务请求来自 IP B」，两次出口不一致本身就是一条免费的关联信号。
@@ -286,11 +350,11 @@ fn solve_once(
 
     let bg_png = download(&agent, &format!("{STATIC_HOST}{bg}"))?;
     let slice_png = download(&agent, &format!("{STATIC_HOST}{slice}"))?;
-
-    // 取图之后再等：真实的顺序是「拿到图 → 人看图（1–2s）→ 拖动（0.2–0.4s）→ 交卷」。
-    // 把延迟放在取图之前，可观测形态会变成「图到手 200ms 就交卷」，反而更假。
-    let look_ms = rand::thread_rng().gen_range(900u64..1900);
-    std::thread::sleep(std::time::Duration::from_millis(look_ms));
+    // 尺寸只用于界面摆放与位移上限校验；解不出来说明这张图不可用，换一张。
+    let (_, bg_width, bg_height) =
+        super::gt4image::decode_gray(&bg_png).map_err(Gt4Error::Unreliable)?;
+    let (_, slice_width, slice_height) =
+        super::gt4image::decode_gray(&slice_png).map_err(Gt4Error::Unreliable)?;
 
     // /load 的 ypos 用来校验识别结果：y 偏离说明这一张配到了背景里别的结构，
     // 此时直接换图重试，而不是交一个错答案（错答案会消耗极验对本会话的容忍度）。
@@ -301,33 +365,57 @@ fn solve_once(
             data["ypos"]
         ));
     }
-    let (dist, score) =
-        get_distance_checked(&bg_png, &slice_png, ypos).map_err(Gt4Error::Unreliable)?;
-    log(&format!(
-        "[gt4] 缺口识别 distance={dist} 相似度={score:.3} ypos={:?}",
-        ypos
-    ));
+    Ok(Gt4Challenge {
+        captcha_id: captcha_id.to_string(),
+        lot_number,
+        payload,
+        process_token,
+        pow_detail,
+        bg_png,
+        slice_png,
+        bg_width,
+        bg_height,
+        slice_width,
+        slice_height,
+        ypos,
+        started,
+    })
+}
 
-    // 拖动本身也要时间。
-    let drag_ms = rand::thread_rng().gen_range(120u64..380);
-    std::thread::sleep(std::time::Duration::from_millis(drag_ms));
-
-    let pow_msg = get_pow_msg(&pow_detail, captcha_id, &lot_number, log);
+/// 交卷：PoW → `w` → `GET /verify` → 四凭证。
+fn submit_challenge(
+    agent: &crate::http::Agent,
+    challenge: &Gt4Challenge,
+    set_left: usize,
+    passtime: u64,
+    log: &mut dyn FnMut(&str),
+) -> Result<Value, Gt4Error> {
+    let pow_msg = get_pow_msg(
+        &challenge.pow_detail,
+        &challenge.captcha_id,
+        &challenge.lot_number,
+        log,
+    );
     let pow_sign = get_pow_sign(&pow_msg);
     let str16 = get_str_16(&mut rand::thread_rng());
-    // 拖动耗时取真实 elapsed —— 服务端知道 lot 的签发时刻，能框住这个值；
+    // 拖动耗时取真实耗时 —— 服务端知道 lot 的签发时刻，能框住这个值；
     // 常量（原来的 1887）在所有账号所有次数上完全一致，本身就是特征。
-    let passtime = started.elapsed().as_millis() as u64;
-    let w = get_w(dist, passtime, &lot_number, &pow_msg, &pow_sign, &str16);
+    let w = get_w(
+        set_left,
+        passtime,
+        &challenge.lot_number,
+        &pow_msg,
+        &pow_sign,
+        &str16,
+    );
 
-    // verify
     let cb = format!("geetest_{}", crate::crypto::envelope::now_ms());
     let verify_url = format!(
         "{GEE_HOST}/verify?callback={cb}&captcha_id={cid}&client_type=web&lot_number={lot}&risk_type=slide&payload={pl}&process_token={pt}&payload_protocol=1&pt=1&w={w}",
-        cid = captcha_id,
-        lot = urlencode(&lot_number),
-        pl = urlencode(&payload),
-        pt = urlencode(&process_token),
+        cid = challenge.captcha_id,
+        lot = urlencode(&challenge.lot_number),
+        pl = urlencode(&challenge.payload),
+        pt = urlencode(&challenge.process_token),
         w = urlencode(&w),
     );
     let resp = agent
@@ -353,6 +441,104 @@ fn solve_once(
         "passToken": seccode["pass_token"],
         "genTime": seccode["gen_time"],
     }))
+}
+
+/// 手动过码：把每张图交给 `solver`，用户拖完再交卷。
+///
+/// 与自动模式的差别只在「怎么得到 set_left」：拖动由人完成，所以
+/// - 拖动没对上（极验判错）不触发验证码冷却，换一张图再拖（最多 3 张）；
+/// - 用户取消立刻返回 `Cancelled`，一个额外请求都不发。
+pub fn solve_gt4_manual(
+    captcha_id: &str,
+    client: &mut super::client::ApiClient,
+    solver: &mut dyn ManualSolver,
+    log: &mut dyn FnMut(&str),
+) -> Result<Value, Gt4Error> {
+    let mut last: Option<Gt4Error> = None;
+    for round in 1..=3u32 {
+        let challenge = load_challenge(captcha_id, client, log)?;
+        log(&format!(
+            "[gt4] 手动过码：第 {round}/3 张图（{}x{}，可移动 0..={}），请拖动",
+            challenge.bg_width,
+            challenge.bg_height,
+            challenge.max_offset()
+        ));
+        let outcome = {
+            let agent = client.agent.clone();
+            match solver.solve(&challenge) {
+                ManualOutcome::Cancel => {
+                    return Err(Gt4Error::Cancelled("已取消验证码".into()));
+                }
+                ManualOutcome::Retry => {
+                    log("[gt4] 按要求换一张图");
+                    continue;
+                }
+                ManualOutcome::Slide {
+                    set_left,
+                    passtime_ms,
+                } => {
+                    let max = challenge.max_offset();
+                    if set_left > max {
+                        return Err(Gt4Error::Unreliable(format!(
+                            "滑块位置 {set_left} 超出图像范围（0..={max}）"
+                        )));
+                    }
+                    // 人拖出来的耗时可能很长（中途发呆）；夹到可信区间，
+                    // 既保留「不是常量」这一点，也不给服务端一个 40 秒的拖动。
+                    let passtime = passtime_ms.clamp(250, 9_000);
+                    log(&format!(
+                        "[gt4] 手动交卷 setLeft={set_left} passtime={passtime}ms"
+                    ));
+                    submit_challenge(&agent, &challenge, set_left, passtime, log)
+                }
+            }
+        };
+        match outcome {
+            Ok(v) => return Ok(v),
+            Err(Gt4Error::Rejected(e)) => {
+                log(&format!("× [gt4] 手动拖动被判错：{e}"));
+                last = Some(Gt4Error::Rejected(e));
+                if round < 3 {
+                    log("[gt4] 换一张图，请再拖一次");
+                    continue;
+                }
+            }
+            Err(other) => {
+                log(&format!("× [gt4] 第 {round} 次提交失败: {other}"));
+                last = Some(other);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| Gt4Error::Fatal("GT4 未执行".into())))
+}
+
+fn solve_once(
+    captcha_id: &str,
+    client: &mut super::client::ApiClient,
+    log: &mut dyn FnMut(&str),
+) -> Result<Value, Gt4Error> {
+    let challenge = load_challenge(captcha_id, client, log)?;
+
+    // 取图之后再等：真实的顺序是「拿到图 → 人看图（1–2s）→ 拖动（0.2–0.4s）→ 交卷」。
+    // 把延迟放在取图之前，可观测形态会变成「图到手 200ms 就交卷」，反而更假。
+    let look_ms = rand::thread_rng().gen_range(900u64..1900);
+    std::thread::sleep(std::time::Duration::from_millis(look_ms));
+
+    let (dist, score) =
+        get_distance_checked(&challenge.bg_png, &challenge.slice_png, challenge.ypos)
+            .map_err(Gt4Error::Unreliable)?;
+    log(&format!(
+        "[gt4] 缺口识别 distance={dist} 相似度={score:.3} ypos={:?}",
+        challenge.ypos
+    ));
+
+    // 拖动本身也要时间。
+    let drag_ms = rand::thread_rng().gen_range(120u64..380);
+    std::thread::sleep(std::time::Duration::from_millis(drag_ms));
+
+    // 从 /load 到 /verify 的真实耗时，就是「人看图 + 拖动」的时间。
+    let passtime = challenge.elapsed_ms();
+    submit_challenge(&client.agent, &challenge, dist, passtime, log)
 }
 
 fn download(agent: &crate::http::Agent, url: &str) -> Result<Vec<u8>, Gt4Error> {

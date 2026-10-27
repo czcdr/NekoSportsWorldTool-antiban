@@ -5,7 +5,6 @@
 //! ③ POST /api/v70100/login（Authorization: Basic + 信封 body）→ uid/token/unid
 
 use super::client::{check_business, get_field, ApiClient};
-use super::gt4::solve_gt4;
 use super::model::{Session, HOST};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -68,11 +67,76 @@ fn gee_check(
     Ok(skip)
 }
 
-/// 完整登录：checkGeeUse → [GT4 → geevalidate] → login。成功返回 Session。
+/// 过码方式。
+///
+/// 自动识别缺口是概率性的（实测约 8% 会认错），而被极验降级过的出口上，
+/// 认错一次就少一次机会。所以把「谁来拖滑块」做成显式选项：让用户自己拖，
+/// 是最稳的一条路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptchaMode {
+    /// 自动识别缺口（默认）。
+    #[default]
+    Auto,
+    /// 手动拖滑块：图交给界面，由人拖进缺口。
+    Manual,
+}
+
+impl CaptchaMode {
+    /// 从配置字符串解析；认不出的值按自动处理（老配置里没有这个字段）。
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "manual" | "hand" | "手动" | "手动过码" => Self::Manual,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动过码",
+            Self::Manual => "手动过码",
+        }
+    }
+}
+
+/// 登录选项。
+pub struct LoginOptions<'a> {
+    pub captcha: CaptchaMode,
+    /// 手动过码的界面回调；`captcha == Manual` 时必须给出。
+    pub solver: Option<&'a mut dyn super::gt4::ManualSolver>,
+}
+
+impl Default for LoginOptions<'_> {
+    fn default() -> Self {
+        Self {
+            captcha: CaptchaMode::Auto,
+            solver: None,
+        }
+    }
+}
+
+/// 完整登录（自动过码）：checkGeeUse → [GT4 → geevalidate] → login。成功返回 Session。
 pub fn login(
     client: &mut ApiClient,
     username: &str,
     password: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<Session, String> {
+    login_with(client, username, password, LoginOptions::default(), log)
+}
+
+/// 登录，可指定过码方式（自动识别 / 手动拖滑块）。
+pub fn login_with(
+    client: &mut ApiClient,
+    username: &str,
+    password: &str,
+    options: LoginOptions<'_>,
     log: &mut dyn FnMut(&str),
 ) -> Result<Session, String> {
     let uuid_value = uuid::Uuid::new_v4().to_string();
@@ -90,17 +154,41 @@ pub fn login(
         Ok(true) => log("[login] 免验证码路径：直接登录"),
         Ok(false) => {
             let captcha_id = CAPTCHA_ID_BIZ0;
-            log("[login] 开始 GT4 滑块验证…");
-            let creds = match solve_gt4(captcha_id, client, log) {
+            let manual = options.captcha == CaptchaMode::Manual;
+            log(&format!(
+                "[login] 开始 GT4 滑块验证（{}）…",
+                options.captcha.label()
+            ));
+            let solved = match (options.captcha, options.solver) {
+                (CaptchaMode::Manual, Some(solver)) => {
+                    super::gt4::solve_gt4_manual(captcha_id, client, solver, log)
+                }
+                (CaptchaMode::Manual, None) => Err(super::gt4::Gt4Error::Fatal(
+                    "手动过码缺少界面回调，请改回自动过码".into(),
+                )),
+                (CaptchaMode::Auto, _) => super::gt4::solve_gt4(captcha_id, client, log),
+            };
+            let creds = match solved {
                 Ok(creds) => creds,
                 Err(error) => {
-                    // 判错不重试（solve_gt4 内部已保证），这里只负责把话说明白。
+                    // 用户自己取消：不是判错，什么都不记，也别吓人。
+                    if error.cancelled() {
+                        return Err(error.message().to_string());
+                    }
+                    // 判错不重试（solve_gt4 / solve_gt4_manual 内部已保证），
+                    // 这里只负责把话说明白。
                     if matches!(error, super::gt4::Gt4Error::Rejected(_)) {
-                        let secs = super::captcha_guard::record_rejection();
-                        let wait = if secs > 0 {
-                            format!("，请{}后再试", super::captcha_guard::cooldown_hint(secs))
+                        // 人拖错一次不构成「客户端不会动」的证据：手动模式下不进
+                        // 进程级冷却，否则拖歪一下就十分钟不能试。
+                        let wait = if manual {
+                            "；换一张图再拖一次即可".to_string()
                         } else {
-                            "；先别连续点击，过几分钟再试".to_string()
+                            let secs = super::captcha_guard::record_rejection();
+                            if secs > 0 {
+                                format!("，请{}后再试", super::captcha_guard::cooldown_hint(secs))
+                            } else {
+                                "；先别连续点击，过几分钟再试".to_string()
+                            }
                         };
                         return Err(format!(
                             "验证码判定未通过，已停止本次尝试以免触发风控{wait}（与账号密码无关）"
@@ -109,12 +197,29 @@ pub fn login(
                     return Err(format!("验证码未能完成：{error}"));
                 }
             };
+            // 极验凭证是一次性的：缺一个就**不要**发 geevalidate —— 交一个 null
+            // 换回来的 10003 只是白烧一次机会，还会被记成一次判错。
+            if let Err(missing) = required_credentials(&creds) {
+                return Err(format!(
+                    "验证码凭证不完整（缺 {missing}），本次没有提交校验；请重试"
+                ));
+            }
             log(&format!(
-                "[login] GT4 通过 lot_number={}",
+                "[login] GT4 通过 lot_number={}（captchaOutput {} 字符 / passToken {} 字符）",
                 creds
                     .get("lotNumber")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
+                    .unwrap_or(""),
+                creds
+                    .get("captchaOutput")
+                    .and_then(|v| v.as_str())
+                    .map(str::len)
+                    .unwrap_or(0),
+                creds
+                    .get("passToken")
+                    .and_then(|v| v.as_str())
+                    .map(str::len)
+                    .unwrap_or(0),
             ));
 
             let body = json!({
@@ -135,53 +240,62 @@ pub fn login(
             // UA 必须由身份拼出：写死 iOS UA 会让同一账号的登录与其余请求分属两台设备。
             let ua = crate::crypto::header::ua_for(&client.identity);
 
-            // 只重发 geevalidate（凭证可能仍有效，重发比重新破一次滑块便宜）：
-            // 不再「重破滑块 3 轮」，也不再在拿不到业务码时当成通过 —— 后者会让
-            // 一次「没验证成功」滑到带密码的登录请求，被服务端记成一次失败登录。
-            let mut validated = false;
-            let mut last_code: Option<i64> = None;
-            for attempt in 1..=2 {
-                let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
-                let code = out
-                    .decrypted
-                    .as_ref()
-                    .and_then(|d| d.business.get("error").cloned())
-                    .and_then(|e| e.as_i64());
-                match code {
-                    Some(10000) => {
-                        super::captcha_guard::record_success();
-                        log("[geevalidate] 验证通过");
-                        validated = true;
-                        break;
-                    }
-                    Some(10003) => {
+            // 只发一次。
+            //
+            // 之前「拿不到业务码就重发一次」的写法有三个问题：
+            // ① 极验的四凭证是一次性的，同一条 `lot_number` 再交给服务端复验，
+            //    会拿到「重复校验」的失败 —— 表现就是**明明过了滑块却回 10003**；
+            // ② 业务码可能是字符串 "10000"（`as_i64()` 读到 None），于是第一次
+            //    明明通过了也被当成「读不到码」而重发，正好踩上 ①；
+            // ③ 一次失败被记成两次判错，冷却直接跳到 10 分钟。
+            // 现在：判码兼容字符串；读不出来就如实报错，不重发。
+            let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
+            let dec = out.decrypted.ok_or_else(|| {
+                format!(
+                    "验证码校验结果无法解密（HTTP {}，{} 字节）{}；本次没有重发同一凭证（会被当成重放）",
+                    out.http_status, out.raw_len, out.raw_head
+                )
+            })?;
+            match business_code(&dec.business) {
+                Some(10000) => {
+                    super::captcha_guard::record_success();
+                    log("[geevalidate] 验证通过");
+                }
+                Some(10003) => {
+                    // 手动模式下这条不代表「拖错了」：人已经拖对了，是服务端/业务侧
+                    // 不认这次凭证。进冷却只会把一个业务问题变成十分钟不能试。
+                    let wait = if manual {
+                        "；请稍后重试，或切换另一种过码方式".to_string()
+                    } else {
                         let secs = super::captcha_guard::record_rejection();
-                        let wait = if secs > 0 {
+                        if secs > 0 {
                             format!("，请{}后再试", super::captcha_guard::cooldown_hint(secs))
                         } else {
                             "，请稍后再试".to_string()
-                        };
-                        return Err(format!(
-                            "服务端拒绝了验证码校验（10003）{wait}（与账号密码无关）"
-                        ));
-                    }
-                    other => {
-                        log(&format!("[geevalidate] err={other:?}（第 {attempt}/2 次）"));
-                        last_code = other;
-                        if attempt < 2 {
-                            let gap = 800 + (crate::crypto::envelope::now_ms().max(0) as u64 % 800);
-                            std::thread::sleep(std::time::Duration::from_millis(gap));
                         }
-                    }
+                    };
+                    let detail = crate::textlog::redact_json(&dec.business);
+                    log(&format!(
+                        "[geevalidate] 10003 原始响应：{}",
+                        truncate(&detail.to_string(), 300)
+                    ));
+                    return Err(format!(
+                        "服务端拒绝了验证码校验（10003）{wait}（与账号密码无关）"
+                    ));
                 }
-            }
-            if !validated {
-                return Err(format!(
-                    "验证码校验未通过（错误码 {}），请稍后再试",
-                    last_code
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "无（响应无法解密）".into())
-                ));
+                other => {
+                    let detail = crate::textlog::redact_json(&dec.business);
+                    log(&format!(
+                        "[geevalidate] 业务码 {other:?}：{}",
+                        truncate(&detail.to_string(), 300)
+                    ));
+                    return Err(format!(
+                        "验证码校验未通过（错误码 {}），请稍后再试",
+                        other
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "无（响应里没有 error 字段）".into())
+                    ));
+                }
             }
             // 验证码刚过就立刻登录同样是个特征；真实用户点「登录」之间会有停顿。
             let pause = 1_200 + (crate::crypto::envelope::now_ms().max(0) as u64 % 2_300);
@@ -295,4 +409,87 @@ pub fn logout(client: &mut ApiClient, log: &mut dyn FnMut(&str)) {
 
 fn truncate(s: &str, n: usize) -> String {
     crate::textlog::truncate(s, n)
+}
+
+/// 四个凭证必须都是非空值；返回第一个缺失的字段名。
+///
+/// `genTime` 允许是数字（极验有时给毫秒时间戳而不是字符串），所以只校验「不是
+/// null / 不是空串」，不强制类型 —— 交给服务端按它自己的口径解析。
+fn required_credentials(creds: &Value) -> Result<(), &'static str> {
+    for key in ["lotNumber", "captchaOutput", "passToken", "genTime"] {
+        let ok = match creds.get(key) {
+            Some(Value::String(text)) => !text.trim().is_empty(),
+            Some(Value::Number(_)) => true,
+            _ => false,
+        };
+        if !ok {
+            return Err(key);
+        }
+    }
+    Ok(())
+}
+
+/// 读业务码 `error`。服务端可能给数字，也可能给字符串（"10000"）——
+/// 只认 `as_i64()` 会把「字符串形式的成功」误判成「读不到码」。
+fn business_code(biz: &Value) -> Option<i64> {
+    match biz.get("error") {
+        Some(Value::Number(number)) => number.as_i64(),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captcha_mode_round_trips_through_config_text() {
+        assert_eq!(CaptchaMode::parse("auto"), CaptchaMode::Auto);
+        assert_eq!(CaptchaMode::parse(" MANUAL "), CaptchaMode::Manual);
+        assert_eq!(CaptchaMode::parse("手动"), CaptchaMode::Manual);
+        // 老配置/空值/拼错 → 自动（绝不能因为认不出就当手动，那会卡在等界面）。
+        assert_eq!(CaptchaMode::parse(""), CaptchaMode::Auto);
+        assert_eq!(CaptchaMode::parse("hand2"), CaptchaMode::Auto);
+        for mode in [CaptchaMode::Auto, CaptchaMode::Manual] {
+            assert_eq!(CaptchaMode::parse(mode.as_str()), mode);
+            assert!(!mode.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn business_code_accepts_numbers_and_strings() {
+        assert_eq!(business_code(&json!({"error": 10000})), Some(10000));
+        // 字符串形式：旧实现读成 None，于是「其实通过了」被当成「读不到码」→
+        // 同一凭证再发一次 → 极验按重放拒掉 → 用户看到 10003。
+        assert_eq!(business_code(&json!({"error": "10000"})), Some(10000));
+        assert_eq!(business_code(&json!({"error": " 10003 "})), Some(10003));
+        assert_eq!(business_code(&json!({"error": null})), None);
+        assert_eq!(business_code(&json!({})), None);
+    }
+
+    #[test]
+    fn credentials_must_all_be_present() {
+        let ok = json!({
+            "lotNumber": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            "captchaOutput": "out",
+            "passToken": "pass",
+            "genTime": "1729999999999",
+        });
+        assert!(required_credentials(&ok).is_ok());
+        // genTime 是数字也要接受
+        let numeric = json!({
+            "lotNumber": "lot", "captchaOutput": "out",
+            "passToken": "pass", "genTime": 1729999999999i64,
+        });
+        assert!(required_credentials(&numeric).is_ok());
+        for key in ["lotNumber", "captchaOutput", "passToken", "genTime"] {
+            let mut missing = ok.clone();
+            missing[key] = Value::Null;
+            assert_eq!(required_credentials(&missing), Err(key));
+            let mut blank = ok.clone();
+            blank[key] = json!("   ");
+            assert_eq!(required_credentials(&blank), Err(key));
+        }
+    }
 }
