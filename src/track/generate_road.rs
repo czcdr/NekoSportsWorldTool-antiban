@@ -466,7 +466,13 @@ pub fn build_road(
     let mut t_acc = 0.0f64;
     let mut dist_acc = 0.0f64;
     let mut steps_acc = 0.0f64;
-    let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
+    // A5（审计 medium）：Road 模式原先写死 `82.0`（初值与 OU 回归目标都是它）。
+    // Legacy 早已改成按区间抽样（`generator.rs`：`base_alt = rng.uniform(20.0, 260.0)`），
+    // 只有 Road 漏改 —— 于是选「真实道路」的所有账号、所有记录 bdA 全落在 82±几米，
+    // 一个校区的人不可能同一海拔。这里与 Legacy 同款：每次运行抽一个基准，
+    // 整条轨迹围绕它做 OU 回归（连续、不逐点跳）。只影响 bdA / totalAscent。
+    let base_alt = rng.uniform(20.0, 260.0);
+    let mut alt = base_alt + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
     let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
     for i in 0..n {
@@ -544,7 +550,7 @@ pub fn build_road(
             // Boundary mode follows the actual road, including exceptional samples.
             to_bd(x, y, c_lat, c_lng)
         };
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
+        alt += 0.04 * (base_alt - alt) + rng.gauss(0.0, alt_sigma);
         // 生物力学联动：v=(cad/60)·stride
         let v_now = speeds[i];
         let mut stride = v_now * 60.0 / cadences[i];
@@ -866,9 +872,44 @@ mod preview_tests {
         }
     }
 
+    /// A5：Road 模式的海拔基准必须每次抽样，不能是写死的 82m。
+    ///
+    /// 判据三条：① 两条不同 seed 的轨迹海拔（顶点）不同；② 都落在 20–260 区间里；
+    /// ③ 同一条轨迹里相邻点不跳（OU 回归的连续性），别把「换了基准」变成「逐点乱跳」。
     #[test]
-    fn no_boundary_extra_mileage_reuses_the_same_checkpoint_circuit() {
-        let (mut net, _, points) = concave_campus();
+    fn road_altitude_is_sampled_per_run_not_pinned_to_82m() {
+        let (net, fences, points) = concave_campus();
+        let net = apply_fences(&net, &fences);
+        let mut peaks = Vec::new();
+        for seed in [3_u64, 11] {
+            let track = build_road(2000.0, 900, seed, 123_000, &points, &points, &net).unwrap();
+            let alts: Vec<f64> = track.locations.iter().map(|p| p.bdA).collect();
+            assert!(!alts.is_empty());
+            let peak = alts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                (20.0..=260.0).contains(&peak),
+                "seed={seed} 顶点海拔 {peak:.1} 越界（应在 20–260m）"
+            );
+            // OU 回归：相邻点不会跳（σ 已被点数摊薄，单步应远小于整个区间）。
+            for pair in alts.windows(2) {
+                assert!(
+                    (pair[1] - pair[0]).abs() < 30.0,
+                    "seed={seed} 相邻点海拔跳变过大：{:.1} -> {:.1}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            peaks.push(peak);
+        }
+        assert!(
+            (peaks[0] - peaks[1]).abs() > 0.01,
+            "两条不同 seed 的 Road 轨迹海拔基准相同（{:?}），基准仍是常量",
+            peaks
+        );
+    }
+
+    #[test]
+    fn no_boundary_extra_mileage_reuses_the_same_checkpoint_circuit() {        let (mut net, _, points) = concave_campus();
         // A long, returnable side road must not be explored to fill the mileage.
         let start = net.graph.node_indices().next().unwrap();
         let far = net.add_node(Coord::new(116.42, 39.9));
