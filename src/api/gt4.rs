@@ -484,10 +484,11 @@ pub fn solve_gt4_manual(
                     return Err(Gt4Error::Cancelled("已取消验证码".into()));
                 }
                 // 等待超时不是「用户取消」：文案要说出真实原因，也不能进冷却。
+                // 用 `Fatal` 而不是 `Unreliable`：`Unreliable` 的语义是「图没认准/没取到」，
+                // 且被自动路径当成可重试（`retryable()`）；「5 分钟没人动」两样都不是。
+                // （手动路径目前不看 `retryable()`，这是给将来复用留的口径。）
                 ManualOutcome::Timeout => {
-                    return Err(Gt4Error::Unreliable(
-                        "验证码等待超时（5 分钟未操作）".into(),
-                    ));
+                    return Err(Gt4Error::Fatal("验证码等待超时（5 分钟未操作）".into()));
                 }
                 ManualOutcome::Retry => {
                     log("[gt4] 按要求换一张图");
@@ -530,13 +531,29 @@ pub fn solve_gt4_manual(
         }
     }
     let last = last.unwrap_or_else(|| Gt4Error::Fatal("GT4 未执行".into()));
-    // 三张全废：这才叫「反复失败」，记一次判错 —— 连点登录每次都会再拿 3 张图，
-    // 不记账就等于把唯一的客户端节流整段绕开。单张拖歪走的是上面的 continue，
-    // 到不了这里，所以「拖歪一次不锁十分钟」的原意没变；取图阶段的网络失败
-    // 更是在 `load_challenge(...)?` 就返回了，同样到不了这行。
-    log("[gt4] 本次手动过码三张图未通过，记一次判错（反复整轮失败会升级为冷却）");
-    let _ = super::captcha_guard::record_rejection();
+    // 三张全废时记不记账，只看「是不是极验判错」：连点登录每次都会再拿 3 张图，
+    // 不记账就等于把唯一的客户端节流整段绕开；但传输失败在 `/load` 阶段本来就
+    // 在 `?` 直接返回、不记账，若 `/verify` 阶段也记账，同一类失败就有了两种
+    // 口径 —— 网络抖两下就把用户锁进 10 分钟冷却（F-03 fail-closed 之后这种
+    // 失败并不罕见）。
+    if record_if_rejected(&last) {
+        log("[gt4] 本次手动过码三张图均被判错，记一次判错（反复整轮失败会升级为冷却）");
+    } else {
+        log("[gt4] 本次手动过码因非判错原因结束（网络/图不可用），不计入验证码冷却");
+    }
     Err(last)
+}
+
+/// 只有「极验明确判错」才计入验证码冷却；返回是否真的记了一次。
+///
+/// 抽成独立函数是为了能离线断言「三轮都是 Fatal 时一次都不记」：真跑三轮
+/// 网络失败在单测里既慢又不可控。
+fn record_if_rejected(last: &Gt4Error) -> bool {
+    if !matches!(last, Gt4Error::Rejected(_)) {
+        return false;
+    }
+    let _ = super::captcha_guard::record_rejection();
+    true
 }
 
 fn solve_once(
@@ -603,6 +620,54 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use rsa::traits::PublicKeyParts;
+
+    /// R9：三张图全废时，只有「极验判错」能升级成验证码冷却。
+    ///
+    /// 判据是行为而不是分支：真去调 `record_rejection` 再把冷却状态读回来，
+    /// 这样「不记账」和「记了但没到门槛」才不会被混为一谈。
+    #[test]
+    fn only_rejections_escalate_the_captcha_cooldown() {
+        let dir = std::env::temp_dir().join(format!("neko-gt4-manual-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(dir.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir);
+
+        // 三轮都是「非判错」：传输失败 / 图不可用 / 用户取消，一次都不该记。
+        for _ in 0..3 {
+            assert!(!record_if_rejected(&Gt4Error::Fatal("网络错误".into())));
+            assert!(!record_if_rejected(&Gt4Error::Unreliable(
+                "图不可用".into()
+            )));
+            assert!(!record_if_rejected(&Gt4Error::Cancelled(
+                "已取消验证码".into()
+            )));
+        }
+        assert!(
+            crate::api::captcha_guard::cooldown_remaining_secs().is_none(),
+            "非判错失败不能进验证码冷却（网络抖两下不应锁 10 分钟）"
+        );
+
+        // 同样的次数换成判错：连续两次就该进冷却 —— 证明记账通路本身是通的，
+        // 上面那条「没进冷却」不是因为压根没写状态。
+        assert!(record_if_rejected(&Gt4Error::Rejected(
+            "verify fail".into()
+        )));
+        assert!(record_if_rejected(&Gt4Error::Rejected(
+            "verify fail".into()
+        )));
+        assert!(
+            crate::api::captcha_guard::cooldown_remaining_secs().is_some(),
+            "连续判错必须能升级成冷却"
+        );
+        crate::api::captcha_guard::record_success();
+    }
 
     /// 联网探针（默认 ignore）：连跑 N 轮 GT4，统计成功率与失败原因。
     ///

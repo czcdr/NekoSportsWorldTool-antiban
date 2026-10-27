@@ -869,6 +869,47 @@ mod tests {
         assert_eq!(app.status, LOGIN_GONE_STATUS);
     }
 
+    /// R1 的顺序假设：`LOGIN_DONE` 与那张旧挑战图**同一帧**到达时，
+    /// 必须按 `update()` 的真实顺序（先 `poll_messages` 后 `poll_captcha`）
+    /// 得出「登录结束、弹窗不出现」。
+    ///
+    /// 不直接调 `eframe::App::update`：`&mut eframe::Frame` 在单元测试里造不出来。
+    /// 这里复刻 update() 的那两行调用顺序，把顺序本身钉死。
+    #[test]
+    fn r1_same_frame_login_done_wins_over_the_stale_challenge() {
+        let ctx = egui::Context::default();
+        let mut app = fixture_app(&ctx);
+        app.login_busy = true;
+        // 后台线程超时前发出的挑战图，和 LOGIN_DONE 一起排在队列里。
+        let (responder, answers) = std::sync::mpsc::channel();
+        assert!(app
+            .captcha_tx
+            .clone()
+            .send(fixture_request(responder, 250))
+            .is_ok());
+        assert!(app
+            .tx
+            .send(format!(
+                "{}{}",
+                crate::ui::LOGIN_DONE,
+                serde_json::json!({"ok": false, "message": CANCELLED_STATUS})
+            ))
+            .is_ok());
+        // update() 的真实顺序。
+        app.poll_messages();
+        app.poll_captcha();
+        assert!(!app.login_busy);
+        assert!(
+            app.captcha.pending.is_none(),
+            "同一帧里登录已结束，旧挑战图不能再复活成弹窗"
+        );
+        assert_eq!(app.status, CANCELLED_STATUS);
+        // 丢掉请求即断开，后台线程不会继续等。
+        assert!(answers
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+    }
+
     /// R8：弹窗首帧要把输入焦点从密码框上拿走（否则手机上软键盘不收，
     /// 拖动的第一下也落在文本框里）。
     #[test]

@@ -223,18 +223,35 @@ UI 线程 (egui)                              登录线程 (spawn_job)
 | R7 成功分支不 `abandon` | **已满足**（无需改）：`abandon()` 原本就在 `LOGIN_DONE` 的 `if/else` 之外（成功与失败都走），R1 的 guard 再覆盖一层 | `src/ui/msgs.rs` 现状 + 用例 `pending_challenge_is_dropped_when_the_login_thread_ends` |
 | R8 不释放输入焦点 | **已修**：弹窗首帧清掉「当前焦点」（`surrender_focus(当前焦点 id)`；对弹窗自己的 id 调用是空操作，因为它并不是焦点持有者） | `captcha.rs::draw_modal`（`focus_cleared` 只做一次）；用例 `opening_the_modal_releases_input_focus` |
 
+### 第 2 轮复评追加（R9 / R10）
+
+| # | 结论 | 落点 |
+|---|---|---|
+| R9（medium）`Fatal`（传输失败）也被计入 `record_rejection` | **已修**：三张全废时只有 `Gt4Error::Rejected` 才记账（`record_if_rejected`），其余打「因非判错原因结束，不计入验证码冷却」的日志。理由：`/load` 阶段传输失败本来就在 `?` 直接返回、不记账，`/verify` 阶段却记账 → 同一类失败两种口径；F-03 fail-closed 之后传输失败并不罕见，网络抖两下就锁 10 分钟 | `gt4.rs::record_if_rejected` + `solve_gt4_manual` 末尾；用例 `api::gt4::tests::only_rejections_escalate_the_captcha_cooldown`（行为断言：3×Fatal/Unreliable/Cancelled 不产生冷却；2×Rejected 必产生冷却） |
+| R10（low）`Timeout` 映射到 `Unreliable` | **已修**：改为 `Gt4Error::Fatal`（文案不变）。`Unreliable` 的语义是「图没认准/没取到」且被自动路径当成可重试；「5 分钟没人动」两样都不是。手动路径目前不看 `retryable()`，改的是将来复用时的口径 | `gt4.rs` 的 `ManualOutcome::Timeout` 分支 |
+
+### 第 2 轮复评追加的集成用例
+
+- `ui::captcha::tests::r1_same_frame_login_done_wins_over_the_stale_challenge`：同一帧里
+  `LOGIN_DONE` 与旧挑战图都到齐，按 `update()` 的真实顺序（先 `poll_messages` 再 `poll_captcha`）
+  复刻，断言「登录结束、弹窗不出现、responder 断开」。不直接调 `eframe::App::update`，是因为
+  `&mut eframe::Frame` 在单测里构造不出来 —— 这里钉的是**顺序**本身。
+
 ## 11. 第 2 轮对 `src/api/gt4.rs` 的改动边界（自查用）
 
 ```
 git diff 94de1f0..HEAD -- src/api/gt4.rs
 ```
 
-只应有 5 个 hunk，且全部落在两处：
+全部只落在三处（详见 §10 与提交说明）：
 
 1. `pub enum ManualOutcome` —— 新增 `Timeout` 变体（R3 需要后台线程能区分「超时」与「用户取消」；
    若只靠 UI 侧计时，App 在后台不渲染帧时根本追不上后台线程的超时，原因仍会被吞）。
-2-5. `solve_gt4_manual`（含其文档注释）—— 抖动、`Timeout` 分支、三张全废后的 `record_rejection`。
+2. `solve_gt4_manual`（含其文档注释）—— 抖动、`Timeout` 分支（R10 起用 `Fatal`）、
+   三张全废后的 `record_if_rejected` 记账判定。
+3. `record_if_rejected`（新增的 8 行小函数）与其单测 —— 为了让「Fatal 不记账」能被离线断言。
 
 `solve_once` / `solve_gt4` / `load_challenge` / `submit_challenge` **一个字节都没动**
-（上面 5 个 hunk 的上下文行都不落在它们体内），自动路径仍与 `94de1f0` 一致。
+（所有 hunk 的上下文行都不落在它们体内），自动路径仍与 `94de1f0` 一致。
+
 
