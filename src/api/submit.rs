@@ -76,6 +76,26 @@ pub fn submit_record(
     p: &SubmitParams,
     log: &mut dyn FnMut(&str),
 ) -> Result<SubmitResult, String> {
+    // A1（审计 high）：身份平台必须与提交链路一致。
+    //
+    // 提交报文无条件按 **Android** 身份构造：清 pixel/idfa、`platform="android"`、
+    // 机型/系统版本改写成 Android 机型库、UA/appVersion 换成 Android（7.4.0、osType=0）。
+    // 但 `DeviceId` 沿用的是当前身份那一个 —— iOS 身份登录 + Android 报文提交，就是
+    // 同一条 token 上「登录说 iOS、提交说 Android」的硬矛盾（真机不会在会话中途换平台）。
+    //
+    // 让整条链跟随 iOS 属于未验证链路（iOS 的提交/OBS/详情口径没有样本），所以这里只做
+    // 准入：在**写回执、发请求之前**拒绝，用户到设备页切成 Android 即可。
+    if client.identity.platform != "android" {
+        let platform = match client.identity.platform.as_str() {
+            "ios" => "iOS",
+            "" => "未设置",
+            other => other,
+        };
+        return Err(format!(
+            "当前设备身份为 {platform}，官方客户端只有 Android；\
+             请到设备页切换为 Android 身份后再提交（否则同一条登录里登录与提交分属两个平台）"
+        ));
+    }
     // 出口闸门必须在写 pending 回执之前：绑不上出口是**本地拒绝、请求没发出**，
     // 若走下面的 Unknown 分支就会留下一条 pending，把后续提交全部锁死。
     client.egress_guard()?;

@@ -79,7 +79,11 @@ impl App {
         ui.add_space(6.0);
 
         mobile::row(ui, |ui| {
-            ui.radio_value(&mut self.device_buf.platform, "ios".to_string(), "iOS");
+            ui.radio_value(&mut self.device_buf.platform, "ios".to_string(), "iOS")
+                .on_hover_text(
+                    "iOS 身份只覆盖登录等链路；官方客户端只有 Android，提交会因平台不一致被拒绝。\
+                     要跑记录请选 Android。",
+                );
             ui.radio_value(
                 &mut self.device_buf.platform,
                 "android".to_string(),
@@ -92,6 +96,15 @@ impl App {
                 self.status = "已生成随机设备（未保存——手动保存后才生效）".into();
             }
         });
+        if self.device_buf.platform != "android" {
+            // A1：iOS 身份不能提交（提交报文固定 Android）。与其让用户填完表单、
+            // 跑完再被拒，不如在选平台这一步就说清。
+            ui.colored_label(
+                theme::warn(),
+                "⚠ 选 iOS 时无法提交跑步记录：官方客户端只有 Android，\
+                 提交前会因平台不一致被拒绝。要跑记录请选 Android。",
+            );
+        }
 
         #[cfg(target_os = "android")]
         if ui.button("读取本机信息").clicked() {

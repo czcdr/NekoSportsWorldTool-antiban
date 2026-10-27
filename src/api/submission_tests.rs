@@ -133,7 +133,11 @@ fn server(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>)
 }
 fn client(host: &str) -> ApiClient {
     let mut c = ApiClient::new(
-        crate::crypto::header::HeaderIdentity::default(),
+        // 提交链路要求 Android 身份（A1 的准入校验）；默认 HeaderIdentity 是 iOS。
+        crate::crypto::header::HeaderIdentity {
+            platform: "android".into(),
+            ..Default::default()
+        },
         Some(crate::api::model::Session {
             uid: 42,
             unid: "77".into(),
@@ -167,9 +171,36 @@ fn error(result: Result<SubmitResult, String>) -> String {
         Err(e) => e,
     }
 }
+/// A1：iOS 身份必须**在发请求、写回执之前**被拒 —— 提交报文固定按 Android 构造，
+/// 用 iOS 身份提交就是同一条 token 上「登录 iOS / 提交 Android」的硬矛盾。
+///
+/// 判据用「同一台 server 上，iOS 那次不产生任何请求，随后 Android 身份能一次成功」，
+/// 顺带证明拒绝没有留下 pending 回执（否则后续提交会被锁死）。
 #[test]
-fn successful_post_then_same_plan_only_sends_once() {
+fn ios_identity_is_rejected_before_any_request_or_receipt() {
     let _fixture = Fixture::new();
+    let (host, task) = server(vec![Reply::Record(
+        json!({"error":10000,"data":{"rrid":"42"}}),
+    )]);
+    let p = params();
+    let mut ios = client(&host);
+    ios.identity.platform = "ios".into();
+    let message = error(submit_record(&mut ios, &p, &mut |_| {}));
+    assert!(message.contains("iOS"), "要指出当前平台：{message}");
+    assert!(message.contains("Android"), "要给出可操作出口：{message}");
+    assert!(
+        message.contains("设备页"),
+        "要说明去哪儿切身份：{message}"
+    );
+
+    // 同一份回执目录下换 Android 身份立刻能提交：说明上面那次没有发请求、也没留 pending。
+    let mut android = client(&host);
+    assert!(submit_record(&mut android, &p, &mut |_| {}).is_ok());
+    assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
+}
+
+#[test]
+fn successful_post_then_same_plan_only_sends_once() {    let _fixture = Fixture::new();
     let (host, task) = server(vec![Reply::Record(
         json!({"error":10000,"data":{"rrid":"42"}}),
     )]);

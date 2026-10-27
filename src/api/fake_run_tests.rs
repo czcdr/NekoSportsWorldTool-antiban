@@ -408,55 +408,53 @@ fn android_chain_reports_exactly_one_identity() {
     }
 }
 
-/// iOS 身份：**已知的双身份**。
+/// iOS 身份：提交在**发请求之前**就被拒绝（审计 A1）。
 ///
-/// 提交固定走 Android 信封（`osType=0` + `androidId` 结构），其余链路跟身份走 iOS。
-/// 这不是本轮引入的，是提交接口的既有设计；把它写成断言，是为了让这条限制可见 ——
-/// 一旦有人真把提交也做成 iOS，这里会红，提醒同步更新结论。
+/// 旧行为是「登录 iOS、提交 Android」的双身份分裂 —— 同一条 token 上两个平台，
+/// 审计判为 high 的跨来源矛盾。现在改成准入拒绝：链路上一条提交请求都不该出现，
+/// 也不该出现任何 Android 的 UA/appVersion。这个用例就是那条结论的看门人。
 #[test]
-fn ios_identity_keeps_the_known_two_identity_split() {
+fn ios_identity_is_refused_before_the_submit_request() {
     let chain = drive("ios");
     let requests = seen(&chain.hits);
-    let outcome = chain.outcome.as_ref().unwrap_or_else(|e| {
-        panic!(
-            "iOS 身份全链失败：{e}\n请求：{requests:#?}\n日志：{:#?}",
-            chain.log
-        )
-    });
-    assert_eq!(outcome.obs_ok, 2, "OBS 上传失败；日志：{:#?}", chain.log);
+    let error = match &chain.outcome {
+        Ok(_) => {
+            assert!(false, "iOS 身份不该跑通提交；请求：{requests:#?}");
+            return;
+        }
+        Err(error) => error.clone(),
+    };
+    assert!(
+        error.contains("iOS") && error.contains("Android"),
+        "拒绝文案要说明平台并给出出口：{error}"
+    );
 
+    // ① 提交请求一条都不该发出。
+    assert!(
+        !chain
+            .hits
+            .iter()
+            .any(|h| h.path.starts_with(crate::api::submit::RECORD_PATH)),
+        "提交请求不该发出；请求：{requests:#?}"
+    );
+    // ② 整条链只能是 iOS 那一套身份，不出现 Android 的 UA/appVersion。
     for hit in &chain.hits {
-        let is_submit = hit.path.starts_with(crate::api::submit::RECORD_PATH);
-        let want_ua = if is_submit { UA_ANDROID } else { UA_IOS };
         assert_eq!(
             hit.ua().as_deref(),
-            Some(want_ua),
-            "{} {} 的 UA 与预期不符（提交固定 Android，其余跟身份）",
+            Some(UA_IOS),
+            "{} {} 不是 iOS UA（iOS 身份不该出现 Android 报文）",
             hit.method,
             hit.path
         );
-        let want_version = if is_submit {
-            ANDROID_APP_VERSION
-        } else {
-            IOS_APP_VERSION
-        };
         if hit.path == "/obs-put" {
             continue;
         }
         assert_eq!(
             hit.header("appversion").as_deref(),
-            Some(want_version),
-            "{} {} 的 appVersion 与信封不同源",
+            Some(IOS_APP_VERSION),
+            "{} {} 的 appVersion 与身份不同源",
             hit.method,
             hit.path
         );
     }
-
-    // 把这条已知分裂显式记下来：非提交链路是 iOS，提交是 Android。
-    let non_submit_ios = chain
-        .hits
-        .iter()
-        .filter(|h| !h.path.starts_with(crate::api::submit::RECORD_PATH))
-        .all(|h| h.ua().as_deref() == Some(UA_IOS));
-    assert!(non_submit_ios, "非提交链路应统一为 iOS UA");
 }
