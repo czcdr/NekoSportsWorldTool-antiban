@@ -91,6 +91,15 @@ pub struct Config {
     /// 提交行为护栏（深夜/每日次数/批量补签）。缺省即默认开启。
     #[serde(default)]
     pub safety: crate::safety::SafetyPolicy,
+    /// 瓦片路网的自定义源（留空 = 默认 OSM；百度/自建源才需要填）。
+    #[serde(default)]
+    pub tile_url_template: String,
+    /// 瓦片源允许的额外主机（默认只允许 OSM 与 *.bdimg.com）。
+    #[serde(default)]
+    pub tile_allowed_hosts: String,
+    /// 瓦片源额外请求头，形如 Referer: https://map.baidu.com/（每行一条）。
+    #[serde(default)]
+    pub tile_headers: String,
     /// 设备身份的**冗余备份**（identity.json 丢失/损坏时回填）。
     ///
     /// 只存恢复必需的最小字段：城市、锚点经纬度、device_id。
@@ -188,6 +197,9 @@ impl Default for Config {
             osm_path: String::new(),
             route_mode: default_route_mode(),
             safety: crate::safety::SafetyPolicy::default(),
+            tile_url_template: String::new(),
+            tile_allowed_hosts: String::new(),
+            tile_headers: String::new(),
             identity_backup: None,
         }
     }
@@ -200,6 +212,47 @@ impl Config {
     /// 大小写/别名规则、最后「界面显示手动、登录却按自动跑」。
     pub fn resolved_captcha_mode(&self) -> crate::api::login::CaptchaMode {
         crate::api::login::CaptchaMode::parse(&self.captcha_mode)
+    }
+    /// 把配置里的瓦片源设置组成 `TileConfig`（默认 OSM）。
+    ///
+    /// 三个字段都是「留空 = 用默认」：
+    /// - `tile_url_template` 空 → `DEFAULT_URL_TEMPLATE`（OSM 标准 XYZ）；
+    /// - 模板里含 `bdimg.com` 时自动切到百度投影（用户只需粘 URL，不用记投影）；
+    /// - `tile_allowed_hosts` 逗号/换行分隔，追加到内置白名单；
+    /// - `tile_headers` 每行 `Name: Value`。
+    pub fn tile_config(&self) -> crate::track::tile_road::TileConfig {
+        use crate::track::tile_road::{TileConfig, TileProjection};
+        let template = self.tile_url_template.trim();
+        let projection = if template.contains("bdimg.com") {
+            TileProjection::Baidu
+        } else {
+            TileProjection::WebMercator
+        };
+        let allowed_hosts = self
+            .tile_allowed_hosts
+            .split([',', ';', '\n', ' '])
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let headers = self
+            .tile_headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
+        TileConfig {
+            url_template: if template.is_empty() {
+                crate::track::tile_road::DEFAULT_URL_TEMPLATE.to_string()
+            } else {
+                template.to_string()
+            },
+            projection,
+            allowed_hosts,
+            headers,
+            ..TileConfig::default()
+        }
     }
 }
 

@@ -238,11 +238,13 @@ fn server_skew_ms(server_ts: i64) -> i64 {
 ///   均匀抽样、自带毫秒，再平移反而会破坏它与 7:00–20:00 窗口的对齐；
 /// - 增量 < 60s：分钟由用户选，不跨分钟/不跨日，`totalTime` 与 10s 窗口径都不受影响；
 /// - 用 `draw` 传入随机数，方便测试可复现。
-fn second_precision_start(base_ms: i64, draw: u32) -> i64 {
+fn second_precision_start(base_ms: i64, draw: u32, now_ms: i64) -> i64 {
     if base_ms.rem_euclid(60_000) != 0 {
         return base_ms;
     }
-    base_ms + (draw % 60_000) as i64
+    // F4：指定时刻被钳到「现在」时，再加最多 59.999s 会把开始时间推到未来 ——
+    // 服务端看到 startTime 晚于 createTime 会直接判异常。夹住不超过 now。
+    (base_ms + (draw % 60_000) as i64).min(now_ms)
 }
 
 /// A4：只读的围栏校验 —— 数一遍有多少采样点落在学校围栏外。
@@ -330,7 +332,8 @@ pub fn run_full_flow_cancellable(
     // `start_ms`，flag/beginTime/gainTime 全部由它派生，不各算各的。
     //
     // 随机模式的时刻本来就是均匀抽样（带毫秒），原样保留，不再二次平移。
-    let start_ms = second_precision_start(params.start_ms, rand::random::<u32>());
+    let now_for_start = crate::crypto::envelope::now_ms();
+    let start_ms = second_precision_start(params.start_ms, rand::random::<u32>(), now_for_start);
     let reservation = crate::safety::reserve_run(&safety, start_ms)?;
 
     // 出口与轨迹同城：策略 / 点位 / 提交 / OBS / 详情整条链路共用同一出口 IP。
@@ -812,7 +815,7 @@ mod verification_tests {
         assert_eq!(minute % 60_000, 0, "样本必须是整分");
         let draws: Vec<i64> = [0_u32, 7_321, 59_999, 30_000]
             .iter()
-            .map(|d| second_precision_start(minute, *d))
+            .map(|d| second_precision_start(minute, *d, minute + 120_000))
             .collect();
         // ① 落在同一分钟内：分钟不变、仍属于这一分钟。
         for value in &draws {
@@ -828,9 +831,19 @@ mod verification_tests {
             "不同抽样得到相同起点：{draws:?}"
         );
 
+        // ⑤ F4：指定时刻就是「现在」时（run.rs 会把未来时刻钳到今天），
+        //    补秒/毫秒不能把开始时间推到未来。
+        let now = minute + 3_000; // 用户选的那一分钟已经过去 3 秒
+        for draw in [0u32, 1, 30_000, 59_999] {
+            let start = second_precision_start(minute, draw, now);
+            assert!(start <= now, "开始时间不能晚于现在：{start} > {now}");
+        }
         // ④ 随机模式（非整分）原样保留，避免破坏与 7:00–20:00 窗口的对齐。
         let sampled = minute + 12_345;
-        assert_eq!(second_precision_start(sampled, 30_000), sampled);
+        assert_eq!(
+            second_precision_start(sampled, 30_000, sampled + 60_000),
+            sampled
+        );
     }
 
     /// A4：只读围栏校验 —— 数点、给文案，但不改轨迹、不拦提交。

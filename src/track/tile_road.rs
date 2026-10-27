@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 pub const TILE_PX: usize = 256;
 /// BD-09 球面墨卡托的半周长（米）。百度地图内部口径，不是 20037508.34。
 pub const BD_ORIGIN_SHIFT: f64 = 20_037_726.37;
+/// 标准 Web 墨卡托（EPSG:3857）的半周长（米）。
+pub const WEB_MERCATOR_SHIFT: f64 = 20_037_508.342_789_244;
 /// 一次生成最多拼多少张瓦片（4×4=16 起，8×8=64 是默认上限）。
 pub const DEFAULT_MAX_TILES: usize = 64;
 /// 拼接后图像的像素总量上限。
@@ -36,7 +38,66 @@ pub const MIN_ROAD_RATIO: f64 = 0.004;
 /// 亮、彩度又是 0，会被整体判成路面、占比接近 100% —— 只有下限是挡不住的。
 pub const MAX_ROAD_RATIO: f64 = 0.55;
 
-/// 生成参数（全部可调，默认值面向百度 `pl` 底图 + 校园尺度）。
+/// 瓦片投影：决定「经纬度 → 瓦片编号」和「像素 → 经纬度」怎么算。
+///
+/// 默认 `WebMercator`（标准 XYZ，OSM 等大多数源用它）；`Baidu` 是自家编号
+/// （BD-09 球面墨卡托 + 20037726.37 偏移），只有在拿到可用的百度 URL 时才需要切。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TileProjection {
+    /// 标准 XYZ：2^z 块，原点在左上，y 向南增大，坐标是 WGS84。
+    #[default]
+    WebMercator,
+    /// 百度自有编号（BD-09）。
+    Baidu,
+}
+
+impl TileProjection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TileProjection::WebMercator => "webmercator",
+            TileProjection::Baidu => "baidu",
+        }
+    }
+
+    /// 认不出的一律回落到 WebMercator（默认源）。
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "baidu" | "bd" | "百度" => TileProjection::Baidu,
+            _ => TileProjection::WebMercator,
+        }
+    }
+}
+
+/// 默认瓦片源：OSM 标准 XYZ 栅格（免鉴权、WGS84）。
+///
+/// 百度匿名口子已封（2026-10 冒烟：`styles=pl&scaler=1` 只回 197 字节纯色
+/// 256×256，加 `udt`/`Referer` 都一样），所以默认不再指向百度。
+pub const DEFAULT_URL_TEMPLATE: &str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+/// 百度预设（**需要**把浏览器里抓到的完整参数补上，尤其是 `udt` 与鉴权参数，
+/// 否则服务端只回占位图）。四域名轮换由模板里的 `{host}` 触发。
+pub const BAIDU_URL_TEMPLATE: &str =
+    "https://maponline{host}.bdimg.com/tile/?qt=tile&x={x}&y={y}&z={z}&styles=pl&scaler=1";
+
+/// 单张瓦片的读取上限（2 MiB）。正常 256×256 PNG 只有几十 KB；
+/// 超上限按坏图处理，避免一个恶意的巨大响应把内存吃掉。
+pub const MAX_TILE_BYTES: usize = 2 * 1024 * 1024;
+/// 单张瓦片解码上限（与 `ui/captcha.rs` 同款）。
+pub const MAX_TILE_IMAGE_SIDE: u32 = 4_096;
+pub const MAX_TILE_IMAGE_ALLOC: u64 = 32 * 1024 * 1024;
+
+/// 内置允许的瓦片主机（大小写不敏感；`.bdimg.com` 是后缀匹配）。
+pub const DEFAULT_ALLOWED_HOSTS: [&str; 3] = [
+    "tile.openstreetmap.org",
+    "bdimg.com",
+    "tile.openstreetmap.de",
+];
+
+fn default_url_template() -> String {
+    DEFAULT_URL_TEMPLATE.to_string()
+}
+
+/// 生成参数（全部可调；默认指向 OSM，阈值面向浅色路网底图）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TileConfig {
     /// 缩放级别。z18 墨卡托尺度 ≈0.60 m/px（地面尺度乘 cos φ，北京 ≈0.46 m/px）。
@@ -49,17 +110,31 @@ pub struct TileConfig {
     pub merge_m: f64,
     /// 亮度下限：低于它的是深色文字/图标/水系深色边。
     pub road_min_luma: u8,
-    /// 亮度上限：默认 255（不设上限）。纯白广场可能被误判，用局部对比兜。
+    /// 亮度上限：默认 255（不设上限）。纯白广场可能被误判，用自适应阈值兜。
     pub road_max_luma: u8,
     /// 允许的最大彩度（RGB 极差）：超过说明是蓝/绿/红这些非路面元素。
     pub max_chroma: u8,
-    /// 局部对比下限：路面比 9×9 邻域均值亮多少才算路（0-255）。
+    /// 局部对比下限：路面比整幅图背景均值亮多少才算路（0-255）。
     ///
     /// 绝对阈值之外必须有这一条：底图背景本身就是浅灰，只靠亮度区间区分不开，
-    /// 而「路比周围更亮」是稳定的判据。
+    /// 而「路比背景更亮」是稳定的判据。换源后这个值往往要重新标定。
     pub contrast_min: u8,
     /// 骨架折线最短像素长度，短于此视为噪点。
     pub min_polyline_px: usize,
+    /// 瓦片 URL 模板：必须含 `{x}` `{y}` `{z}`，可选 `{host}`（四域名轮换）。
+    #[serde(default = "default_url_template")]
+    pub url_template: String,
+    /// 该模板对应的投影。用 OSM 保持 `WebMercator`；用百度要切 `Baidu`。
+    #[serde(default)]
+    pub projection: TileProjection,
+    /// 额外请求头（`(名称, 值)`）——自定义源需要 Referer/鉴权时用它。
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    /// 额外允许的瓦片主机（在 DEFAULT_ALLOWED_HOSTS 之外再加）。
+    ///
+    /// 不填就只有内置那两个：模板来自用户输入，不做白名单等于给自己留了
+    /// 一个能打内网的 SSRF 入口（见 `review/TILE-ROAD.md` 的「源白名单与限额」）。
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for TileConfig {
@@ -74,7 +149,45 @@ impl Default for TileConfig {
             max_chroma: 18,
             contrast_min: 8,
             min_polyline_px: 12,
+            url_template: default_url_template(),
+            projection: TileProjection::WebMercator,
+            headers: Vec::new(),
+            allowed_hosts: Vec::new(),
         }
+    }
+}
+
+impl TileConfig {
+    /// 百度预设（把 `udt`/鉴权参数补进 `url_template` 才会真的出图）。
+    pub fn baidu_preset() -> Self {
+        Self {
+            url_template: BAIDU_URL_TEMPLATE.to_string(),
+            projection: TileProjection::Baidu,
+            ..Self::default()
+        }
+    }
+
+    /// 源的简短描述（状态栏/缓存里显示）：默认 OSM、百度预设还是自定义模板。
+    pub fn describe_source(&self) -> String {
+        if self.uses_default_source() {
+            return "OSM 标准 XYZ".into();
+        }
+        if self.url_template.contains("bdimg.com") {
+            return "百度瓦片".into();
+        }
+        self.url_template
+            .split("//")
+            .nth(1)
+            .and_then(|rest| rest.split("/").next())
+            .map(|host| format!("自定义（{host}）"))
+            .unwrap_or_else(|| "自定义".into())
+    }
+
+    /// 是不是内置的 OSM 默认源（UI 上用来显示「默认 / 自定义」）。
+    pub fn uses_default_source(&self) -> bool {
+        self.url_template.trim() == DEFAULT_URL_TEMPLATE
+            && self.projection == TileProjection::WebMercator
+            && self.headers.is_empty()
     }
 }
 
@@ -152,14 +265,71 @@ pub fn mercator_to_baidu(x: f64, y: f64) -> (f64, f64) {
     (lat, lon)
 }
 
-/// 一个像素在墨卡托平面上的边长（米，不含纬度修正）。z18 ≈ 0.597 m/px。
-pub fn mercator_m_per_px(z: u8) -> f64 {
-    2.0 * BD_ORIGIN_SHIFT / (TILE_PX as f64 * (1u64 << z) as f64)
+/// 一个像素在墨卡托平面上的边长（米，不含纬度修正）。
+///
+/// z18：Web 墨卡托 ≈0.597 m/px（赤道）；百度口径几乎一样（半周长差 0.001%）。
+pub fn mercator_m_per_px(z: u8, projection: TileProjection) -> f64 {
+    2.0 * mercator_half_extent(projection) / (TILE_PX as f64 * (1u64 << z) as f64)
+}
+
+/// 该投影的墨卡托半周长（米）。
+pub fn mercator_half_extent(projection: TileProjection) -> f64 {
+    match projection {
+        TileProjection::Baidu => BD_ORIGIN_SHIFT,
+        TileProjection::WebMercator => WEB_MERCATOR_SHIFT,
+    }
 }
 
 /// 一个像素对应的**地面**米数：墨卡托尺度 × cos(纬度)。z18 北京 ≈0.46 m/px。
-pub fn meters_per_pixel(lat: f64, z: u8) -> f64 {
-    mercator_m_per_px(z) * lat.to_radians().cos().max(0.05)
+pub fn meters_per_pixel(lat: f64, z: u8, projection: TileProjection) -> f64 {
+    mercator_m_per_px(z, projection) * lat.to_radians().cos().max(0.05)
+}
+
+/// WGS84 经纬度 → Web 墨卡托米（标准 EPSG:3857）。
+pub fn web_mercator(lat: f64, lon: f64) -> (f64, f64) {
+    let x = lon * WEB_MERCATOR_SHIFT / 180.0;
+    let y =
+        ((90.0 + lat) * std::f64::consts::PI / 360.0).tan().ln() / (std::f64::consts::PI / 180.0);
+    (x, y * WEB_MERCATOR_SHIFT / 180.0)
+}
+
+/// Web 墨卡托米 → WGS84 经纬度。
+pub fn web_mercator_to_wgs84(x: f64, y: f64) -> (f64, f64) {
+    let lon = x * 180.0 / WEB_MERCATOR_SHIFT;
+    let lat = 180.0 / std::f64::consts::PI
+        * 2.0
+        * (y * std::f64::consts::PI / WEB_MERCATOR_SHIFT).exp().atan()
+        - 90.0;
+    (lat, lon)
+}
+
+/// 标准 XYZ（Web 墨卡托）瓦片编号。
+///
+/// 公开公式：`x = floor((lon+180)/360 · 2^z)`，
+/// `y = floor((1 − ln(tan φ + sec φ)/π)/2 · 2^z)`，φ 为纬度弧度。
+/// 天安门（39.9087, 116.3975）z18：
+/// `x = floor(0.823326…·262144) = 215 830`、
+/// `y = floor(0.378906…·262144) = 99 328`（与百度编号在这点恰好一致，见
+/// `baidu_tile_xy` 的注释：两个半周长只差 0.001%，同纬度落同一块瓦片属正常）。
+pub fn web_mercator_tile_xy(lat: f64, lon: f64, z: u8) -> (i64, i64) {
+    let n = (1u64 << z) as f64;
+    let x = ((lon + 180.0) / 360.0 * n).floor();
+    let lat_rad = lat.to_radians();
+    let y = ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n)
+        .floor();
+    let max = (1u64 << z) as i64 - 1;
+    (
+        x.clamp(0.0, max as f64) as i64,
+        y.clamp(0.0, max as f64) as i64,
+    )
+}
+
+/// 按投影算瓦片编号。
+pub fn tile_xy(lat: f64, lon: f64, z: u8, projection: TileProjection) -> (i64, i64) {
+    match projection {
+        TileProjection::Baidu => baidu_tile_xy(lat, lon, z),
+        TileProjection::WebMercator => web_mercator_tile_xy(lat, lon, z),
+    }
 }
 
 /// 百度瓦片编号。
@@ -207,12 +377,17 @@ impl TileRange {
     }
 }
 
-/// `bbox` 在 z 级覆盖哪些瓦片。
+/// `bbox` 在 z 级覆盖哪些瓦片（**百度投影**；新代码请用 `tile_range_with`）。
 ///
 /// 纬度越大 y 越小（行号向南增大），所以两个端点要各自算再取 min/max。
 pub fn tile_range(bbox: &Bbox, z: u8) -> TileRange {
-    let (x_a, y_a) = baidu_tile_xy(bbox.min_lat, bbox.min_lon, z);
-    let (x_b, y_b) = baidu_tile_xy(bbox.max_lat, bbox.max_lon, z);
+    tile_range_with(bbox, z, TileProjection::Baidu)
+}
+
+/// 按指定投影算覆盖 `bbox` 的瓦片区间。
+pub fn tile_range_with(bbox: &Bbox, z: u8, projection: TileProjection) -> TileRange {
+    let (x_a, y_a) = tile_xy(bbox.min_lat, bbox.min_lon, z, projection);
+    let (x_b, y_b) = tile_xy(bbox.max_lat, bbox.max_lon, z, projection);
     TileRange {
         z,
         x0: x_a.min(x_b),
@@ -254,100 +429,291 @@ pub struct Stitched {
     pub height: usize,
     pub rgb: Vec<u8>,
     pub tiles: usize,
+    /// 解码失败/被跳过的瓦片数（缺块处骨架会断线）。
+    pub skipped: usize,
     pub z: u8,
-    /// 左上角像素在墨卡托米里的坐标。
+    /// 源投影：决定像素→经纬度、以及产物是 BD-09 还是 WGS84。
+    pub projection: TileProjection,
+    /// 左上角像素在该投影的**墨卡托米**里的坐标。
     pub origin_m: (f64, f64),
 }
 
 impl Stitched {
-    /// 像素坐标 → BD-09 经纬度（用墨卡托尺度，不是地面尺度）。
-    pub fn pixel_to_bd09(&self, px: f64, py: f64) -> (f64, f64) {
-        let scale = mercator_m_per_px(self.z);
-        mercator_to_baidu(self.origin_m.0 + px * scale, self.origin_m.1 - py * scale)
+    /// 像素坐标 → 该源坐标系下的经纬度（墨卡托尺度，不是地面尺度）。
+    ///
+    /// `WebMercator` 得到 **WGS84**（OSM 原生口径，随后由 `align_network` 转 BD-09）；
+    /// `Baidu` 直接得到 BD-09（建图时标记为「已对齐」）。
+    pub fn pixel_to_latlon(&self, px: f64, py: f64) -> (f64, f64) {
+        let scale = mercator_m_per_px(self.z, self.projection);
+        let (mx, my) = (self.origin_m.0 + px * scale, self.origin_m.1 - py * scale);
+        match self.projection {
+            TileProjection::Baidu => mercator_to_baidu(mx, my),
+            TileProjection::WebMercator => web_mercator_to_wgs84(mx, my),
+        }
     }
 
-    /// 左上角像素的 BD-09 经纬度（`build_graph` 的输入）。
-    pub fn origin_bd09(&self) -> (f64, f64) {
-        self.pixel_to_bd09(0.0, 0.0)
+    /// 左上角像素的经纬度（`build_graph` 的输入）。
+    pub fn origin_latlon(&self) -> (f64, f64) {
+        self.pixel_to_latlon(0.0, 0.0)
+    }
+
+    /// 产物是否已经是 BD-09（Baidu 源）—— 决定建图时 `align_applied` 的取值。
+    pub fn is_bd09(&self) -> bool {
+        self.projection == TileProjection::Baidu
     }
 }
 
 /// 抓取并拼接瓦片。
 ///
-/// 先做预算校验（超限直接报错，一个请求都不发）；再按四域名轮换逐张抓，单张失败
-/// 重试一次 —— 缺块会让骨架在接缝处断开，看起来像「路没了」，所以拿不全就整体失败。
-pub fn fetch_tiles(agent: &Agent, bbox: &Bbox, cfg: &TileConfig) -> Result<Stitched, String> {
-    let range = tile_range(bbox, cfg.z);
+/// 先做预算校验与模板校验（超限 / 模板缺占位符 → 一个请求都不发）；再逐张抓，
+/// 单张失败重试一次 —— 缺块会让骨架在接缝处断开，看起来像「路没了」，拿不全就整体失败。
+pub fn fetch_tiles(
+    agent: &Agent,
+    bbox: &Bbox,
+    cfg: &TileConfig,
+    cancel: &dyn Fn() -> Result<(), String>,
+) -> Result<Stitched, String> {
+    let range = tile_range_with(bbox, cfg.z, cfg.projection);
     let count = check_budget(&range, cfg)?;
+    // 模板先校验一遍：免得抓了一半才发现 URL 拼不出来。
+    tile_request_spec(cfg, range.x0, range.y0, cfg.z, 0)?;
     let width = range.cols() as usize * TILE_PX;
     let height = range.rows() as usize * TILE_PX;
     let mut rgb = vec![255u8; width * height * 3];
     let mut served = 0usize;
+    let mut skipped = 0usize;
     for (row, y) in (range.y0..=range.y1).enumerate() {
         for (col, x) in (range.x0..=range.x1).enumerate() {
-            let png = fetch_one(agent, x, y, cfg.z, served)?;
+            // F5：每张之间检查取消，UI 点了取消就不再继续发请求。
+            cancel()?;
+            let png = fetch_one(agent, cfg, x, y, served)?;
             served += 1;
-            blit(&mut rgb, width, height, col * TILE_PX, row * TILE_PX, &png);
+            if let Err(reason) = blit(&mut rgb, width, height, col * TILE_PX, row * TILE_PX, &png) {
+                // F2：解码失败不静默吞，计数上报（缺块会让骨架断线，必须让人看见）。
+                skipped += 1;
+                eprintln!("[tiles] 瓦片解码失败（x={x} y={y}）：{reason}");
+            }
         }
     }
-    let span = 2.0 * BD_ORIGIN_SHIFT / (1u64 << cfg.z) as f64;
+    let shift = mercator_half_extent(cfg.projection);
+    let span = 2.0 * shift / (1u64 << cfg.z) as f64;
     Ok(Stitched {
         width,
         height,
         rgb,
         tiles: count,
+        skipped,
         z: cfg.z,
+        projection: cfg.projection,
         origin_m: (
-            range.x0 as f64 * span - BD_ORIGIN_SHIFT,
-            BD_ORIGIN_SHIFT - range.y0 as f64 * span,
+            range.x0 as f64 * span - shift,
+            shift - range.y0 as f64 * span,
         ),
     })
 }
 
-/// 抓单张瓦片：四域名轮换 + 限速 + 失败重试一次。
-fn fetch_one(agent: &Agent, x: i64, y: i64, z: u8, index: usize) -> Result<Vec<u8>, String> {
+/// 把 URL 模板填成一条请求：返回（URL, 需要附加的 header）。
+///
+/// 占位符 `{x}`/`{y}`/`{z}` 必填，`{host}` 可选 —— 出现时按四域名轮换
+/// （百度预设用 `maponline{host}.bdimg.com`；OSM 模板里没有它，就不会轮换）。
+/// 缺占位符**直接报错**，不发出坏请求（否则服务端回一堆 404/占位图，反而更难查）。
+pub fn tile_request_spec(
+    cfg: &TileConfig,
+    x: i64,
+    y: i64,
+    z: u8,
+    index: usize,
+) -> Result<(String, Vec<(String, String)>), String> {
+    let template = cfg.url_template.trim();
+    if template.is_empty() {
+        return Err(format!(
+            "瓦片 URL 模板为空：默认是 {DEFAULT_URL_TEMPLATE}。要用百度就把浏览器里抓到的完整模板粘进来"
+        ));
+    }
+    for placeholder in ["{x}", "{y}", "{z}"] {
+        if !template.contains(placeholder) {
+            return Err(format!(
+                "瓦片 URL 模板缺少 {placeholder} 占位符（需要 {{x}}/{{y}}/{{z}}）：{template}"
+            ));
+        }
+    }
     let host = TILE_HOST_PREFIXES[index % TILE_HOST_PREFIXES.len()];
-    let url = format!(
-        "https://maponline{host}.bdimg.com/tile/?qt=tile&x={x}&y={y}&z={z}&styles=pl&scaler=1"
+    let filled = template
+        .replace("{x}", &x.to_string())
+        .replace("{y}", &y.to_string())
+        .replace("{z}", &z.to_string())
+        .replace("{host}", host);
+    validate_tile_url(&filled, cfg)?;
+    Ok((filled, cfg.headers.clone()))
+}
+
+/// 校验一条已填好的瓦片 URL：只允许 `https://` 绝对地址 + 白名单主机，并拒绝私网/回环字面量。
+///
+/// 为什么必须做：`url_template` 是**用户可输入**的，不做校验等于给程序塞了一个
+/// 能打内网的 SSRF 入口（`http://127.0.0.1:8080/...`、`http://192.168.1.1/...`）。
+/// 拒绝时**明确报错**，不静默回退默认源 —— 否则用户以为自己在用自己的源，
+/// 其实一直在打 OSM。
+pub fn validate_tile_url(url: &str, cfg: &TileConfig) -> Result<(), String> {
+    let lower = url.trim().to_ascii_lowercase();
+    if !lower.starts_with("https://") {
+        return Err(format!(
+            "瓦片 URL 必须是以 https:// 开头的绝对地址（收到「{}」）：\
+             不支持 http/file/ftp 或相对路径",
+            url.split(':').next().unwrap_or("")
+        ));
+    }
+    let rest = &lower["https://".len()..];
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@') // 去掉 userinfo
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .to_string();
+    if host.is_empty() {
+        return Err(format!("瓦片 URL 解析不出主机名：{url}"));
+    }
+    // 私网 / 回环 / 本地名一律拒绝：这些是 SSRF 最直接的目标。
+    let private = host == "localhost"
+        || host == "0.0.0.0"
+        || host == "::1"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => {
+                    v4.is_loopback()
+                        || v4.is_private()
+                        || v4.is_link_local()
+                        || v4.is_unspecified()
+                        || v4.is_broadcast()
+                }
+                std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+            })
+            .unwrap_or(false);
+    if private {
+        return Err(format!(
+            "瓦片 URL 指向私网/回环地址（{host}），已拒绝：瓦片源必须是公网地址"
+        ));
+    }
+    // 白名单：内置 + 配置里显式加的（大小写不敏感；`foo.com` 也算 `*.foo.com`）。
+    let mut allowed: Vec<String> = DEFAULT_ALLOWED_HOSTS
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    allowed.extend(
+        cfg.allowed_hosts
+            .iter()
+            .map(|h| h.trim().to_ascii_lowercase()),
     );
+    let matched = allowed.iter().any(|entry| {
+        let entry = entry.trim_start_matches('.');
+        !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
+    });
+    if !matched {
+        return Err(format!(
+            "瓦片主机 {host} 不在白名单里。默认只允许 {}；\
+             要加源请把主机名写进配置的 allowed_hosts（不要用 IP 或 localhost）",
+            DEFAULT_ALLOWED_HOSTS.join(" / ")
+        ));
+    }
+    Ok(())
+}
+
+/// 一张瓦片的响应是否只是「占位图」（几十到几百字节的单色 PNG）。
+///
+/// 百度匿名口子被封后回的就是这种：HTTP 200 + 197 字节的纯色 256×256。
+/// 单独成函数便于离线测试，也让这条判据不只散在抓取循环里。
+pub fn is_placeholder_tile(bytes: &[u8]) -> bool {
+    bytes.len() < 512
+}
+
+/// 抓单张瓦片：限速 + 失败重试一次（域名轮换由模板里的 `{host}` 决定）。
+fn fetch_one(
+    agent: &Agent,
+    cfg: &TileConfig,
+    x: i64,
+    y: i64,
+    index: usize,
+) -> Result<Vec<u8>, String> {
+    let (url, headers) = tile_request_spec(cfg, x, y, cfg.z, index)?;
     // 同一出口连打瓦片比连打接口更容易被限流，慢一点更稳。
     std::thread::sleep(std::time::Duration::from_millis(180));
     let mut last = String::new();
     for attempt in 0..2 {
-        let outcome = agent
+        let mut request = agent
             .get(&url)
-            .set("User-Agent", crate::crypto::header::UA_IOS)
-            .call();
-        match outcome {
+            .set("User-Agent", crate::crypto::header::UA_IOS);
+        for (key, value) in &headers {
+            request = request.set(key, value);
+        }
+        match request.call() {
             Ok(resp) => {
                 let status = resp.status();
                 let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)
-                    .map_err(|e| format!("瓦片读取失败（z{z} x{x} y{y}）：{e}"))?;
+                // 上限 +1 是为了区分「正好等于上限」和「超了」。
+                let mut reader = resp.into_reader();
+                // 上限 +1 是为了区分「正好等于上限」和「超了」。
+                let limited = std::io::Read::take(&mut reader, MAX_TILE_BYTES as u64 + 1);
+                std::io::Read::read_to_end(&mut { limited }, &mut buf)
+                    .map_err(|e| format!("瓦片读取失败（z{} x{x} y{y}）：{e}", cfg.z))?;
+                if buf.len() > MAX_TILE_BYTES {
+                    last = format!(
+                        "瓦片超过单张读取上限（{} MiB），按坏图处理",
+                        MAX_TILE_BYTES / 1024 / 1024
+                    );
+                    break;
+                }
                 if status == 403 || status == 401 {
                     last = format!("瓦片被拒绝（HTTP {status}）");
-                } else if buf.len() < 512 {
-                    last = format!("瓦片内容过短（{} 字节，可能是占位图）", buf.len());
+                } else if is_placeholder_tile(&buf) {
+                    last = format!(
+                        "瓦片内容过短（{} 字节，可能是占位图）——很多服务不再对匿名请求出图",
+                        buf.len()
+                    );
                 } else {
                     return Ok(buf);
                 }
             }
-            Err(e) => last = format!("瓦片请求失败（z{z} x{x} y{y}）：{e}"),
+            Err(e) => last = format!("瓦片请求失败（z{} x{x} y{y}）：{e}", cfg.z),
         }
         if attempt == 0 {
             std::thread::sleep(std::time::Duration::from_millis(600));
         }
     }
     Err(format!(
-        "{last}。可换网络或稍后重试；也可以先切回「真实道路」，或到路网页人工导入 OSM 路网"
+        "{last}。默认源是 {DEFAULT_URL_TEMPLATE}（免鉴权）；自定义源请确认模板与 header 与浏览器里抓到的完全一致。\
+         也可以切回「真实道路」，或到路网页人工导入 OSM 路网"
     ))
 }
 
 /// 把一张 PNG 瓦片贴到大图（越界像素丢弃）。
-fn blit(dst: &mut [u8], dst_w: usize, dst_h: usize, x0: usize, y0: usize, png: &[u8]) {
-    let Ok(decoded) = image::load_from_memory(png) else {
-        return;
-    };
+fn blit(
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+    x0: usize,
+    y0: usize,
+    png: &[u8],
+) -> Result<(), String> {
+    // 解码上限与 `ui/captcha.rs` 同款：`load_from_memory` 不限尺寸，
+    // 一张伪造的大图能把内存吃光（瓦片来自网络，必须当不可信输入）。
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_TILE_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_TILE_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_TILE_IMAGE_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|e| format!("解码失败：{e}"))?;
     let img = decoded.to_rgb8();
     for (y, row) in img.rows().enumerate() {
         let dy = y0 + y;
@@ -363,6 +729,7 @@ fn blit(dst: &mut [u8], dst_w: usize, dst_h: usize, x0: usize, y0: usize, png: &
             dst[at..at + 3].copy_from_slice(&px.0);
         }
     }
+    Ok(())
 }
 
 // ── 道路像素分类 ────────────────────────────────────────────────────────
@@ -722,8 +1089,14 @@ fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 /// 生成统计（写进缓存，也用于状态栏汇报）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Stats {
+    /// 瓦片源描述（主机名；自定义模板时为「自定义」）。
+    #[serde(default)]
+    pub source: String,
     pub tiles: usize,
     pub road_ratio: f64,
+    /// 解码失败被跳过的瓦片数。
+    #[serde(default)]
+    pub skipped: usize,
     pub polylines: usize,
     pub nodes: usize,
     pub edges: usize,
@@ -735,9 +1108,16 @@ pub struct Stats {
 impl Stats {
     /// 给状态栏的一行话。
     pub fn summary(&self) -> String {
+        let skipped = if self.skipped > 0 {
+            format!("（{} 张解码失败已跳过）", self.skipped)
+        } else {
+            String::new()
+        };
         format!(
-            "瓦片 {} 张 / 道路像素占比 {:.2}% / 折线 {} 条 / 节点 {} / 耗时 {} ms",
+            "源 {} · 瓦片 {} 张{} / 占比 {:.2}% / 折线 {} 条 / 节点 {} / 耗时 {} ms",
+            self.source,
             self.tiles,
+            skipped,
             self.road_ratio * 100.0,
             self.polylines,
             self.nodes,
@@ -751,6 +1131,12 @@ impl Stats {
 struct Cache {
     version: u32,
     source: String,
+    /// 归属：学校 unid（+ 校区 key）。不同学校/校区共用一个缓存会走出别人的路网。
+    #[serde(default)]
+    owner: String,
+    /// 产物的坐标系（Baidu=BD-09，WebMercator=WGS84），回读时决定 align_applied。
+    #[serde(default)]
+    projection: TileProjection,
     z: u8,
     bbox: Bbox,
     generated_at_ms: i64,
@@ -773,40 +1159,53 @@ pub fn pixels_to_bd09(stitched: &Stitched, lines: &[Vec<(f64, f64)>]) -> Vec<Vec
         .iter()
         .map(|line| {
             line.iter()
-                .map(|&(x, y)| stitched.pixel_to_bd09(x, y))
+                .map(|&(x, y)| stitched.pixel_to_latlon(x, y))
                 .collect()
         })
         .collect()
 }
 
-/// 像素折线 + 左上角 BD-09 原点 → `RoadGraph`。
+/// 像素折线 + 左上角经纬度原点 → `RoadGraph`。
 ///
 /// 像素→经纬度用局部仿射（每像素固定米数）：校区尺度（几公里）误差在亚米级，
 /// 对「沿道路行进」没有影响；跨城市使用才需要换投影。
+///
+/// `aligned` 表示传入原点/产物**已经是 BD-09**（百度源）。WebMercator 源得到的是
+/// WGS84，必须传 `false` —— 之后由 `align_network` 做一次 WGS84→BD-09；
+/// 若这里误标成已对齐，轨迹会整体偏到隔壁街区（而且看起来仍"像一条路"）。
 pub fn build_graph(
     lines_px: &[Vec<(f64, f64)>],
-    origin_bd09: (f64, f64),
+    origin_latlon: (f64, f64),
     m_per_px: f64,
     merge_m: f64,
+    aligned: bool,
 ) -> RoadGraph {
     let dlat = m_per_px / 111_320.0;
-    let dlon = m_per_px / (111_320.0 * origin_bd09.0.to_radians().cos().max(0.05));
+    let dlon = m_per_px / (111_320.0 * origin_latlon.0.to_radians().cos().max(0.05));
     let lines: Vec<Vec<(f64, f64)>> = lines_px
         .iter()
         .map(|line| {
             line.iter()
-                .map(|&(x, y)| (origin_bd09.0 - y * dlat, origin_bd09.1 + x * dlon))
+                .map(|&(x, y)| (origin_latlon.0 - y * dlat, origin_latlon.1 + x * dlon))
                 .collect()
         })
         .collect();
-    assemble_graph(&lines, merge_m)
+    assemble_graph(&lines, merge_m, aligned)
 }
 
-/// BD-09 折线 → `RoadGraph`（缓存回读走这条）。
+/// BD-09 折线 → `RoadGraph`（百度源的缓存回读走这条）。
 pub fn graph_from_bd09(lines: &[Vec<(f64, f64)>], merge_m: f64) -> RoadGraph {
-    assemble_graph(lines, merge_m)
+    assemble_graph(lines, merge_m, true)
 }
 
+/// 任意经纬度折线 → `RoadGraph`；`aligned` 语义同 `build_graph`。
+pub fn graph_from_latlon(
+    lines: &[Vec<(f64, f64)>],
+    merge_m: f64,
+    projection: TileProjection,
+) -> RoadGraph {
+    assemble_graph(lines, merge_m, projection == TileProjection::Baidu)
+}
 fn cell_of(point: (f64, f64), merge: f64) -> (i64, i64) {
     let cell_lat = merge / 111_320.0;
     let cell_lon = merge / (111_320.0 * point.0.to_radians().cos().max(0.05));
@@ -820,7 +1219,7 @@ fn cell_of(point: (f64, f64), merge: f64) -> (i64, i64) {
 ///
 /// 只有端点距离 ≤ `merge_m` 才共用节点 —— 不相邻的两条路不会被并到一起
 /// （用例 `parallel_roads_stay_two_components` 就是在防这个）。
-fn assemble_graph(lines: &[Vec<(f64, f64)>], merge_m: f64) -> RoadGraph {
+fn assemble_graph(lines: &[Vec<(f64, f64)>], merge_m: f64, aligned: bool) -> RoadGraph {
     let mut graph = RoadGraph::new();
     let merge = merge_m.max(0.05);
     let mut nodes: Vec<(f64, f64)> = Vec::new();
@@ -876,8 +1275,9 @@ fn assemble_graph(lines: &[Vec<(f64, f64)>], merge_m: f64) -> RoadGraph {
         }
     }
     graph.compute_anchor();
-    // 节点本身就是 BD-09：标记成「已对齐」，避免 `align_network` 再平移一次。
-    graph.align_applied = true;
+    // Baidu 源：节点已是 BD-09 → 标记已对齐，避免 `align_network` 再平移一次。
+    // WebMercator 源：节点是 WGS84 → 保持 false，让 `align_network` 转一次。
+    graph.align_applied = aligned;
     graph
 }
 
@@ -895,9 +1295,11 @@ pub fn generate(
     bbox: &Bbox,
     cfg: &TileConfig,
     out_path: &std::path::Path,
+    owner: &str,
+    cancel: &dyn Fn() -> Result<(), String>,
 ) -> Result<(Stats, RoadGraph), String> {
     let started = std::time::Instant::now();
-    let stitched = fetch_tiles(agent, bbox, cfg)?;
+    let stitched = fetch_tiles(agent, bbox, cfg, cancel)?;
     let mask = classify_roads(&stitched.rgb, stitched.width, stitched.height, cfg);
     let road_px = mask.iter().filter(|v| **v == 1).count();
     let ratio = road_px as f64 / mask.len().max(1) as f64;
@@ -928,7 +1330,7 @@ pub fn generate(
         );
     }
     let (lat_c, _) = bbox.center();
-    let m_per_px = meters_per_pixel(lat_c, cfg.z);
+    let m_per_px = meters_per_pixel(lat_c, cfg.z, cfg.projection);
     let tol_px = (cfg.simplify_m / m_per_px.max(0.01)).max(0.8);
     let simplified: Vec<Vec<(f64, f64)>> = traced
         .iter()
@@ -936,14 +1338,23 @@ pub fn generate(
         .filter(|line| line.len() >= 2)
         .collect();
     let polylines = pixels_to_bd09(&stitched, &simplified);
-    // 图按局部仿射建（与缓存回读同一套逻辑），缓存里存经纬度，回读不依赖 z。
-    let graph = build_graph(&simplified, stitched.origin_bd09(), m_per_px, cfg.merge_m);
+    // 图按局部仿射建（与缓存回读同一套逻辑）；Baidu 源的经纬度已是 BD-09，
+    // WebMercator 源是 WGS84（留给 align_network 做 BD 对齐，不能标记成已对齐）。
+    let graph = build_graph(
+        &simplified,
+        stitched.origin_latlon(),
+        m_per_px,
+        cfg.merge_m,
+        stitched.is_bd09(),
+    );
     if graph.graph.edge_count() == 0 {
         return Err("折线没能连成路网（全部是不连通的孤立点）。可降低 z 或换更大范围重试".into());
     }
     let stats = Stats {
+        source: cfg.describe_source(),
         tiles: stitched.tiles,
         road_ratio: ratio,
+        skipped: stitched.skipped,
         polylines: polylines.len(),
         nodes: graph.graph.node_count(),
         edges: graph.graph.edge_count(),
@@ -951,7 +1362,7 @@ pub fn generate(
         z: cfg.z,
         generated_at_ms: crate::crypto::envelope::now_ms(),
     };
-    save_cache(out_path, bbox, &stats, &polylines)?;
+    save_cache(out_path, bbox, &stats, &polylines, cfg.projection, owner)?;
     Ok((stats, graph))
 }
 
@@ -961,10 +1372,14 @@ pub fn save_cache(
     bbox: &Bbox,
     stats: &Stats,
     polylines: &[Vec<(f64, f64)>],
+    projection: TileProjection,
+    owner: &str,
 ) -> Result<(), String> {
     let cache = Cache {
         version: CACHE_VERSION,
-        source: "baidu-tile-pl".into(),
+        source: stats.source.clone(),
+        owner: owner.to_string(),
+        projection,
         z: stats.z,
         bbox: *bbox,
         generated_at_ms: stats.generated_at_ms,
@@ -977,7 +1392,20 @@ pub fn save_cache(
 }
 
 /// 读缓存：返回统计与路网（节点已是 BD-09，不需要再对齐）。
+/// 不带归属校验的读缓存（测试/离线场景）。
 pub fn load(path: &std::path::Path) -> Result<(Stats, RoadGraph), String> {
+    load_checked(path, "", None)
+}
+
+/// 带归属校验的读缓存：`owner` 非空时要求与写入时一致；`bbox` 非空时要求范围重叠。
+///
+/// F3：缓存是**磁盘上的文件**，可能被别的学校/校区覆盖，也可能是旧范围留下的。
+/// 不校验就会「在我的校区里走出别人学校的路」——而且看起来完全正常。
+pub fn load_checked(
+    path: &std::path::Path,
+    owner: &str,
+    bbox: Option<&Bbox>,
+) -> Result<(Stats, RoadGraph), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("读取瓦片路网缓存失败（{}）：{e}", path.display()))?;
     let cache: Cache =
@@ -991,7 +1419,30 @@ pub fn load(path: &std::path::Path) -> Result<(Stats, RoadGraph), String> {
     if cache.polylines.is_empty() {
         return Err("瓦片路网缓存里没有折线，请重新生成".into());
     }
-    let graph = graph_from_bd09(&cache.polylines, 3.0);
+    // F3：归属校验。缓存是磁盘文件，可能被别的学校/校区覆盖，或是旧范围留下的。
+    if !owner.trim().is_empty() && cache.owner.trim() != owner.trim() {
+        return Err(format!(
+            "瓦片路网缓存属于「{}」，与当前学校「{owner}」不符：请在跑步页重新点「生成瓦片路网」",
+            if cache.owner.trim().is_empty() {
+                "未知（旧版本缓存）"
+            } else {
+                cache.owner.trim()
+            }
+        ));
+    }
+    if let Some(want) = bbox {
+        // 租约要求「实际重叠」：只要有一块交集就还能用（抓图半径常按锚点浮动）。
+        let overlap = want.min_lat <= cache.bbox.max_lat
+            && want.max_lat >= cache.bbox.min_lat
+            && want.min_lon <= cache.bbox.max_lon
+            && want.max_lon >= cache.bbox.min_lon;
+        if !overlap {
+            return Err(
+                "瓦片路网缓存的范围与当前定位/围栏不重叠：请在跑步页重新点「生成瓦片路网」".into(),
+            );
+        }
+    }
+    let graph = graph_from_latlon(&cache.polylines, 3.0, cache.projection);
     Ok((cache.stats, graph))
 }
 
@@ -1101,8 +1552,8 @@ mod tests {
         assert!(north.1 < y18, "向北应让 y 变小");
 
         // ⑤ 尺度：z18 墨卡托 ≈0.60 m/px；北京地面 ≈0.46 m/px。
-        assert!((mercator_m_per_px(18) - 0.597).abs() < 0.002);
-        assert!((meters_per_pixel(39.9087, 18) - 0.458).abs() < 0.005);
+        assert!((mercator_m_per_px(18, TileProjection::Baidu) - 0.597).abs() < 0.002);
+        assert!((meters_per_pixel(39.9087, 18, TileProjection::Baidu) - 0.458).abs() < 0.005);
     }
 
     #[test]
@@ -1154,7 +1605,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "两条平行路应追出 2 条线");
 
         // 像素带进图：两条线相距约 64px（≈38m），远大于合并容差 3m。
-        let graph = build_graph(&lines, (39.9, 116.4), 0.597, 3.0);
+        let graph = build_graph(&lines, (39.9, 116.4), 0.597, 3.0, true);
         assert_eq!(
             components(&graph),
             2,
@@ -1174,6 +1625,8 @@ mod tests {
             vec![(39.902, 116.4), (39.903, 116.399)],
         ];
         let stats = Stats {
+            source: "自定义（tile.example.org）".into(),
+            skipped: 0,
             tiles: 4,
             road_ratio: 0.052,
             polylines: 2,
@@ -1184,7 +1637,15 @@ mod tests {
             generated_at_ms: 1_700_000_000_000,
         };
         let bbox = Bbox::around(39.9, 116.4, 400.0);
-        save_cache(&path, &bbox, &stats, &lines).unwrap();
+        save_cache(
+            &path,
+            &bbox,
+            &stats,
+            &lines,
+            TileProjection::Baidu,
+            "unid-1",
+        )
+        .unwrap();
 
         let (loaded, graph) = load(&path).unwrap();
         assert_eq!(loaded.polylines, 2);
@@ -1243,6 +1704,208 @@ mod tests {
             road_ratio_is_plausible(ratio),
             "正常十字图的占比 {ratio:.3} 不该被拒"
         );
+    }
+
+    /// ① URL 模板：占位符替换正确；缺 `{x}` 明确报错（且不发出坏请求）。
+    #[test]
+    fn url_template_is_filled_and_missing_placeholders_are_rejected() {
+        let mut cfg = TileConfig::default();
+        assert_eq!(cfg.url_template, DEFAULT_URL_TEMPLATE, "默认必须是 OSM");
+        let (url, headers) = tile_request_spec(&cfg, 12, 34, 18, 0).unwrap();
+        assert_eq!(url, "https://tile.openstreetmap.org/18/12/34.png");
+        assert!(headers.is_empty(), "默认源不需要额外 header");
+
+        // 自定义查询串 + {host} 轮换 + 自定义 header
+        let custom = TileConfig {
+            url_template:
+                "https://maponline{host}.bdimg.com/tile/?qt=tile&x={x}&y={y}&z={z}&styles=pl".into(),
+            projection: TileProjection::Baidu,
+            headers: vec![("Referer".into(), "https://map.baidu.com/".into())],
+            ..TileConfig::default()
+        };
+        let (url, headers) = tile_request_spec(&custom, 7, 8, 18, 3).unwrap();
+        assert!(
+            url.contains("maponline3.bdimg.com"),
+            "四域名轮换失效：{url}"
+        );
+        assert!(url.contains("x=7") && url.contains("y=8") && url.contains("z=18"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Referer", "自定义 header 必须原样带出");
+
+        // 缺占位符：明确报错，不会拼出坏 URL
+        for broken in [
+            "https://example.com/{z}/{y}.png",
+            "https://example.com/{z}/{x}.png",
+            "https://example.com/fixed.png",
+        ] {
+            let cfg = TileConfig {
+                url_template: broken.into(),
+                ..TileConfig::default()
+            };
+            let err = tile_request_spec(&cfg, 1, 2, 18, 0).unwrap_err();
+            assert!(err.contains("占位符"), "{broken} → {err}");
+        }
+        // 空模板也给可操作提示
+        let empty = TileConfig {
+            url_template: "   ".into(),
+            ..TileConfig::default()
+        };
+        assert!(tile_request_spec(&empty, 1, 2, 18, 0)
+            .unwrap_err()
+            .contains(DEFAULT_URL_TEMPLATE));
+    }
+
+    /// ② 默认源（Web 墨卡托）的编号换算：与公开公式手算值一致。
+    #[test]
+    fn default_projection_matches_the_public_xyz_formula() {
+        // 天安门（WGS84 近似，与 BD-09 差一个固定偏移，这里只验证公式本身）
+        let (x18, y18) = web_mercator_tile_xy(39.9087, 116.3975, 18);
+        // 手算：x = floor((116.3975+180)/360 · 2^18) = floor(0.823326…·262144) = 215830
+        //       y = floor((1 − ln(tan φ + sec φ)/π)/2 · 2^18) = floor(0.378906…·262144) = 99328
+        assert_eq!((x18, y18), (215_830, 99_328), "与公开公式手算值不一致");
+        // z 每降一级正好折半
+        assert_eq!(
+            web_mercator_tile_xy(39.9087, 116.3975, 17),
+            (x18 / 2, y18 / 2)
+        );
+        // 方向：向东 x 增、向北 y 减；且编号被夹在 [0, 2^z)
+        let east = web_mercator_tile_xy(39.9087, 116.4075, 18);
+        assert!(east.0 > x18 && east.1 == y18);
+        let north = web_mercator_tile_xy(39.9187, 116.3975, 18);
+        assert!(north.1 < y18);
+        assert!(web_mercator_tile_xy(-85.0, 179.9, 18).0 < (1i64 << 18));
+        // 默认投影确实是 WebMercator，且两条投影路径都可用的
+        assert_eq!(
+            TileConfig::default().projection,
+            TileProjection::WebMercator
+        );
+        assert_eq!(TileProjection::from_str("baidu"), TileProjection::Baidu);
+        assert_eq!(
+            TileProjection::from_str("随便写"),
+            TileProjection::WebMercator
+        );
+        // 用哪种投影算范围都成立（同一个 bbox 两种编号都各有结果）
+        let bbox = Bbox::around(39.9087, 116.3975, 200.0);
+        assert!(tile_range_with(&bbox, 18, TileProjection::Baidu).count() > 0);
+        assert!(tile_range_with(&bbox, 18, TileProjection::WebMercator).count() > 0);
+    }
+
+    /// ③ 占位图 / 空白图仍被两道守卫挡住（<512 字节 + 道路占比上限）。
+    #[test]
+    fn placeholder_and_blank_tiles_are_still_guarded() {
+        // 197 字节正是百度匿名口子被封后的响应大小
+        assert!(is_placeholder_tile(&[0u8; 197]));
+        assert!(is_placeholder_tile(&[0u8; 511]));
+        assert!(!is_placeholder_tile(&[0u8; 512]));
+        // 空白图即使绕过字节守卫，也会被占比上限拦住
+        let white = Canvas::new(64, 64, 255);
+        let cfg = TileConfig::default();
+        let mask = classify_roads(&white.rgb, white.width, white.height, &cfg);
+        let ratio = count(&mask) as f64 / mask.len() as f64;
+        assert!(!road_ratio_is_plausible(ratio), "空白图必须被拒");
+    }
+
+    /// F1：源白名单与协议限制（SSRF 面）。拒绝必须**明确报错**，不静默回退默认源。
+    #[test]
+    fn tile_source_whitelist_rejects_unsafe_urls() {
+        let cfg = TileConfig::default();
+        // 允许：默认 OSM 与百度预设
+        assert!(validate_tile_url("https://tile.openstreetmap.org/18/1/2.png", &cfg).is_ok());
+        assert!(validate_tile_url("https://maponline0.bdimg.com/tile/?x=1", &cfg).is_ok());
+        // 非 https / 非绝对地址：一律拒
+        for bad in [
+            "http://tile.openstreetmap.org/18/1/2.png",
+            "file:///etc/passwd",
+            "ftp://tile.openstreetmap.org/18/1/2.png",
+            "/mnt/tiles/{z}/{x}/{y}.png",
+        ] {
+            let err = validate_tile_url(bad, &cfg).unwrap_err();
+            assert!(err.contains("https://"), "{bad} → {err}");
+        }
+        // 私网 / 回环 / 本地名：即使加进白名单也拒
+        let mut permissive = TileConfig::default();
+        permissive.allowed_hosts =
+            vec!["localhost".into(), "127.0.0.1".into(), "192.168.1.1".into()];
+        for bad in [
+            "https://127.0.0.1:8080/tiles/{z}/{x}/{y}.png",
+            "https://localhost/t/1.png",
+            "https://192.168.1.1/t.png",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/t.png",
+            "https://router.local/t.png",
+        ] {
+            assert!(
+                validate_tile_url(bad, &permissive).is_err(),
+                "私网地址必须被拒：{bad}"
+            );
+        }
+        // 不在白名单的公网主机：拒，并提示怎么加
+        let err = validate_tile_url("https://evil.example.com/{z}/{x}/{y}.png", &cfg).unwrap_err();
+        assert!(
+            err.contains("白名单") && err.contains("allowed_hosts"),
+            "{err}"
+        );
+        // 显式加进 allowed_hosts 后放行
+        let mut custom = TileConfig::default();
+        custom.allowed_hosts = vec!["tile.example.com".into()];
+        assert!(validate_tile_url("https://tile.example.com/18/1/2.png", &custom).is_ok());
+    }
+
+    /// F3：缓存带归属（owner + bbox），不符要拒绝而不是照用。
+    #[test]
+    fn cache_is_scoped_to_school_and_area() {
+        let dir = std::env::temp_dir().join(format!("tile-own-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile-road.json");
+        let bbox = Bbox::around(39.9, 116.4, 300.0);
+        let stats = Stats {
+            source: "OSM 标准 XYZ".into(),
+            tiles: 4,
+            road_ratio: 0.05,
+            skipped: 2,
+            polylines: 1,
+            nodes: 2,
+            edges: 2,
+            elapsed_ms: 10,
+            z: 18,
+            generated_at_ms: 1,
+        };
+        let lines = vec![vec![(39.9, 116.4), (39.901, 116.401)]];
+        save_cache(
+            &path,
+            &bbox,
+            &stats,
+            &lines,
+            TileProjection::WebMercator,
+            "unid-1",
+        )
+        .unwrap();
+
+        // 自带归属性：统计里要能看见「跳过 2 张」
+        assert!(
+            stats.summary().contains("2 张解码失败"),
+            "{}",
+            stats.summary()
+        );
+
+        // 学校不符 → 拒
+        let err = match load_checked(&path, "unid-2", Some(&bbox)) {
+            Ok(_) => panic!("归属不符的缓存不该被读进来"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unid-1") && err.contains("学校"), "{err}");
+        // 范围不重叠 → 拒
+        let far = Bbox::around(31.2, 121.5, 300.0);
+        let err = match load_checked(&path, "unid-1", Some(&far)) {
+            Ok(_) => panic!("范围不重叠的缓存不该被读进来"),
+            Err(e) => e,
+        };
+        assert!(err.contains("范围"), "{err}");
+        // 归属与范围都对 → 通过（WebMercator 源不应标记为已对齐）
+        let (loaded, graph) = load_checked(&path, "unid-1", Some(&bbox)).unwrap();
+        assert_eq!(loaded.tiles, 4);
+        assert!(!graph.align_applied, "OSM 源是 WGS84，不能标记成已对齐");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn too_many_tiles_is_refused_before_fetching() {

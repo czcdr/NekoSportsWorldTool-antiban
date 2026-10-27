@@ -539,7 +539,7 @@ impl App {
                     if ui
                         .add_enabled(!busy, egui::Button::new("生成瓦片路网"))
                         .on_hover_text(
-                            "按当前学校围栏（没有围栏则用定位锚点 ±700m）抓百度瓦片，\
+                            "按当前学校围栏（没有围栏则用定位锚点 ±700m）抓瓦片，\
                              识别道路后建图；结果缓存到数据目录，下次直接复用",
                         )
                         .clicked()
@@ -549,6 +549,23 @@ impl App {
                     if !self.osm_page.status.is_empty() {
                         ui.colored_label(theme::plain(), &self.osm_page.status);
                     }
+                });
+                // 源说明：默认 OSM 免鉴权；百度匿名口子已封，要用就把浏览器里抓到的
+                // 完整瓦片 URL 模板贴进来（投影按 bdimg.com 自动切）。
+                ui.colored_label(
+                    theme::text_dim(),
+                    "瓦片源：默认 OSM 栅格（免鉴权）。要用百度/自建源，把浏览器里抓到的完整\
+                     瓦片 URL 模板粘到下面（需含 {x}/{y}/{z}；百度还要在 config.json 的 \
+                     tile_headers 里补 Referer 等请求头），主机不在白名单时先在 \
+                     tile_allowed_hosts 里加。",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("URL 模板：");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.tile_url_template)
+                            .hint_text("留空 = https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+                            .desired_width(320.0),
+                    );
                 });
             }
         }

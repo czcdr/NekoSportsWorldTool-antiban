@@ -347,21 +347,36 @@ impl App {
         ));
         let net_tx = self.net_tx.clone();
         let control = self.osm_page.cancel.clone();
-        let cfg = crate::track::tile_road::TileConfig::default();
+        // 瓦片源来自配置（默认 OSM）；用户粘的自定义模板也走这里。
+        let cfg = self.config.tile_config();
         let path = crate::track::tile_road::default_cache_path();
+        let owner = session.unid.clone();
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let client = tx.client(identity, Some(session));
             let stage = |message: &str| {
                 let _ = tx.send(format!("__ROAD_STAGE__{request_id}|{message}"));
             };
-            stage("抓取百度瓦片…");
+            stage("抓取瓦片…");
             let result = (|| {
                 control.check()?;
-                let generated =
-                    crate::track::tile_road::generate(&client.agent, &bbox, &cfg, &path)?;
-                let (stats, graph) = generated;
+                // F5：取消检查传进抓图循环，每张瓦片之间都会问一次。
+                let cancel = || control.check();
+                let (stats, graph) = crate::track::tile_road::generate(
+                    &client.agent,
+                    &bbox,
+                    &cfg,
+                    &path,
+                    &owner,
+                    &cancel,
+                )?;
                 log(&format!("√ [tiles] {}", stats.summary()));
+                if stats.skipped > 0 {
+                    log(&format!(
+                        "⚠ [tiles] 有 {} 张瓦片解码失败被跳过：这些位置的路可能缺失",
+                        stats.skipped
+                    ));
+                }
                 if stats.road_ratio < 0.02 {
                     log("⚠ [tiles] 道路像素占比很低：底图可能是示意图或大片遮挡，轨迹可能贴边");
                 }

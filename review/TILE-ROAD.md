@@ -142,3 +142,62 @@ save_cache()            JSON（bbox / z / 生成时间 / 折线 / 统计）
 而原来只有 `MIN_ROAD_RATIO`（下限）一道闸 → 会一路走到建图、产出一张荒唐的「全是路」的图。
 现在加了 `MAX_ROAD_RATIO = 0.55` 与 `road_ratio_is_plausible()`，两端都卡，
 并有用例 `blank_or_uniform_tiles_are_rejected_by_the_ratio_guard` 覆盖（全白→拒、纯灰→拒、正常十字→放行）。
+
+## 十、瓦片源可配置（t15）
+
+### 默认换成 OSM
+
+`TileConfig.url_template` 默认 `https://tile.openstreetmap.org/{z}/{x}/{y}.png`（免鉴权，WGS84）。
+百度匿名口子已封（见第九节），所以默认不再指向百度 —— **管线一行没改**，只换了「从哪儿取图」：
+
+- `TileProjection::WebMercator`（默认）：标准 XYZ，`web_mercator_tile_xy`；产物是 **WGS84**，
+  建图时 `align_applied = false`，由 `align_network` 做一次 WGS84→BD-09。
+- `TileProjection::Baidu`：保留原有 `baidu_tile_xy` 与 BD-09 局部仿射（`align_applied = true`）。
+  只有粘到可用的百度 URL 时才用；`Config::tile_config()` 看到模板含 `bdimg.com` 会自动切过去。
+
+### 怎么粘自定义源
+
+1. 浏览器打开底图 → F12 → Network → 过滤 `tile`，点一张瓦片 → 复制完整 URL；
+2. 把 `x`/`y`/`z` 的数值替换成占位符，例如
+   `https://maponline0.bdimg.com/tile/?qt=tile&x={x}&y={y}&z={z}&styles=pl&scaler=1&udt=20240801`；
+3. 填进跑步页的「URL 模板」（或 `config.json` 的 `tile_url_template`）；
+4. 需要的请求头写进 `config.json` 的 `tile_headers`，每行一条，例如
+   `Referer: https://map.baidu.com/`；
+5. 主机不在白名单时，把主机名加进 `tile_allowed_hosts`（逗号分隔，`foo.com` 同时覆盖 `*.foo.com`）。
+
+### 源白名单与限额（F1）
+
+`url_template` 是**用户可输入**的，不做校验等于给自己留了个 SSRF 入口。现在的约束：
+
+| 检查 | 规则 |
+|---|---|
+| 协议 | 只允许 `https://` 开头的绝对地址；`http:` / `file:` / `ftp:` / 相对路径一律拒绝并明确报错（**不静默回退默认源**） |
+| 主机白名单 | 内置 `tile.openstreetmap.org` / `bdimg.com`（含 `*.bdimg.com`）/ `tile.openstreetmap.de`，其余需写进 `allowed_hosts`；比对大小写不敏感、去端口、去 userinfo |
+| 私网/回环 | `localhost`、`127.*`、`10.*`、`172.16–31.*`、`192.168.*`、`169.254.*`、`0.0.0.0`、`[::1]`、`*.local`、`*.internal` 一律拒绝（即使加进白名单） |
+| 单张读取 | `take(2 MiB + 1)`；超限按坏图处理 |
+| 单张解码 | `ImageReader::with_format(Png).limits(4096×4096 / 32 MiB)`（与 `ui/captcha.rs` 同款） |
+| 拼接总量 | 保留 `MAX_PIXELS`（8 Mi 像素）与 `max_tiles`（默认 64） |
+| 占位图 | `<512 字节` 视为占位图；`<0.4%` 与 `>55%` 道路像素占比两端卡死 |
+
+用例：`tile_source_whitelist_rejects_unsafe_urls`（http/file/相对路径、私网字面量、非白名单公网主机、
+显式加白名单后放行）。
+
+### 同批的另外三条（F2/F3/F5）
+
+- **F2 解码失败不静默吞**：`blit` 返回原因，`fetch_tiles` 计数 `skipped`，`Stats::summary()`
+  会显示「（N 张解码失败已跳过）」，UI 日志另有一条告警 —— 缺块处骨架会断线，必须让人看见。
+- **F3 缓存归属**：缓存里带 `owner`（学校 unid）与 `bbox`；`load_checked(path, owner, bbox)`
+  在「学校不符」或「范围不重叠」时拒绝并提示重新生成。用例 `cache_is_scoped_to_school_and_area`。
+- **F5 可取消**：`fetch_tiles`/`generate` 接受 `cancel: &dyn Fn() -> Result<(), String>`，
+  每张瓦片之间检查一次；UI 取消后不再继续发请求。
+
+### 换源后阈值要重新标定
+
+不同底图的「背景 vs 路面」亮度差不一样，换源后若道路像素占比异常（太小/太大），按这个顺序调：
+
+1. 先看 `Stats::summary()` 里的占比：正常校园底图约 **2%–25%**；
+2. 占比过小（<1%）→ 降 `contrast_min`（默认 8）到 4–6，让「比背景略亮」的路面也能入选；
+3. 占比过大（>55%）→ 升 `contrast_min` 或降 `road_max_luma`，把接近纯白的背景排除；
+4. 彩色底图（水系/绿地占比高）→ 收紧 `max_chroma`（默认 18 → 12）；
+5. 每次只改一个参数，改完重新生成看折线条数与连通分量是否合理（碎线多说明阈值太松，
+   骨架断得多说明太紧）。
