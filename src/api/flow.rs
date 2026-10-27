@@ -555,6 +555,48 @@ pub fn run_full_flow_cancellable(
             start_ms,
             &route_pts,
         ),
+        // 第 4 种模式：瓦片矢量化路网。与 Road 的唯一差别是「路网从哪来」——
+        // 这里读本地瓦片缓存（`tile_road::load`），之后的裁剪/路由完全复用同一套。
+        RouteMode::Tiles => {
+            let cache = crate::track::tile_road::default_cache_path();
+            let mut net = match crate::track::tile_road::load(&cache) {
+                Ok((stats, graph)) => {
+                    log(&format!("[tiles] 瓦片路网：{}", stats.summary()));
+                    if graph.graph.edge_count() == 0 {
+                        return Err(
+                            "瓦片路网里没有可用道路：请在跑步页重新点「生成瓦片路网」".into()
+                        );
+                    }
+                    graph
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "瓦片路网不可用（{e}）。请到跑步页点「生成瓦片路网」，\
+                         或切回「真实道路 / 经典」模式；人工导入 OSM 路网也仍然可用"
+                    ))
+                }
+            };
+            // 缓存里的节点已是 BD-09（`align_applied = true`），align_network 会自己跳过。
+            crate::track::generate_road::align_network(&mut net);
+            let filtered = crate::track::generate_road::apply_fences(&net, &fences.polygons);
+            log(if fences.polygons.is_empty() {
+                "[tiles] 学校边界未提供；沿点位闭环重复补足距离，无法保证校内范围"
+            } else {
+                "[tiles] 在瓦片路网里沿点位闭环重复补足距离"
+            });
+            crate::track::generate_road::build_road(
+                params.dist,
+                params.dur,
+                params.seed,
+                start_ms,
+                &route_pts,
+                &route_pts,
+                &filtered,
+            )
+            .map_err(|e| {
+                format!("瓦片路网路由失败：{e}；可在跑步页重新生成瓦片路网，或切回经典模式")
+            })?
+        }
     };
     control.check()?;
     // A4（审计 medium）：Legacy（默认模式）完全不用围栏 —— 只保证过打卡点，环的

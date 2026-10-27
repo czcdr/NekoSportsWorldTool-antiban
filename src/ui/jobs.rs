@@ -300,6 +300,92 @@ impl App {
         });
     }
 
+    /// 生成瓦片矢量化路网（第 4 种模式的数据准备）。
+    ///
+    /// 只做三件事：定范围（优先学校围栏，没围栏用定位锚点 + 半径）→ 后台抓图并矢量化
+    /// （`tile_road::generate`，自带缓存）→ 把结果当成普通 `RoadGraph` 交给
+    /// `self.network`。后续预览/路由完全复用现有链路，不需要任何分支。
+    ///
+    /// 失败一律**明说原因**（瓦片 403 / 超限 / 认不出道路 / 不连通），并提示
+    /// 「人工导入 OSM」这条退路 —— 这条模式的输出质量取决于底图。
+    pub(crate) fn generate_tile_network(&mut self) {
+        let Some(session) = self.session.clone() else {
+            self.osm_page.status = "请先登录，才能生成瓦片路网".into();
+            return;
+        };
+        if self.osm_page.busy {
+            self.osm_page.status = "正在获取路网，请等当前任务结束".into();
+            return;
+        }
+        let fences = self
+            .run_page
+            .preview_inputs
+            .as_ref()
+            .map(|i| i.fences.clone())
+            .unwrap_or_default();
+        let bbox = match crate::track::tile_road::Bbox::from_fences(&fences) {
+            Some(b) => b,
+            None => match self.identity.anchor_coordinate() {
+                Ok(anchor) => {
+                    crate::track::tile_road::Bbox::around(anchor.latitude, anchor.longitude, 700.0)
+                }
+                Err(_) => {
+                    self.osm_page.status =
+                        "既没有围栏也没有定位锚点：请先在设备信息页设置城市与定位锚点".into();
+                    return;
+                }
+            },
+        };
+        let request_id = self.begin_network_load();
+        self.osm_page.status = "正在抓取瓦片并矢量化（约 10–60 秒）…".into();
+        let identity = self.identity.clone();
+        let scope = Some((
+            session.uid,
+            session.unid.clone(),
+            self.identity.anchor_coordinate().ok(),
+            session.token.clone(),
+        ));
+        let net_tx = self.net_tx.clone();
+        let control = self.osm_page.cancel.clone();
+        let cfg = crate::track::tile_road::TileConfig::default();
+        let path = crate::track::tile_road::default_cache_path();
+        self.spawn_session_job(move |tx| {
+            let mut log = App::logger(tx.clone());
+            let client = tx.client(identity, Some(session));
+            let stage = |message: &str| {
+                let _ = tx.send(format!("__ROAD_STAGE__{request_id}|{message}"));
+            };
+            stage("抓取百度瓦片…");
+            let result = (|| {
+                control.check()?;
+                let generated =
+                    crate::track::tile_road::generate(&client.agent, &bbox, &cfg, &path)?;
+                let (stats, graph) = generated;
+                log(&format!("√ [tiles] {}", stats.summary()));
+                if stats.road_ratio < 0.02 {
+                    log("⚠ [tiles] 道路像素占比很低：底图可能是示意图或大片遮挡，轨迹可能贴边");
+                }
+                control.check()?;
+                Ok::<_, String>(std::sync::Arc::new(graph))
+            })();
+            let warning = match &result {
+                Ok(_) => "瓦片路网已生成（实验性：文字遮挡/隧道/高架处可能断线）".to_string(),
+                Err(e) => format!("瓦片路网生成失败：{e}"),
+            };
+            let _ = net_tx.send(super::osm::NetworkLoad {
+                pending: false,
+                warning,
+                offline: false,
+                request_id,
+                campuses: Vec::new(),
+                selected_key: String::new(),
+                scope,
+                inputs: None,
+                result,
+            });
+        });
+    }
+
     /// 查询公网 IP。
     ///
     /// 配了出口池就必须**经代理**查：直连会把自己的真实 IP 交给 ipify/httpbin，

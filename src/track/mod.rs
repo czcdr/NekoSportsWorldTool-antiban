@@ -11,6 +11,7 @@ pub mod postfix;
 pub mod route_view;
 mod school_track;
 pub mod stats;
+pub mod tile_road;
 pub mod wire;
 
 #[cfg(test)]

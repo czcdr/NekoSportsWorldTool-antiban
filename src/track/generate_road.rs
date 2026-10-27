@@ -34,6 +34,11 @@ pub enum RouteMode {
     /// 时**退回按点位连线**，而不是报错 —— 这是它与 `Road` 的关键区别。
     /// 适合「点位接口只给了 3 个点，但策略又要求 5 个必经点」这类必然对不上的场景。
     Manual,
+    /// 瓦片矢量化路网（实验）：用百度栅格瓦片自己识别道路，见 `tile_road`。
+    ///
+    /// 与 `Road` 的区别只在**路网从哪来**：Road 读 OSM/人工导入，Tiles 读瓦片缓存；
+    /// 后续路由（`build_road`）完全复用，所以这是「第 4 种取图方式」而不是新算法。
+    Tiles,
 }
 
 impl RouteMode {
@@ -41,6 +46,7 @@ impl RouteMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "road" => RouteMode::Road,
             "manual" | "custom" => RouteMode::Manual,
+            "tiles" | "tile" | "瓦片" => RouteMode::Tiles,
             _ => RouteMode::Legacy,
         }
     }
@@ -51,17 +57,23 @@ impl RouteMode {
             RouteMode::Legacy => "legacy",
             RouteMode::Road => "road",
             RouteMode::Manual => "manual",
+            RouteMode::Tiles => "tiles",
         }
     }
 
     /// 是否**必须**拿到路网才能工作。`Manual` 不必须（拿不到就退回连线）。
+    ///
+    /// `Tiles` 必须：没有瓦片路网就没有「沿道路走」这回事，拿不到就该明确报错，
+    /// 而不是悄悄退回连线（那样用户以为在走瓦片路网，实际是直线）。
     pub fn requires_network(self) -> bool {
-        matches!(self, RouteMode::Road)
+        matches!(self, RouteMode::Road | RouteMode::Tiles)
     }
 
     /// 是否需要拉取学校点位/围栏/路网。经典模式不触发这些端点。
+    ///
+    /// `Tiles` 要围栏：它用围栏定抓图范围（没有围栏时回落「锚点 + 半径」）。
     pub fn needs_school_route(self) -> bool {
-        matches!(self, RouteMode::Road | RouteMode::Manual)
+        matches!(self, RouteMode::Road | RouteMode::Manual | RouteMode::Tiles)
     }
 }
 
@@ -695,19 +707,32 @@ mod preview_tests {
         assert_eq!(RouteMode::from_str("legacy"), RouteMode::Legacy);
         assert_eq!(RouteMode::from_str("随便写点什么"), RouteMode::Legacy);
 
-        for m in [RouteMode::Legacy, RouteMode::Road, RouteMode::Manual] {
+        // 第 4 种模式：三个别名都认（配置/命令行手写都行）
+        for alias in ["tiles", "tile", "瓦片", " TILES "] {
+            assert_eq!(RouteMode::from_str(alias), RouteMode::Tiles, "{alias}");
+        }
+
+        for m in [
+            RouteMode::Legacy,
+            RouteMode::Road,
+            RouteMode::Manual,
+            RouteMode::Tiles,
+        ] {
             assert_eq!(RouteMode::from_str(m.as_str()), m, "配置序列化必须可往返");
         }
 
-        // 只有 Road 必须有路网；Manual 拿不到会退回按点位连线
+        // 只有 Road / Tiles 必须有路网；Manual 拿不到会退回按点位连线
         assert!(RouteMode::Road.requires_network());
+        assert!(RouteMode::Tiles.requires_network());
         assert!(!RouteMode::Manual.requires_network());
         assert!(!RouteMode::Legacy.requires_network());
 
         // Manual 仍然要拉学校点位/围栏（只是不追加策略必经点）
         assert!(RouteMode::Road.needs_school_route());
         assert!(RouteMode::Manual.needs_school_route());
-        assert!(!RouteMode::Legacy.needs_school_route());
+        // Tiles 要围栏定抓图范围（没有围栏回落锚点 + 半径）
+        assert!(RouteMode::Tiles.needs_school_route());
+        assert_eq!(RouteMode::Tiles.as_str(), "tiles");
     }
 
     #[test]

@@ -505,6 +505,11 @@ impl App {
                     .on_hover_text(
                         "只用实时点位顺序串联，不要求经过策略必经点；没有路网时按点位连线",
                     );
+                ui.selectable_value(&mut page.route_mode, RouteMode::Tiles, "瓦片矢量化（实验）")
+                    .on_hover_text(
+                        "用百度栅格瓦片自己识别校内道路并建图：不依赖 OSM 导入，\
+                         但结果取决于底图清晰度（文字遮挡/隧道/高架会断线）",
+                    );
                 // 说清「现在是什么模式、还缺什么」：只靠三个按钮名，用户不知道自己
                 // 选的东西眼下能不能出图。
                 let (label, missing) = match page.route_mode {
@@ -517,12 +522,35 @@ impl App {
                         "自定义点位：按点位顺序串联，有路网时沿道路",
                         self.network.is_none().then_some("无路网，将按点位连线"),
                     ),
+                    RouteMode::Tiles => (
+                        "瓦片矢量化：从百度瓦片识别道路后沿路行进",
+                        self.network.is_none().then_some("瓦片路网未生成"),
+                    ),
                 };
                 ui.colored_label(theme::plain(), format!("（{label}）"));
                 if let Some(missing) = missing {
                     ui.colored_label(theme::warn(), format!("（{missing}）"));
                 }
             });
+            // 瓦片矢量化要先有图：按钮单独一行，和模式说明分开，避免「选了模式就自动抓图」的误解。
+            if self.run_page.route_mode == RouteMode::Tiles {
+                ui.horizontal_wrapped(|ui| {
+                    let busy = self.osm_page.busy || self.run_busy;
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("生成瓦片路网"))
+                        .on_hover_text(
+                            "按当前学校围栏（没有围栏则用定位锚点 ±700m）抓百度瓦片，\
+                             识别道路后建图；结果缓存到数据目录，下次直接复用",
+                        )
+                        .clicked()
+                    {
+                        self.generate_tile_network();
+                    }
+                    if !self.osm_page.status.is_empty() {
+                        ui.colored_label(theme::plain(), &self.osm_page.status);
+                    }
+                });
+            }
         }
 
         // 路线算法变了：先标脏 + 丢掉旧预览，再决定要不要重新拉学校数据。
