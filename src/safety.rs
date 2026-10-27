@@ -63,6 +63,11 @@ pub struct SafetyPolicy {
     pub batch_per_day: u32,
     /// 单次批量补签的提交总条数上限（项目数 × 天数 × 每日次数）。
     pub batch_max_records: u32,
+    /// 允许在非 UTC+8 设备上继续提交。
+    ///
+    /// 默认 `false`：设备时区不是北京时间时直接拒绝发请求。只警告不拦会把
+    /// 「今天/昨天」与深夜判定错开一天，也把补签的日期分桶弄歪。
+    pub allow_timezone_mismatch: bool,
 }
 
 impl Default for SafetyPolicy {
@@ -78,6 +83,7 @@ impl Default for SafetyPolicy {
             backfill_days: 3,
             batch_per_day: 2,
             batch_max_records: 6,
+            allow_timezone_mismatch: false,
         }
     }
 }
@@ -383,56 +389,129 @@ fn reserve_run_at(
     })
 }
 
-/// 提交 AI 运动前的检查。`count` 是本批条数（单发固定 1）。
-pub fn check_ai(policy: &SafetyPolicy, count: u32) -> Result<(), String> {
-    check_ai_at(
+/// 提交 AI 运动前的额度占位。
+///
+/// 以前是「check_ai 读计数 → 发请求 → record_ai 写回」：两个进程（或两个入口）
+/// 会读到同一个旧计数、各自通过检查，本地上限因此可以被并发绕过。
+/// 现在和 `reserve_run` 一样在文件锁内完成「校验 + 计数 +1」，失败由 Drop 归还。
+#[derive(Debug)]
+pub struct AiReservation {
+    root: PathBuf,
+    day: String,
+    count: u32,
+    committed: bool,
+    enabled: bool,
+}
+
+impl AiReservation {
+    /// 服务端已接受：保留这次计数。
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AiReservation {
+    fn drop(&mut self) {
+        if self.committed || !self.enabled {
+            return;
+        }
+        // 归还失败只可能少归一次（偏保守），不影响主流程。
+        let _ = with_lock(&self.root, |state| {
+            if let Some(day) = state.days.get_mut(&self.day) {
+                day.ai = day.ai.saturating_sub(self.count);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// 单发 AI：深夜 + 每日上限校验，并在锁内占位。
+pub fn reserve_ai(policy: &SafetyPolicy, count: u32) -> Result<AiReservation, String> {
+    reserve_ai_at(
         &crate::platform::data_dir(),
         policy,
-        count,
         crate::crypto::envelope::now_ms(),
+        count,
+        true,
     )
 }
 
-fn check_ai_at(root: &Path, policy: &SafetyPolicy, count: u32, now_ms: i64) -> Result<(), String> {
+/// 批量补签：按**记录所属日期**占位；深夜与规模限制由调用方单独检查
+/// （历史记录的 `at_ms` 不是提交时刻，不能拿它判断深夜）。
+pub fn reserve_ai_on(
+    policy: &SafetyPolicy,
+    at_ms: i64,
+    count: u32,
+) -> Result<AiReservation, String> {
+    reserve_ai_at(&crate::platform::data_dir(), policy, at_ms, count, false)
+}
+
+fn reserve_ai_at(
+    root: &Path,
+    policy: &SafetyPolicy,
+    at_ms: i64,
+    count: u32,
+    enforce_now: bool,
+) -> Result<AiReservation, String> {
     policy.validate()?;
-    if !policy.enabled {
-        return Ok(());
+    if !policy.enabled || count == 0 {
+        return Ok(AiReservation {
+            root: root.to_path_buf(),
+            day: String::new(),
+            count,
+            committed: false,
+            enabled: false,
+        });
     }
-    let (today, hour) = cst_parts(now_ms);
-    if in_night(policy, hour) {
+    let (day, hour) = cst_parts(at_ms);
+    if enforce_now && in_night(policy, hour) {
         return Err(format!(
             "安全护栏：现在是 {hour} 点，落在深夜 {}-{} 点，AI 运动同样会被判异常。\n\
              确需提交：把 config.json 的 safety.enabled 改成 false。",
             policy.night_from, policy.night_to
         ));
     }
-    let done = load_state_at(root)?.get(&today).ai;
-    if done.saturating_add(count) > policy.daily_ai {
-        return Err(format!(
-            "安全护栏：{today} 已提交 AI 运动 {done} 条，本批 {count} 条会超过每日上限 {}。\n\
-             确需提交：把 config.json 的 safety.enabled 改成 false。",
-            policy.daily_ai
-        ));
-    }
-    Ok(())
-}
-
-/// AI 提交成功后记账（记在"现在"这一天）。
-pub fn record_ai(policy: &SafetyPolicy, count: u32) -> Result<(), String> {
-    record_ai_on(policy, crate::crypto::envelope::now_ms(), count)
-}
-
-/// AI 提交成功后记账，按**记录所属的那一天**分桶（批量补签要补历史日期）。
-pub fn record_ai_on(policy: &SafetyPolicy, at_ms: i64, count: u32) -> Result<(), String> {
-    if !policy.enabled {
-        return Ok(());
-    }
-    let (day, _) = cst_parts(at_ms);
-    let key = day;
-    with_lock(&crate::platform::data_dir(), |state| {
+    let key = day.clone();
+    with_lock(root, |state| {
+        if enforce_now {
+            let done = state.get(&key).ai;
+            if done.saturating_add(count) > policy.daily_ai {
+                return Err(format!(
+                    "安全护栏：{key} 已提交 AI 运动 {done} 条，本批 {count} 条会超过每日上限 {}。\n\
+                     确需提交：把 config.json 的 safety.enabled 改成 false。",
+                    policy.daily_ai
+                ));
+            }
+        }
         state.bump(&key, |c| c.ai = c.ai.saturating_add(count));
         Ok(())
+    })?;
+    Ok(AiReservation {
+        root: root.to_path_buf(),
+        day,
+        count,
+        committed: false,
+        enabled: true,
     })
+}
+
+/// 本地时区必须与协议口径一致（UTC+8）。
+///
+/// 配置 `safety.allow_timezone_mismatch=true` 可显式放行；否则拒发请求 ——
+/// 只写一条警告等于让「今天/昨天」与深夜判定错一天，还把补签日期分桶弄歪。
+pub fn check_timezone(policy: &SafetyPolicy, offset_secs: i32) -> Result<(), String> {
+    const REQUIRED: i32 = 8 * 3600;
+    if offset_secs == REQUIRED || policy.allow_timezone_mismatch {
+        return Ok(());
+    }
+    Err(format!(
+        "安全护栏：设备时区偏移 {:+.1} 小时，不是 UTC+8。\n\
+         随机时刻与「今天/昨天」按设备本地时区计算，深夜判定与配额按北京时间，\
+         两者错位会让日期与时段判断都失准。\n\
+         请把设备时区设为北京时间；确实要在其他时区运行，请在 config.json 的 \
+         safety 里加 \"allow_timezone_mismatch\": true。",
+        offset_secs as f64 / 3600.0
+    ))
 }
 
 /// 只检查"当前时刻是否深夜"。
@@ -663,8 +742,12 @@ mod tests {
     fn ai_daily_cap_includes_batch_size() {
         let p = SafetyPolicy::default();
         let dir = tmp();
-        assert!(check_ai_at(&dir, &p, 2, at(12)).is_ok());
-        assert!(check_ai_at(&dir, &p, 3, at(12)).is_err(), "3 条超过上限 2");
+        // 一次占满每日 2 条；再占 1 条必须被同一个锁内的检查挡住。
+        reserve_ai_at(&dir, &p, at(12), 2, true).unwrap().commit();
+        assert!(
+            reserve_ai_at(&dir, &p, at(12), 1, true).is_err(),
+            "第 3 条超过上限 2"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -762,7 +845,7 @@ mod tests {
         crate::platform::TEST_DATA_DIR.with(|slot| *slot.borrow_mut() = Some(dir.clone()));
         let p = SafetyPolicy::default();
         let historic = day(2, 12);
-        record_ai_on(&p, historic, 1).unwrap();
+        reserve_ai_on(&p, historic, 1).unwrap().commit();
         let state = load_state_at(&dir).unwrap();
         let (historic_day, _) = cst_parts(historic);
         let (today, _) = cst_parts(crate::crypto::envelope::now_ms());
@@ -770,5 +853,61 @@ mod tests {
         assert_eq!(state.get(&today).ai, 0, "不应该算到今天头上");
         crate::platform::TEST_DATA_DIR.with(|slot| *slot.borrow_mut() = None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 占位式记账：请求失败（未 commit）必须归还额度，否则一次网络错误就吃掉配额。
+    #[test]
+    fn ai_reservation_rolls_back_when_not_committed() {
+        let dir = tmp();
+        let p = SafetyPolicy {
+            daily_ai: 1,
+            ..SafetyPolicy::default()
+        };
+        let at = day(0, 12);
+        {
+            let _reservation = reserve_ai_at(&dir, &p, at, 1, false).unwrap();
+            // 提前 drop（模拟请求失败）
+        }
+        let state = load_state_at(&dir).unwrap();
+        let (key, _) = cst_parts(at);
+        assert_eq!(state.get(&key).ai, 0, "未提交的占位没有归还");
+        reserve_ai_at(&dir, &p, at, 1, false).unwrap().commit();
+        assert_eq!(load_state_at(&dir).unwrap().get(&key).ai, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 并发入口在锁内检查 + 占位：第二个占位必须被每日上限挡住。
+    #[test]
+    fn ai_reservation_enforces_cap_inside_lock() {
+        let dir = tmp();
+        let p = SafetyPolicy {
+            daily_ai: 1,
+            ..SafetyPolicy::default()
+        };
+        let at = day(0, 12);
+        let first = reserve_ai_at(&dir, &p, at, 1, true).unwrap();
+        assert!(
+            reserve_ai_at(&dir, &p, at, 1, true).is_err(),
+            "同一时刻第二个占位不应通过"
+        );
+        first.commit();
+        assert!(reserve_ai_at(&dir, &p, at, 1, true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn timezone_gate_blocks_non_cst_unless_allowed() {
+        let p = SafetyPolicy::default();
+        assert!(check_timezone(&p, 8 * 3600).is_ok());
+        assert!(check_timezone(&p, 0).is_err());
+        assert!(check_timezone(&p, -5 * 3600).is_err());
+        let relaxed = SafetyPolicy {
+            allow_timezone_mismatch: true,
+            ..SafetyPolicy::default()
+        };
+        assert!(check_timezone(&relaxed, 0).is_ok());
+        // 老配置没有该字段时必须回到「拦」的默认值
+        let legacy: SafetyPolicy = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(!legacy.allow_timezone_mismatch);
     }
 }

@@ -27,7 +27,13 @@ type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 /// 密文格式前缀：以后换算法/换密钥派生方式时靠它区分。
-const PREFIX: &str = "v1:";
+///
+/// v1 = AES-256-CBC（无完整性保护，已淘汰，仍可读以完成迁移）；
+/// v2 = AES-256-CBC + HMAC-SHA256（encrypt-then-MAC）。
+const PREFIX_V1: &str = "v1:";
+const PREFIX_V2: &str = "v2:";
+/// v2 尾部 MAC 长度（HMAC-SHA256）。
+const MAC_LEN: usize = 32;
 /// salt 文件名（放在数据目录里，与凭据文件同级）。
 const SALT_FILE: &str = "local.salt";
 
@@ -84,7 +90,8 @@ fn host_id() -> String {
     }
 }
 
-fn key() -> Option<[u8; 32]> {
+/// v1 用的主密钥（也是 v2 的派生母密钥）。
+fn master_key() -> Option<[u8; 32]> {
     let salt = salt()?;
     let mut hasher = Sha256::new();
     hasher.update(key_material().as_bytes());
@@ -92,30 +99,111 @@ fn key() -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
-/// 加密。返回 `v1:<base64(iv||ciphertext)>`；空串原样返回空串。
+/// 从主密钥派生用途隔离的子密钥（enc / mac 分离，避免同钥两用）。
+fn derive(master: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(master);
+    hasher.update(label);
+    hasher.finalize().into()
+}
+
+/// HMAC-SHA256（RFC 2104）。
+///
+/// 不额外引依赖：只需要两次 SHA-256，比新增一个 crate 更可控。
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    let mut outer = Sha256::new();
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= block[i];
+        opad[i] ^= block[i];
+    }
+    inner.update(ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+/// 常数时间比较：MAC 校验不能因为"第几个字节不同"而提前返回。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// 加密。返回 `v2:<base64(iv||ciphertext||mac)>`；空串原样返回空串。
 pub fn seal(plain: &str) -> Option<String> {
     if plain.is_empty() {
         return Some(String::new());
     }
-    let key = key()?;
+    let master = master_key()?;
+    let enc_key = derive(&master, b"enc");
+    let mac_key = derive(&master, b"mac");
     let iv: [u8; 16] = rand::random();
-    let ciphertext =
-        Aes256CbcEnc::new(&key.into(), &iv.into()).encrypt_padded_vec::<Pkcs7>(plain.as_bytes());
-    let mut blob = Vec::with_capacity(16 + ciphertext.len());
+    let ciphertext = Aes256CbcEnc::new(&enc_key.into(), &iv.into())
+        .encrypt_padded_vec::<Pkcs7>(plain.as_bytes());
+    let mut blob = Vec::with_capacity(16 + ciphertext.len() + MAC_LEN);
     blob.extend_from_slice(&iv);
     blob.extend_from_slice(&ciphertext);
-    Some(format!("{PREFIX}{}", B64.encode(blob)))
+    let mac = hmac_sha256(&mac_key, &blob);
+    blob.extend_from_slice(&mac);
+    Some(format!("{PREFIX_V2}{}", B64.encode(blob)))
 }
 
 /// 解密。格式不符 / 密钥变了 / 数据被改过都返回 `None`。
 pub fn open(sealed: &str) -> Option<String> {
-    let body = sealed.strip_prefix(PREFIX)?;
+    if let Some(body) = sealed.strip_prefix(PREFIX_V2) {
+        return open_v2(body);
+    }
+    if let Some(body) = sealed.strip_prefix(PREFIX_V1) {
+        return open_v1(body);
+    }
+    None
+}
+
+fn open_v2(body: &str) -> Option<String> {
+    let blob = B64.decode(body).ok()?;
+    // 至少要有 iv(16) + 一个分组(16) + mac(32)。
+    if blob.len() < 16 + 16 + MAC_LEN {
+        return None;
+    }
+    let (data, mac) = blob.split_at(blob.len() - MAC_LEN);
+    let master = master_key()?;
+    let mac_key = derive(&master, b"mac");
+    if !constant_time_eq(mac, &hmac_sha256(&mac_key, data)) {
+        return None;
+    }
+    let (iv, ciphertext) = data.split_at(16);
+    let iv: [u8; 16] = iv.try_into().ok()?;
+    let enc_key = derive(&master, b"enc");
+    let plain = Aes256CbcDec::new(&enc_key.into(), &iv.into())
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
+        .ok()?;
+    String::from_utf8(plain).ok()
+}
+
+/// 旧格式（v1）：AES-256-CBC，无 MAC。只为迁移而保留。
+fn open_v1(body: &str) -> Option<String> {
     let blob = B64.decode(body).ok()?;
     if blob.len() < 32 {
         return None;
     }
     let (iv, ciphertext) = blob.split_at(16);
-    let key = key()?;
+    let key = master_key()?;
     let iv: [u8; 16] = iv.try_into().ok()?;
     let plain = Aes256CbcDec::new(&key.into(), &iv.into())
         .decrypt_padded_vec::<Pkcs7>(ciphertext)
@@ -156,7 +244,7 @@ mod tests {
         let _dir = TempDir::new("roundtrip");
         let secret = "s3cret-pass-中文";
         let sealed = seal(secret).expect("seal");
-        assert!(sealed.starts_with(PREFIX), "{sealed}");
+        assert!(sealed.starts_with(PREFIX_V2), "{sealed}");
         assert!(!sealed.contains(secret), "密文里不能出现明文");
         assert!(!sealed.contains("s3cret"), "{sealed}");
         assert_eq!(open(&sealed).as_deref(), Some(secret));
@@ -178,19 +266,43 @@ mod tests {
     fn tampered_or_foreign_ciphertext_is_rejected() {
         let _dir = TempDir::new("tamper");
         let sealed = seal("s3cret").unwrap();
-        // 版本前缀不对
-        assert!(open(&format!("v2:{}", &sealed[3..])).is_none());
+        let body = sealed.strip_prefix(PREFIX_V2).unwrap();
+        // 版本前缀不认识
+        assert!(open(&format!("v9:{body}")).is_none());
         // 不是 base64
-        assert!(open("v1:not-base64!!").is_none());
+        assert!(open("v2:not-base64!!").is_none());
         // 太短
-        assert!(open("v1:AAAA").is_none());
-        // 改一个字节 → PKCS7/密钥流不符
-        let mut blob = B64.decode(&sealed[3..]).unwrap();
+        assert!(open("v2:AAAA").is_none());
+        // 改密文中间一个字节 → MAC 先失败
+        let mut blob = B64.decode(body).unwrap();
+        let middle = 16 + 1;
+        blob[middle] ^= 0xFF;
+        assert!(
+            open(&format!("{PREFIX_V2}{}", B64.encode(&blob))).is_none(),
+            "被改过的密文必须解不开（MAC）"
+        );
+        // 只改 MAC 最后一个字节也必须失败
+        let mut blob = B64.decode(body).unwrap();
         let last = blob.len() - 1;
         blob[last] ^= 0xFF;
         assert!(
-            open(&format!("v1:{}", B64.encode(blob))).is_none(),
-            "被改过的密文必须解不开"
+            open(&format!("{PREFIX_V2}{}", B64.encode(blob))).is_none(),
+            "MAC 被改过必须失败"
         );
+    }
+
+    /// v1（无 MAC）仍要能读：老用户的 config.json 里还是 v1 密文。
+    #[test]
+    fn legacy_v1_ciphertext_still_opens() {
+        let _dir = TempDir::new("legacy");
+        let key = master_key().unwrap();
+        let iv: [u8; 16] = rand::random();
+        let ct =
+            Aes256CbcEnc::new(&key.into(), &iv.into()).encrypt_padded_vec::<Pkcs7>(b"old-secret");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&iv);
+        blob.extend_from_slice(&ct);
+        let sealed = format!("{PREFIX_V1}{}", B64.encode(blob));
+        assert_eq!(open(&sealed).as_deref(), Some("old-secret"));
     }
 }

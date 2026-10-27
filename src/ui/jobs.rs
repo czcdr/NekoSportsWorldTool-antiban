@@ -299,10 +299,61 @@ impl App {
         });
     }
 
+    /// 查询公网 IP。
+    ///
+    /// 配了出口池就必须**经代理**查：直连会把自己的真实 IP 交给 ipify/httpbin，
+    /// 也会让界面上显示的 IP 与业务出口不是同一个，误导排障。代理不可用时宁可
+    /// 不查，也不绕过去。
     pub(crate) fn fetch_ip(&mut self) {
-        self.spawn_job(|tx| {
-            let agent = crate::api::client::make_agent();
+        let city = self.identity.city.clone();
+        self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
+            let path = crate::platform::data_dir().join("proxies.json");
+            let mut pool = match crate::api::egress::EgressPool::load(&path) {
+                Ok(pool) => pool,
+                Err(error) => {
+                    log(&format!(
+                        "公网 IP 未查询：出口配置不可用（{}）；直连会把真实 IP 交给第三方",
+                        crate::textlog::redact_text(&format!("{error:?}"))
+                    ));
+                    tx.send(format!("{IP}失败")).ok();
+                    return;
+                }
+            };
+            let mut entry = None;
+            let agent = if pool.is_empty() {
+                log("[net] 未配置出口池：按本机直连出口查询公网 IP（显示的 IP 即真实出口）");
+                crate::api::client::make_agent()
+            } else {
+                match pool.acquire(&city) {
+                    Ok(selected) => match crate::api::client::agent_with_proxy(&selected.url) {
+                        Ok(agent) => {
+                            log(&format!(
+                                "[net] 经同城出口 {} 查询公网 IP",
+                                if selected.id.is_empty() {
+                                    crate::textlog::redact_url(&selected.url)
+                                } else {
+                                    selected.id.clone()
+                                }
+                            ));
+                            entry = Some(selected);
+                            agent
+                        }
+                        Err(error) => {
+                            log(&format!("公网 IP 未查询：{error}"));
+                            tx.send(format!("{IP}失败")).ok();
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        log(&format!(
+                            "公网 IP 未查询：{error}（不改为直连，避免暴露真实 IP）"
+                        ));
+                        tx.send(format!("{IP}失败")).ok();
+                        return;
+                    }
+                }
+            };
             let mut ip = String::new();
             for url in [
                 "https://api.ipify.org?format=json",
@@ -324,6 +375,16 @@ impl App {
                         }
                     }
                 }
+            }
+            if let Some(selected) = &entry {
+                pool.report(
+                    selected.key(),
+                    if ip.is_empty() {
+                        crate::api::egress::Outcome::Failed
+                    } else {
+                        crate::api::egress::Outcome::Ok
+                    },
+                );
             }
             if ip.is_empty() {
                 log("公网 IP 获取失败");

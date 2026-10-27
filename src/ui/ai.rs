@@ -277,6 +277,7 @@ impl App {
         let policy = self.config.safety.clone();
         let planned = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
         for check in [
+            crate::safety::check_timezone(&policy, chrono::Local::now().offset().local_minus_utc()),
             crate::safety::check_night(&policy),
             crate::safety::check_backfill(&policy, plan.days, plan.per_day, planned),
         ] {
@@ -311,17 +312,24 @@ impl App {
                         } else {
                             format!("{day} 天前")
                         };
+                        // 记账落到这条记录所属的那一天（历史日按 at 分桶）。
+                        // 先占位再请求：失败由 Drop 归还，成功才 commit。
+                        let when = at.unwrap_or_else(crate::crypto::envelope::now_ms);
+                        let reservation = crate::safety::reserve_ai_on(&policy, when, 1);
+                        let reservation = match reservation {
+                            Ok(r) => r,
+                            Err(error) => {
+                                log(&format!("⚠ [safety] {error}"));
+                                continue;
+                            }
+                        };
                         match crate::api::ai::upload(&mut client, sport, plan.mode, at) {
-                            Ok(biz) if biz.get("error").and_then(|e| e.as_i64()) == Some(10000) => {
+                            Ok(biz) if crate::api::ai::upload_succeeded(&biz) => {
                                 ok += 1;
+                                reservation.commit();
                                 log(&format!(
                                     "√ [ai] {tag} sport={sport} 成功（{done}/{total}）"
                                 ));
-                                // 记账落到这条记录所属的那一天（历史日按 at 分桶）
-                                let when = at.unwrap_or_else(crate::crypto::envelope::now_ms);
-                                if let Err(error) = crate::safety::record_ai_on(&policy, when, 1) {
-                                    log(&format!("⚠ [safety] 补签计数写入失败：{error}"));
-                                }
                             }
                             Ok(biz) => {
                                 let msg = biz.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -340,7 +348,10 @@ impl App {
                 }
             }
             let payload = serde_json::json!({
-                "ok": true, "batch": true,
+                // ok 只代表「整批全部成功」：0/N 或部分失败都不能报成功。
+                "ok": total > 0 && ok == total,
+                "partial": ok > 0 && ok < total,
+                "batch": true,
                 "success": ok, "total": total,
                 "days": plan.days, "per_day": plan.per_day,
                 "sports": plan.sport_ids.len(),

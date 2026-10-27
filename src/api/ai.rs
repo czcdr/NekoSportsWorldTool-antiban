@@ -92,6 +92,17 @@ pub fn fetch_info(client: &mut ApiClient, sport_id: i64) -> Result<SportInfo, St
     })
 }
 
+/// 提交接口的业务成功码（与批处理里的判定保持一致）。
+pub const AI_OK_CODE: i64 = 10000;
+
+/// 服务器是否确认这条 AI 记录已提交成功。
+///
+/// `upload` 在没有 error 字段时也会返回 Ok（响应被接受 ≠ 记录被计数），
+/// 调用方必须显式判定，否则「请求走完」会被当成「提交成功」。
+pub fn upload_succeeded(biz: &Value) -> bool {
+    biz.get("error").and_then(Value::as_i64) == Some(AI_OK_CODE)
+}
+
 /// 提交 AI 运动记录。字段语义对照真人记录：
 /// 计次类（type=1）score=个数、speed=0、消耗=个数×0.07；
 /// 计时类（type=2）score=用时毫秒、speed=每分钟个数、消耗=秒×0.2；坐位体前屈消耗为 0。

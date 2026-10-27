@@ -217,7 +217,7 @@ fn cmd_run(rest: &[&str]) -> i32 {
     match crate::api::flow::run_full_flow(&mut client, &params, &mut log) {
         Ok(out) => {
             println!(
-                "记录提交成功 rrid={} uuid={}；OBS 上传={}/2；详情读取={}；服务端达标判定={}",
+                "记录已被服务端接受 rrid={} uuid={}；OBS 上传={}/2；详情读取={}；服务端达标判定={}",
                 out.result.rrid,
                 out.result.uuid,
                 out.obs_ok,
@@ -228,7 +228,14 @@ fn cmd_run(rest: &[&str]) -> i32 {
                 },
                 out.verification.label()
             );
-            0
+            // 退出码区分四种结局：0 完成 / 2 OBS 不全 / 3 详情未知 / 4 未达标。
+            // 定时脚本据此判断「重试有没有意义」，不再把"请求被接受"当成功。
+            if out.is_success() {
+                println!("结论：{}", out.summary());
+            } else {
+                eprintln!("结论：{}", out.summary());
+            }
+            out.exit_code()
         }
         Err(e) => {
             eprintln!("跑步提交失败: {e}");

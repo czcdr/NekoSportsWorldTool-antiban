@@ -1069,14 +1069,20 @@ impl App {
             ) {
                 Ok(out) => {
                     log(&format!(
-                        "全链完成 rrid={} obs={}/2 verify={} uuid={}",
+                        "全链结束 rrid={} obs={}/2 verdict={} uuid={}",
                         out.result.rrid,
                         out.obs_ok,
-                        out.verification.label(),
+                        out.verdict_code(),
                         out.result.uuid
                     ));
+                    log(&format!("结论：{}", out.summary()));
                     serde_json::json!({
-                        "ok": true, "rrid": out.result.rrid,
+                        "ok": out.is_success(),
+                        "submitted": true,
+                        "verdict": out.verdict_code(),
+                        "exit_code": out.exit_code(),
+                        "summary": out.summary(),
+                        "rrid": out.result.rrid,
                         "obs_ok": out.obs_ok, "verification": out.verification,
                         "uuid": out.result.uuid,
                         "dist": out.result.total_dis, "dur": out.result.total_time,

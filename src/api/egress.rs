@@ -68,6 +68,18 @@ pub enum PoolError {
     Config(String),
 }
 
+impl std::fmt::Display for PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCandidate => write!(f, "该城市没有配置出口节点"),
+            Self::Exhausted => write!(f, "同城出口全部处于冷却中"),
+            Self::Config(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for PoolError {}
+
 #[derive(Debug, Default)]
 pub struct EgressPool {
     entries: Vec<ProxyEntry>,

@@ -275,12 +275,14 @@ fn send_record(
     let (hp, hp_extra) =
         build_android_header(&android_identity, p.uid, &client_token(client), None);
     let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
-    let now = crate::crypto::envelope::now_ms();
+    // body 与 header 各读一次时钟。以前这里写死 `now + 1`，而普通请求路径早已
+    // 改成自然两读：同一账号的提交请求恒定差 1ms，两条链路口径还不一致，
+    // 反而更像脚本常量。
     let body_env = build_envelope_ts(
         &mut client.session,
         &body_plain,
         OuterOrder::Insert,
-        now + 1,
+        crate::crypto::envelope::now_ms(),
     );
 
     let runes = format!("{}{}", p.policy_ts, p.uid);

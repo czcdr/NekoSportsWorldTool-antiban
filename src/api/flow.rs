@@ -36,6 +36,95 @@ pub struct RunOutcome {
     pub verification: Verification,
 }
 
+/// 「请求被接受」之外的最终状态。
+///
+/// 提交成功 ≠ OBS 完整 ≠ 详情可读 ≠ 服务端判定达标。以前只要提交被接受就
+/// 返回 `Ok`，CLI 以 0 退出、UI 显示「提交成功」—— 定时任务会把这种半成品
+/// 当成完成。现在把四种结果分开，调用方按此决定退出码与文案。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunVerdict {
+    /// OBS 2/2 且详情明确达标。
+    Complete,
+    /// 服务端已接受，但详情明确判定未达标（记录在、不计数）。
+    NotCounted,
+    /// 提交已被接受，但 OBS 没传全（对象缺失，详情页大概率读不到轨迹）。
+    ObsIncomplete,
+    /// 详情读不到或没有判定字段：结果未知，不能算成功。
+    Unverified,
+}
+
+impl RunOutcome {
+    pub fn verdict(&self) -> RunVerdict {
+        // 服务端的明确否决优先于其它信号。
+        if self.verification.complete == Some(false) {
+            return RunVerdict::NotCounted;
+        }
+        if self.obs_ok < 2 {
+            return RunVerdict::ObsIncomplete;
+        }
+        if self.verification.complete == Some(true) {
+            RunVerdict::Complete
+        } else {
+            RunVerdict::Unverified
+        }
+    }
+
+    /// 只有一条完整记录才算成功：OBS 齐全 + 详情可读 + 服务端判定达标。
+    pub fn is_success(&self) -> bool {
+        self.verdict() == RunVerdict::Complete
+    }
+
+    /// 进程退出码：0 完成 / 2 OBS 不全 / 3 详情未知 / 4 未达标。
+    ///
+    /// 用不同码而不是统一非零，方便定时脚本区分「重试可能有用」（3）与
+    /// 「重试也没用，得改参数」（4）。
+    pub fn exit_code(&self) -> i32 {
+        match self.verdict() {
+            RunVerdict::Complete => 0,
+            RunVerdict::ObsIncomplete => 2,
+            RunVerdict::Unverified => 3,
+            RunVerdict::NotCounted => 4,
+        }
+    }
+
+    /// 机器可读的状态码（写进 UI 结果 JSON）。
+    pub fn verdict_code(&self) -> &'static str {
+        match self.verdict() {
+            RunVerdict::Complete => "complete",
+            RunVerdict::NotCounted => "not_counted",
+            RunVerdict::ObsIncomplete => "obs_incomplete",
+            RunVerdict::Unverified => "unverified",
+        }
+    }
+
+    /// 一句话结论（CLI/UI 共用口径）。
+    pub fn summary(&self) -> String {
+        match self.verdict() {
+            RunVerdict::Complete => "记录完成：OBS 2/2，详情达标".into(),
+            RunVerdict::NotCounted => {
+                let reasons = self.verification.failure_reasons();
+                if reasons.is_empty() {
+                    "服务端判定未达标，本条不计入".into()
+                } else {
+                    format!("服务端判定未达标：{}", reasons.join("；"))
+                }
+            }
+            RunVerdict::ObsIncomplete => format!(
+                "提交已被接受，但 OBS 只上传 {}/2：轨迹对象不完整，记录大概率无效",
+                self.obs_ok
+            ),
+            RunVerdict::Unverified => {
+                let reason = self
+                    .verification
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "响应没有达标判定字段".into());
+                format!("提交已被接受，但无法确认是否达标：{reason}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Verification {
     pub detail: Option<Value>,
@@ -159,7 +248,12 @@ pub fn run_full_flow_cancellable(
     // 这里**占位而不是只检查**：锁内完成「校验 + 计数 +1」，提交失败由 RAII 归还，
     // 既堵住并发提交同时读到 0 条的竞态，也避免写盘失败变成"永远 0 条"的 fail-open。
     let safety = super::model::load_config().safety;
-    let reservation = crate::safety::reserve_run(&safety, params.start_ms)?;
+    // 时区不是 UTC+8 时直接停：只警告会让「今天/昨天」与深夜判定错一天。
+    crate::safety::check_timezone(&safety, chrono::Local::now().offset().local_minus_utc())?;
+    // 0-4 秒抖动先落定，再按**最终开始时间**占位：否则午夜边界会把额度记到
+    // 前一天，而提交的轨迹落在后一天（关掉深夜拦截时就会真的错位）。
+    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
+    let reservation = crate::safety::reserve_run(&safety, start_ms)?;
 
     // 出口与轨迹同城：策略 / 点位 / 提交 / OBS / 详情整条链路共用同一出口 IP。
     // 服务端把「轨迹所在城市」和「请求来源 IP」做对比，是最廉价的风控手段。
@@ -174,11 +268,11 @@ pub fn run_full_flow_cancellable(
             }
         )),
         None => {
-            if client.egress.is_some() {
-                log(&format!(
-                    "[net] ⚠ 出口池里没有 {city} 的节点，本次直连 —— 来源 IP 可能与轨迹城市不符"
-                ));
-            }
+            // 走到这里只剩「本来就没配代理」：配置坏了/没有同城节点都会返回 Err，
+            // 不会静默直连。
+            log(&format!(
+                "[net] 未配置出口池，本次直连 —— 来源 IP 可能与轨迹城市（{city}）不符"
+            ));
         }
     }
 
@@ -218,15 +312,10 @@ pub fn run_full_flow_cancellable(
             skew_ms / 1000
         ));
     }
-    // 时区口径：随机时刻/「今天-昨天」用的是设备本地时区，护栏用的是北京时间。
-    // 设备时区不是 UTC+8 时两者会错位（白天可能被当成深夜拦，日期也会错一天）。
-    let offset = chrono::Local::now().offset().local_minus_utc();
-    if offset != 8 * 3600 {
-        log(&format!(
-            "⚠ [time] 设备时区不是 UTC+8（{:+.1} 小时）：随机时刻与「今天/昨天」按本地时区算，\
-             而深夜判定按北京时间 —— 请把手机时区设为北京时间，否则配额与时段会错位",
-            offset as f64 / 3600.0
-        ));
+    // 时区在入口处已强制（check_timezone）：走到这里只可能是 UTC+8，或用户显式放行。
+    if safety.allow_timezone_mismatch && chrono::Local::now().offset().local_minus_utc() != 8 * 3600
+    {
+        log("[time] 已按 safety.allow_timezone_mismatch 放行非 UTC+8 时区；日期与时段判断可能与北京时间错位");
     }
     sleep_jitter(1500);
 
@@ -287,8 +376,8 @@ pub fn run_full_flow_cancellable(
         params.dur,
         route_pts.len()
     ));
-    // 随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s），轨迹/提交/OBS/五点统一使用
-    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
+    // 随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s），轨迹/提交/OBS/五点统一使用；
+    // 已在占位之前算好（`start_ms`），这里不再二次抽样。
     let mut track = match params.route_mode {
         RouteMode::Road => {
             if !fences.polygons.is_empty() {
@@ -494,12 +583,20 @@ pub fn run_ai_submit(
 ) -> Result<Value, String> {
     // AI 运动同样受行为护栏约束（深夜 / 每日条数）。
     let safety = super::model::load_config().safety;
-    crate::safety::check_ai(&safety, 1)?;
+    crate::safety::check_timezone(&safety, chrono::Local::now().offset().local_minus_utc())?;
+    // 锁内「校验 + 占位」：并发提交不会同时读到同一个旧计数。请求失败时
+    // reservation 在 Drop 里归还，不会白吃配额。
+    let reservation = crate::safety::reserve_ai(&safety, 1)?;
     log(&format!("[ai] 提交 sportId={sport_id} mode={mode:?}…"));
     let biz = super::ai::upload(client, sport_id, mode, None)?;
-    if let Err(error) = crate::safety::record_ai(&safety, 1) {
-        log(&format!("⚠ [safety] 当日计数写入失败：{error}"));
+    if !super::ai::upload_succeeded(&biz) {
+        let message = biz
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("服务器未确认提交成功");
+        return Err(format!("AI 提交被拒绝：{message}"));
     }
+    reservation.commit();
     log("√ [ai] 提交成功");
     Ok(biz)
 }
@@ -601,6 +698,66 @@ mod verification_tests {
         assert!(second.detail.is_none());
         assert_eq!(second.complete, None);
         assert_eq!(second.error.as_deref(), Some("offline"));
+    }
+
+    fn outcome(obs_ok: usize, verification: Verification) -> RunOutcome {
+        RunOutcome {
+            result: SubmitResult {
+                rrid: 1,
+                uuid: "u".into(),
+                start_ms: 0,
+                complete: None,
+                total_dis: 3000.0,
+                total_time: 1200,
+                total_steps: 3000,
+                avg_step_freq: 150,
+                calorie: 200,
+                avg_power: 100,
+                sel_distance: 2000,
+            },
+            obs_ok,
+            verification,
+        }
+    }
+
+    /// 审计 F-01 的回归：请求被接受 ≠ 记录完成。
+    #[test]
+    fn accepted_submission_is_only_success_when_every_stage_passed() {
+        let graded = || Verification::from_result(Ok(json!({"complete": true})));
+        let rejected = || {
+            Verification::from_result(Ok(
+                json!({"complete": false, "reasonList": [{"complete": false, "reason": "里程未达标"}]}),
+            ))
+        };
+        let unreadable = || Verification::from_result(Err("timeout".into()));
+
+        let complete = outcome(2, graded());
+        assert_eq!(complete.verdict(), RunVerdict::Complete);
+        assert!(complete.is_success());
+        assert_eq!(complete.exit_code(), 0);
+
+        // 服务端明确未达标：即使 OBS 全传也失败，且退出码单独可辨。
+        let not_counted = outcome(2, rejected());
+        assert_eq!(not_counted.verdict(), RunVerdict::NotCounted);
+        assert!(!not_counted.is_success());
+        assert_eq!(not_counted.exit_code(), 4);
+        assert!(not_counted.summary().contains("里程未达标"));
+
+        // OBS 没传全：详情即使达标也不算完成。
+        let obs_short = outcome(1, graded());
+        assert_eq!(obs_short.verdict(), RunVerdict::ObsIncomplete);
+        assert_eq!(obs_short.exit_code(), 2);
+        assert!(!obs_short.is_success());
+
+        // 详情读不到：未知，不能当成功。
+        let unknown = outcome(2, unreadable());
+        assert_eq!(unknown.verdict(), RunVerdict::Unverified);
+        assert_eq!(unknown.exit_code(), 3);
+        assert!(!unknown.is_success());
+
+        // 详情可读但没有判定字段：同样是未知。
+        let no_flag = outcome(2, Verification::from_result(Ok(json!({"reasonList": []}))));
+        assert_eq!(no_flag.verdict(), RunVerdict::Unverified);
     }
 }
 

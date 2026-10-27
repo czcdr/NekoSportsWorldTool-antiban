@@ -368,20 +368,25 @@ pub fn save_ai_sports(list: &[crate::api::ai::AiSport]) -> Result<(), String> {
 ///
 /// 结构体本身不加密（内存里必须是明文才能登录），只有写盘这一层改写 JSON；
 /// 这样既不动 `Config`/`Session` 的字段，也不影响任何读代码 —— 迁移面最小。
-fn seal_field(v: &mut serde_json::Value, plain: &str, sealed: &str) {
+///
+/// 加密不可用时**拒绝写盘**，而不是退回明文：数据目录只读时保存本来也会失败，
+/// 但"悄悄写明文口令"是另一类问题，不能按普通路径处理。
+fn seal_field(v: &mut serde_json::Value, plain: &str, sealed: &str) -> Result<(), String> {
     let Some(value) = v.get(plain).and_then(|x| x.as_str()).map(str::to_string) else {
-        return;
+        return Ok(());
     };
     if value.is_empty() {
-        return;
+        return Ok(());
     }
     match crate::crypto::local_seal::seal(&value) {
         Some(cipher) => {
             v[sealed] = serde_json::Value::String(cipher);
             v[plain] = serde_json::Value::String(String::new());
+            Ok(())
         }
-        // 加密不可用（salt 写不进去）：保持旧行为，至少功能不中断。
-        None => eprintln!("[data] {plain} 未能加密保存（本地加密不可用）"),
+        None => Err(format!(
+            "本地加密不可用（local.salt 写入失败或数据目录不可写），已拒绝把 {plain} 以明文保存"
+        )),
     }
 }
 
@@ -409,11 +414,52 @@ fn open_field(v: &mut serde_json::Value, plain: &str, sealed: &str) {
     }
 }
 
+/// 宽松反序列化：**字段级**容错。
+///
+/// `serde_json::from_value(..).unwrap_or_default()` 会让一个字段类型写错
+/// （比如 `"daily_runs": "1"`）把整份配置或登录态重置成默认值：用户看到的是
+/// 「设置/账号莫名其妙没了」。这里逐个字段试解析，坏字段回落默认值、其余保留。
+fn deserialize_lenient<T>(v: serde_json::Value, name: &str) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Default,
+{
+    let Some(map) = v.as_object() else {
+        eprintln!("[data] {name} 不是 JSON 对象，使用默认值");
+        return T::default();
+    };
+    let mut kept = serde_json::Map::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (key, value) in map {
+        // 单字段探针：所有字段都有 serde(default)，只放一个键进也能解析成功；
+        // 类型不符则这里就失败，正好用来定位坏字段。
+        let probe = serde_json::json!({ key.clone(): value.clone() });
+        match serde_json::from_value::<T>(probe) {
+            Ok(_) => {
+                kept.insert(key.clone(), value.clone());
+            }
+            Err(_) => dropped.push(key.clone()),
+        }
+    }
+    if !dropped.is_empty() {
+        eprintln!(
+            "[data] {name} 有字段类型不符，已保留其余字段，下列字段回落默认值：{}",
+            dropped.join(", ")
+        );
+    }
+    match serde_json::from_value(serde_json::Value::Object(kept)) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("[data] {name} 仍无法解析（{error}），使用默认值");
+            T::default()
+        }
+    }
+}
+
 pub fn load_session() -> Session {
     match read_json::<serde_json::Value>("session.json") {
         Some(mut v) => {
             open_field(&mut v, "token", "token_sealed");
-            serde_json::from_value(v).unwrap_or_default()
+            deserialize_lenient(v, "session.json")
         }
         None => Session::default(),
     }
@@ -421,7 +467,7 @@ pub fn load_session() -> Session {
 
 pub fn save_session(s: &Session) -> Result<(), String> {
     let mut v = serde_json::to_value(s).map_err(|e| format!("序列化 session.json 失败: {e}"))?;
-    seal_field(&mut v, "token", "token_sealed");
+    seal_field(&mut v, "token", "token_sealed")?;
     write_json("session.json", &v)
 }
 
@@ -433,7 +479,7 @@ pub fn load_config() -> Config {
     match read_json::<serde_json::Value>("config.json") {
         Some(mut v) => {
             open_field(&mut v, "password", "password_sealed");
-            serde_json::from_value(v).unwrap_or_default()
+            deserialize_lenient(v, "config.json")
         }
         None => Config::default(),
     }
@@ -441,7 +487,7 @@ pub fn load_config() -> Config {
 
 pub fn save_config(c: &Config) -> Result<(), String> {
     let mut v = serde_json::to_value(c).map_err(|e| format!("序列化 config.json 失败: {e}"))?;
-    seal_field(&mut v, "password", "password_sealed");
+    seal_field(&mut v, "password", "password_sealed")?;
     write_json("config.json", &v)
 }
 
@@ -1048,5 +1094,83 @@ mod points_cache_tests {
         let raw = std::fs::read_to_string(directory.join("config.json")).unwrap();
         assert!(!raw.contains("legacy-plain"), "{raw}");
         assert_eq!(load_config().password, "legacy-plain");
+    }
+}
+
+#[cfg(test)]
+mod lenient_persistence_tests {
+    use super::*;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "neko-model-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            crate::platform::TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = Some(dir.clone()));
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            crate::platform::TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 审计 F-09：一个字段类型写错，不能把整份配置重置成默认值。
+    #[test]
+    fn one_bad_field_does_not_reset_the_whole_config() {
+        let dir = TempDir::new("badfield");
+        std::fs::write(
+            dir.0.join("config.json"),
+            r#"{"dist_min":"oops","dist_max":9.5,"username":"alice","face_check":false}"#,
+        )
+        .unwrap();
+        let config = load_config();
+        assert_eq!(config.username, "alice", "合法字段被连坐了");
+        assert_eq!(config.dist_max, 9.5);
+        assert!(!config.face_check);
+        // 坏字段回落默认值，而不是 0（Config 的默认 dist_min 不是 0）
+        assert_eq!(config.dist_min, Config::default().dist_min);
+    }
+
+    /// 登录态同理：uid 类型错误时 token 仍应保留，避免「重新登录才能用」。
+    #[test]
+    fn bad_session_field_keeps_token() {
+        let dir = TempDir::new("badsession");
+        std::fs::write(
+            dir.0.join("session.json"),
+            r#"{"uid":"not-a-number","token":"tok-123","unid":"u1"}"#,
+        )
+        .unwrap();
+        let session = load_session();
+        assert_eq!(session.token, "tok-123");
+        assert_eq!(session.unid, "u1");
+        assert_eq!(session.uid, 0);
+    }
+
+    /// 落盘必须走 v2 密文（带 MAC），文件里不能出现明文口令。
+    #[test]
+    fn password_is_written_as_v2_sealed_blob() {
+        let dir = TempDir::new("seal");
+        let config = Config {
+            password: "plain-text-pass".into(),
+            username: "alice".into(),
+            ..Config::default()
+        };
+        save_config(&config).unwrap();
+        let text = std::fs::read_to_string(dir.0.join("config.json")).unwrap();
+        assert!(!text.contains("plain-text-pass"), "{text}");
+        assert!(text.contains("v2:"), "未使用带 MAC 的 v2 格式：{text}");
+        let loaded = load_config();
+        assert_eq!(loaded.password, "plain-text-pass");
+        assert_eq!(loaded.username, "alice");
     }
 }

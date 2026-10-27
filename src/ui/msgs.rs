@@ -351,25 +351,45 @@ impl App {
         if let Some(v) = done_run {
             self.run_busy = false;
             let val: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+            let summary = val["summary"].as_str().unwrap_or("");
             if val.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
                 self.status = format!(
-                    "跑步提交成功 rrid={}（OBS {}/2）",
+                    "跑步完成 rrid={}（OBS {}/2）：{summary}",
                     val["rrid"].as_i64().unwrap_or(0),
                     val["obs_ok"].as_i64().unwrap_or(0)
                 );
                 self.popup = Some(run_popup(&val));
                 self.refresh_data_page();
                 self.run_page.preview_stale = true;
+            } else if val
+                .get("submitted")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                // 请求被接受 ≠ 记录有效：OBS 不全 / 未达标 / 详情读不到都走这里。
+                // 记录本身已经产生，仍然刷新列表，让用户看到它的真实状态。
+                self.status = format!("跑步已提交，但未确认完成：{summary}");
+                self.popup = Some(run_popup(&val));
+                self.refresh_data_page();
+                self.run_page.preview_stale = true;
             } else {
-                self.status = format!("跑步操作未完成：{}", val["message"].as_str().unwrap_or(""));
+                self.status = format!("跑步操作失败：{}", val["message"].as_str().unwrap_or(""));
             }
         }
         if let Some(v) = done_ai {
             self.ai_submit_active = false;
             self.ai_busy = false;
             let val: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+            let success = val["success"].as_i64().unwrap_or(0);
+            let total = val["total"].as_i64().unwrap_or(0);
             if val.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
                 self.status = "AI 运动提交成功".into();
+                self.popup = Some(ai_popup(&val));
+            } else if val.get("batch").and_then(|b| b.as_bool()).unwrap_or(false) && success > 0 {
+                self.status = format!("AI 批量补签部分成功：{success}/{total}（其余见日志）");
+                self.popup = Some(ai_popup(&val));
+            } else if val.get("batch").and_then(|b| b.as_bool()).unwrap_or(false) {
+                self.status = format!("AI 批量补签失败：0/{total}（详见日志）");
                 self.popup = Some(ai_popup(&val));
             } else {
                 self.status = format!("AI 提交失败：{}", val["message"].as_str().unwrap_or(""));
@@ -603,9 +623,19 @@ fn run_popup(v: &serde_json::Value) -> PopupInfo {
             v["avg_power"].as_i64().unwrap_or(0)
         ),
         format!("开始时间：{}", fmt_hms(v["start"].as_i64().unwrap_or(0))),
-        "记录提交：成功".into(),
+        format!(
+            "记录提交：{}",
+            if v["submitted"].as_bool().unwrap_or(false) {
+                "已被服务端接受"
+            } else {
+                "失败"
+            }
+        ),
         format!("OBS 上传：{}/2", v["obs_ok"].as_i64().unwrap_or(0)),
     ];
+    if let Some(summary) = v["summary"].as_str().filter(|s| !s.is_empty()) {
+        lines.push(format!("结论：{summary}"));
+    }
     if let Ok(verification) =
         serde_json::from_value::<crate::api::flow::Verification>(v["verification"].clone())
     {

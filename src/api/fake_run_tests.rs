@@ -228,6 +228,13 @@ fn drive(platform: &str) -> Chain {
     let root = std::env::temp_dir().join(format!("fake-run-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(root.clone()));
+    // 全链会检查设备时区必须是 UTC+8。CI 跑在 UTC 上，若这里不放行，
+    // 整条链在「时区」就停了 —— 与要验证的协议行为无关。
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"safety":{"allow_timezone_mismatch":true}}"#,
+    )
+    .unwrap();
 
     let (host, hits, stop) = start_mock();
     let (lat, lon) = crate::track::geom::wgs84_to_bd09(39.9, 116.4);

@@ -61,6 +61,12 @@ pub fn upload_both_keys(
     log: &mut dyn FnMut(&str),
 ) -> usize {
     let mut ok = 0;
+    // 出口闸门：代理配置坏了/没有同城节点时**不要**拿直连 agent 上传轨迹，
+    // 宁可让这一步明确失败（调用方会看到 OBS 0/2）。
+    if let Err(error) = client.egress_guard() {
+        log(&format!("[obs] 跳过上传：{error}"));
+        return 0;
+    }
     // OBS 直传是这条链上唯一上传轨迹数据的步骤：UA 与**出口**都必须与业务请求同源。
     // 这里克隆 client 那只 agent（内部 Arc，克隆很便宜），它已经带上同城出口代理。
     let ua = crate::crypto::header::ua_for(&client.identity);
@@ -92,7 +98,9 @@ pub fn fetch_object(
 ) -> Result<Value, String> {
     let signed = sign_url(client, "Get", key)?;
     let ua = crate::crypto::header::ua_for(&client.identity);
-    let agent = super::client::make_agent();
+    // 必须复用业务 client 的 agent（带同城出口）：以前这里自己 make_agent()，
+    // 一旦回读被接进主流程，就会出现「上传走代理、回读走家宽」的出口跳变。
+    let agent = client.agent.clone();
     let resp = agent
         .get(&signed)
         .set("User-Agent", &ua)

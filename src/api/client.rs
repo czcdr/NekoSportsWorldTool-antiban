@@ -10,46 +10,54 @@ use crate::crypto::envelope::{
 };
 use crate::crypto::header::{build_header_for, HeaderIdentity};
 
-pub fn make_agent() -> crate::http::Agent {
-    make_agent_with_proxy(None)
-}
+const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// 构造 HTTP agent。`proxy_url` 为 `socks5://host:port` 或 `http://host:port`。
-///
-/// 注意：调用方（`bind_egress_for_city`）会**先校验**代理串，校验失败直接报错，
-/// 不会走到这里的兜底分支。这里的 `Err` 分支只是防御性处理 —— 一旦真的触发，
-/// 说明"以为在走代理、其实直连"，比不配代理更糟，所以必须留日志。
-/// 直连与走代理的出口 IP 不同，两者绝不能在同一次跑步任务里混用。
-pub fn make_agent_with_proxy(proxy_url: Option<&str>) -> crate::http::Agent {
-    match crate::http::Agent::new(std::time::Duration::from_secs(30), proxy_url) {
+pub fn make_agent() -> crate::http::Agent {
+    match try_agent_with_proxy(None) {
         Ok(agent) => agent,
-        Err(error) => {
-            // 代理串可能带 user:pass：日志里只留打码后的地址。
-            if let Some(url) = proxy_url {
-                eprintln!(
-                    "[net] 代理 {} 配置无效，本次改为直连：{}",
-                    crate::textlog::redact_url(url),
-                    crate::textlog::redact_text(&error)
-                );
-            }
-            crate::http::Agent::with_timeout(std::time::Duration::from_secs(30))
-        }
+        // 直连 agent 构造失败（TLS 后端初始化异常）时退回同一实现的兜底构造；
+        // 这里没有"代理配了却没走"的问题，因为本来就是要直连。
+        Err(_) => crate::http::Agent::with_timeout(AGENT_TIMEOUT),
     }
 }
 
-/// 从数据目录读取 `proxies.json`。文件不存在 = 直连（与改造前一致）。
-fn load_egress_from_disk() -> Option<crate::api::egress::EgressPool> {
+/// 构造 HTTP agent，代理串无效时**返回错误而不是直连**。
+///
+/// 直连与走代理的出口 IP 不同，两者绝不能在同一次任务里混用。以前这里失败会
+/// 静默回退到直连，调用方却仍在日志里写"已绑定同城出口"。
+fn try_agent_with_proxy(proxy_url: Option<&str>) -> Result<crate::http::Agent, String> {
+    crate::http::Agent::new(AGENT_TIMEOUT, proxy_url).map_err(|error| {
+        let detail = crate::textlog::redact_text(&error.to_string());
+        match proxy_url {
+            Some(url) => format!(
+                "代理 {} 不可用（{detail}）；拒绝改为直连",
+                crate::textlog::redact_url(url)
+            ),
+            None => format!("无法创建直连 HTTP 客户端：{detail}"),
+        }
+    })
+}
+
+/// 按指定代理构造 agent（供出口探测之类的旁路使用），失败即错误。
+pub(crate) fn agent_with_proxy(proxy_url: &str) -> Result<crate::http::Agent, String> {
+    try_agent_with_proxy(Some(proxy_url))
+}
+
+/// 从数据目录读取 `proxies.json`。
+///
+/// - 文件不存在 / 空数组 → `Ok(None)`：未配置代理，直连（与改造前一致）；
+/// - 解析失败 / 协议不支持 → `Err`：**不能当没配**，否则一个写坏的
+///   `proxies.json` 就会把整条链路静默降级成真实 IP 直连。
+fn load_egress_from_disk() -> Result<Option<crate::api::egress::EgressPool>, String> {
     let path = crate::platform::data_dir().join("proxies.json");
     match crate::api::egress::EgressPool::load(&path) {
-        Ok(pool) if !pool.is_empty() => Some(pool),
-        Ok(_) => None,
-        Err(error) => {
-            eprintln!(
-                "[net] 出口配置被忽略（本次直连）：{}",
-                crate::textlog::redact_text(&format!("{error:?}"))
-            );
-            None
-        }
+        Ok(pool) if !pool.is_empty() => Ok(Some(pool)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(format!(
+            "出口配置 {} 无法使用：{}（已拒绝发请求，避免回落到直连）",
+            path.display(),
+            crate::textlog::redact_text(&format!("{error:?}"))
+        )),
     }
 }
 
@@ -96,6 +104,11 @@ pub struct RequestOutcome {
 
 impl ApiClient {
     pub fn new(identity: HeaderIdentity, login: Option<Session>) -> Self {
+        // 配置坏了不能当成「没配」：记下错误，之后每个请求都会被 egress_guard 拦下。
+        let (egress, egress_error) = match load_egress_from_disk() {
+            Ok(pool) => (pool, None),
+            Err(error) => (None, Some(error)),
+        };
         let mut client = Self {
             auth_context: None,
             auth_rejected: false,
@@ -105,9 +118,9 @@ impl ApiClient {
             session: EnvelopeSession::new(),
             identity,
             login,
-            egress: load_egress_from_disk(),
+            egress,
             egress_entry: None,
-            egress_error: None,
+            egress_error,
         };
         client.bootstrap_egress();
         client
@@ -133,13 +146,18 @@ impl ApiClient {
     /// 按城市绑定出口，并把代理装到 HTTP agent 上。
     ///
     /// - `Ok(Some(entry))`：已绑定同城出口；
-    /// - `Ok(None)`：该城市没有配置出口 —— 直连（可能暴露真实 IP，由调用方提示）；
-    /// - `Err`：配了同城出口但全部在冷却中。此时**不要**降级直连，
-    ///   否则等于主动把异地/家宽 IP 暴露给服务端。
+    /// - `Ok(None)`：**没有配置**出口池（`proxies.json` 不存在或为空）—— 直连；
+    /// - `Err`：配置坏了 / 没有该城市的节点 / 全部冷却 / 代理无法装载。
+    ///   这几种都**不降级直连**：放行就等于把真实 IP 交给服务端，而调用方
+    ///   还以为自己走了同城代理。
     pub fn bind_egress_for_city(
         &mut self,
         city: &str,
     ) -> Result<Option<crate::api::egress::ProxyEntry>, String> {
+        // 配置阶段就坏了（JSON 解析/协议不支持）：不再尝试，直接沿用错误。
+        if let Some(error) = &self.egress_error {
+            return Err(error.clone());
+        }
         // 幂等：已经绑过就直接返回。重复 acquire 会把游标推走，
         // 让同一次任务在中途换出口 —— 那本身就是可疑信号。
         if let Some(entry) = &self.egress_entry {
@@ -150,28 +168,25 @@ impl ApiClient {
         };
         match pool.acquire(city) {
             Ok(entry) => {
-                // 先验证代理串：配置写错时宁可报错，也不要"以为在走代理、其实直连"。
-                // 直连等于把真实 IP 直接交给服务端 —— 这比不配代理更糟，因为用户
-                // 以为自己已经被保护了。
-                reqwest::Proxy::all(&entry.url).map_err(|error| {
-                    let message = format!(
-                        "出口 {} 的代理地址不可用：{}",
-                        crate::textlog::redact_url(&entry.url),
-                        crate::textlog::redact_text(&error.to_string())
-                    );
-                    self.egress_error = Some(message.clone());
-                    message
-                })?;
-                self.agent = make_agent_with_proxy(Some(&entry.url));
+                // 代理串必须真正能装进 HTTP 客户端；失败就停，不退化成直连。
+                match try_agent_with_proxy(Some(&entry.url)) {
+                    Ok(agent) => self.agent = agent,
+                    Err(message) => {
+                        self.egress_error = Some(message.clone());
+                        return Err(message);
+                    }
+                }
                 self.egress_entry = Some(entry.clone());
                 self.egress_error = None;
                 Ok(Some(entry))
             }
             Err(crate::api::egress::PoolError::NoCandidate) => {
-                self.agent = make_agent_with_proxy(None);
-                self.egress_entry = None;
-                self.egress_error = None;
-                Ok(None)
+                let message = format!(
+                    "出口池里没有 {city} 的可用节点：已拒绝发请求（直连会把真实 IP 暴露给服务端）。\
+                     请给该城市补节点，或把设备城市改成已有节点的城市"
+                );
+                self.egress_error = Some(message.clone());
+                Err(message)
             }
             Err(crate::api::egress::PoolError::Exhausted) => {
                 let message = "同城出口全部处于冷却中，本次不发请求（避免暴露异地 IP）".to_string();
@@ -737,5 +752,75 @@ mod shared_auth_tests {
             );
         }
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod egress_fail_closed_tests {
+    use super::*;
+
+    /// 每个用例独立数据目录：proxies.json 落在 TEST_DATA_DIR 里。
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "neko-egress-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            crate::platform::TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = Some(dir.clone()));
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            crate::platform::TEST_DATA_DIR.with(|cell| *cell.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 写坏的 proxies.json 不能被当成「没配代理」：一旦放过就是真实 IP 直连。
+    #[test]
+    fn broken_proxy_config_blocks_requests_instead_of_going_direct() {
+        let dir = TempDir::new("broken");
+        std::fs::write(dir.0.join("proxies.json"), "{ this is not json").unwrap();
+        let client = ApiClient::new(HeaderIdentity::default(), None);
+        assert!(client.egress.is_none(), "坏配置不应生成出口池");
+        let error = client.egress_guard().expect_err("坏配置必须拦住请求");
+        assert!(error.contains("出口配置"), "{error}");
+        assert!(
+            error.contains("拒绝") || error.contains("无法使用"),
+            "错误信息要说清为什么不发请求：{error}"
+        );
+    }
+
+    /// 配了池子但没有当前城市节点：拒绝，而不是静默直连。
+    #[test]
+    fn missing_city_node_refuses_instead_of_going_direct() {
+        let dir = TempDir::new("nocity");
+        std::fs::write(
+            dir.0.join("proxies.json"),
+            r#"[{"url":"socks5://127.0.0.1:1080","city":"北京"}]"#,
+        )
+        .unwrap();
+        let mut identity = HeaderIdentity::default();
+        identity.city = "上海".into();
+        let client = ApiClient::new(identity, None);
+        let error = client.egress_guard().expect_err("没有同城节点必须拦住请求");
+        assert!(error.contains("上海"), "{error}");
+        assert!(error.contains("拒绝"), "{error}");
+    }
+
+    /// 完全没有 proxies.json：保持原行为（直连），不误伤默认用户。
+    #[test]
+    fn absent_proxy_config_keeps_direct_mode() {
+        let _dir = TempDir::new("absent");
+        let client = ApiClient::new(HeaderIdentity::default(), None);
+        assert!(client.egress.is_none());
+        assert!(client.egress_guard().is_ok());
     }
 }
