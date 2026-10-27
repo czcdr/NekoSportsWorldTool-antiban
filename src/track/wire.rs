@@ -288,11 +288,7 @@ fn step_diff_stats(diffs: &[f64], win_steps: i64, window_s: f64) -> (f64, f64, f
         let sum: f64 = diffs.iter().sum();
         let max = diffs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let min = diffs.iter().copied().fold(f64::INFINITY, f64::min);
-        return (
-            round_to(sum / count, 2),
-            round_to(max, 2),
-            round_to(min, 2),
-        );
+        return (round_to(sum / count, 2), round_to(max, 2), round_to(min, 2));
     }
     let typical = round_to(win_steps as f64 / window_s.max(1.0), 2).max(0.01);
     (
@@ -609,7 +605,10 @@ mod window_and_position_tests {
             .iter()
             .map(|w| w["avgDiff"].as_f64().unwrap_or(-1.0))
             .collect();
-        assert!(avg.iter().all(|v| *v >= 0.0), "avgDiff 必须是非负数字：{avg:?}");
+        assert!(
+            avg.iter().all(|v| *v >= 0.0),
+            "avgDiff 必须是非负数字：{avg:?}"
+        );
         assert!(
             avg.windows(2).any(|w| (w[0] - w[1]).abs() > f64::EPSILON),
             "同一轨迹不同窗的 avgDiff 不该完全相同：{avg:?}"
@@ -646,7 +645,8 @@ mod window_and_position_tests {
 
     /// 末窗不足 10s 时按实际时长缩放，避免详情页算出 300+ 步/分。
     #[test]
-    fn last_partial_window_keeps_cadence_sane() {        let (sp, stf) = build_windows(&track_with(1237));
+    fn last_partial_window_keeps_cadence_sane() {
+        let (sp, stf) = build_windows(&track_with(1237));
         let last = stf.last().unwrap();
         let secs = ((last["endTime"].as_i64().unwrap() - last["beginTime"].as_i64().unwrap())
             as f64

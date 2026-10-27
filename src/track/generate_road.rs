@@ -983,7 +983,8 @@ mod preview_tests {
     }
 
     #[test]
-    fn no_boundary_extra_mileage_reuses_the_same_checkpoint_circuit() {        let (mut net, _, points) = concave_campus();
+    fn no_boundary_extra_mileage_reuses_the_same_checkpoint_circuit() {
+        let (mut net, _, points) = concave_campus();
         // A long, returnable side road must not be explored to fill the mileage.
         let start = net.graph.node_indices().next().unwrap();
         let far = net.add_node(Coord::new(116.42, 39.9));

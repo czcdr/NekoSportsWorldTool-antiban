@@ -188,10 +188,7 @@ fn ios_identity_is_rejected_before_any_request_or_receipt() {
     let message = error(submit_record(&mut ios, &p, &mut |_| {}));
     assert!(message.contains("iOS"), "要指出当前平台：{message}");
     assert!(message.contains("Android"), "要给出可操作出口：{message}");
-    assert!(
-        message.contains("设备页"),
-        "要说明去哪儿切身份：{message}"
-    );
+    assert!(message.contains("设备页"), "要说明去哪儿切身份：{message}");
 
     // 同一份回执目录下换 Android 身份立刻能提交：说明上面那次没有发请求、也没留 pending。
     let mut android = client(&host);
@@ -200,7 +197,8 @@ fn ios_identity_is_rejected_before_any_request_or_receipt() {
 }
 
 #[test]
-fn successful_post_then_same_plan_only_sends_once() {    let _fixture = Fixture::new();
+fn successful_post_then_same_plan_only_sends_once() {
+    let _fixture = Fixture::new();
     let (host, task) = server(vec![Reply::Record(
         json!({"error":10000,"data":{"rrid":"42"}}),
     )]);
