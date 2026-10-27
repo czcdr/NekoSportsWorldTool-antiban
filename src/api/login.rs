@@ -242,9 +242,14 @@ pub fn login_with(
                 "passToken": creds["passToken"],
                 "genTime": creds["genTime"],
                 "isOffline": false,
-                // 必须跟身份走：写死 1（iOS）时，Android 身份的同一条请求会出现
-                // 「body 说 iOS、headerSign 说 Android」的跨来源矛盾。
-                "osType": if client.identity.platform == "android" { 0 } else { 1 },
+                // 必须是 1。实测（0.6.1 的变体探针，2026-10-27）：
+                //   osType=0 → {"error":10003,"message":"验证失败"}
+                //   osType=1 → {"error":10000,"message":"成功"}
+                // 这个字段不是「平台」：Android 身份的登录体仍写 0 且能登录成功，
+                // 说明 geevalidate 这一侧的 osType 是「客户端类型/移动端」语义。
+                // 旧实现按 identity.platform 派生（Android→0），于是无论滑块拖得对不对
+                // 都会被判「验证失败」——这就是长期 10003 的真正原因。
+                "osType": 1,
                 "businessType": 0,
                 "uuid": uuid_value,
                 "username": username,
