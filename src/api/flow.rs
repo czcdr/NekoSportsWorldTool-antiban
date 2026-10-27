@@ -34,6 +34,9 @@ pub struct RunOutcome {
     pub result: SubmitResult,
     pub obs_ok: usize,
     pub verification: Verification,
+    /// 如实记录的「这条记录可能不算数」的原因（A4 围栏外采样点 / A8 要求人脸核验
+    /// 但没提供核验数据）。不改变提交行为，只让 UI 与 CLI 都能看见。
+    pub warnings: Vec<String>,
 }
 
 /// 「请求被接受」之外的最终状态。
@@ -98,8 +101,12 @@ impl RunOutcome {
     }
 
     /// 一句话结论（CLI/UI 共用口径）。
+    ///
+    /// `warnings`（A4 围栏外采样点 / A8 要求核验但无核验数据）追加在结论后面，
+    /// 这样 CLI 的 `结论：…` 与 UI 的结果弹窗都会原样带出这句 —— 不用每个调用方
+    /// 各自记得打印。
     pub fn summary(&self) -> String {
-        match self.verdict() {
+        let base = match self.verdict() {
             RunVerdict::Complete => "记录完成：OBS 2/2，详情达标".into(),
             RunVerdict::NotCounted => {
                 let reasons = self.verification.failure_reasons();
@@ -121,7 +128,11 @@ impl RunOutcome {
                     .unwrap_or_else(|| "响应没有达标判定字段".into());
                 format!("提交已被接受，但无法确认是否达标：{reason}")
             }
+        };
+        if self.warnings.is_empty() {
+            return base;
         }
+        format!("{base}；{}", self.warnings.join("；"))
     }
 }
 
@@ -234,6 +245,46 @@ fn second_precision_start(base_ms: i64, draw: u32) -> i64 {
     base_ms + (draw % 60_000) as i64
 }
 
+/// A4：只读的围栏校验 —— 数一遍有多少采样点落在学校围栏外。
+///
+/// Legacy（默认模式）只保证「经过打卡点」，生成的环还会向外鼓；Manual 拿不到路网时
+/// 退回同一条连线路径。两者都不使用围栏选线，这里只把事实数出来交给调用方警告，
+/// **不改轨迹、不拦提交**（改选线属于另一个量级的改动）。
+///
+/// `track.locations[].gLat/gLng` 与围栏同为 BD09（见 `generate_road::to_bd`），
+/// 可以直接比。
+fn count_points_outside_fences(
+    track: &crate::track::model::Track,
+    fences: &[Vec<(f64, f64)>],
+) -> usize {
+    if fences.is_empty() {
+        return 0;
+    }
+    // 围栏是 (lat, lon) 元组；boundary 用 Coord::new(lon, lat)。
+    let polys: Vec<Vec<route_planner::Coord>> = fences
+        .iter()
+        .map(|ring| {
+            ring.iter()
+                .map(|&(lat, lon)| route_planner::Coord::new(lon, lat))
+                .collect()
+        })
+        .collect();
+    track
+        .locations
+        .iter()
+        .filter(|p| {
+            !route_planner::boundary::contains(&polys, route_planner::Coord::new(p.gLng, p.gLat))
+        })
+        .count()
+}
+
+/// A4：围栏外采样点的告警文案（0 个时不告警）。
+///
+/// 抽成函数是为了让文案本身可测：这句话会同时出现在日志、UI 弹窗与 CLI 结论里。
+fn fence_warning(outside: usize) -> Option<String> {
+    (outside > 0).then(|| format!("本路线有 {outside} 个采样点在围栏外，可能被判无效"))
+}
+
 /// 跑步全链。
 pub fn run_full_flow(
     client: &mut ApiClient,
@@ -314,14 +365,23 @@ pub fn run_full_flow_cancellable(
     ));
     // 人脸核验：服务端要不要，本工具都**不执行**核验。这里只把事实摆出来 ——
     // 让「这条记录可能被判无效」在跑之前就可见，而不是等详情页异常才发现。
+    //
+    // A8（审计 medium）：原来只打一条日志就算了，结论里看不出来。现在同时记进
+    // `warnings`，由 `RunOutcome::summary()` 带进 UI 弹窗与 CLI 输出 —— 提交行为不变
+    // （不拒绝、不改 faceCheck），只是别让用户以为这是一条干净的记录。
+    let mut warnings: Vec<String> = Vec::new();
     match pol.face_required {
-        Some(true) => log(&format!(
-            "⚠ [policy] 服务端要求本次人脸核验（faceVerifyType={}）：本工具不执行核验，\
-             提交只有 faceCheck 标记、没有核验数据，记录可能被判无效",
-            pol.face_verify_type
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "未下发".into())
-        )),
+        Some(true) => {
+            warnings
+                .push("已提交，但校方要求人脸核验而未提供核验数据，可能不计入有效次数".to_string());
+            log(&format!(
+                "⚠ [policy] 服务端要求本次人脸核验（faceVerifyType={}）：本工具不执行核验，\
+                 提交只有 faceCheck 标记、没有核验数据，记录可能被判无效",
+                pol.face_verify_type
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "未下发".into())
+            ));
+        }
         Some(false) => log("[policy] 服务端本次未要求人脸核验"),
         None => log("[policy] 响应未下发人脸核验配置（不代表不要求）"),
     }
@@ -497,6 +557,22 @@ pub fn run_full_flow_cancellable(
         ),
     };
     control.check()?;
+    // A4（审计 medium）：Legacy（默认模式）完全不用围栏 —— 只保证过打卡点，环的
+    // Catmull-Rom 还会向外鼓；Manual 在拿不到路网时也退化成同一条连线路径。
+    // 这里补一道**只读**校验：数出围栏外的采样点，如实警告，不改轨迹、不拦提交
+    // （改选线是另一个量级的改动，审计也只要求可见）。
+    let outside = count_points_outside_fences(&track, &fences.polygons);
+    if let Some(message) = fence_warning(outside) {
+        log(&format!(
+            "⚠ [fence] {message}（{}）",
+            if params.route_mode == RouteMode::Legacy {
+                "经典模式只过打卡点、不避让围栏"
+            } else {
+                "当前模式无路网时按点位连线"
+            }
+        ));
+        warnings.push(message);
+    }
     if let Some(range) = params.manual_altitude_range {
         crate::track::altitude::override_bd_a_range(&mut track, range)?;
         log(&format!(
@@ -598,6 +674,7 @@ pub fn run_full_flow_cancellable(
         result,
         obs_ok,
         verification,
+        warnings,
     })
 }
 
@@ -714,8 +791,99 @@ mod verification_tests {
         assert_eq!(second_precision_start(sampled, 30_000), sampled);
     }
 
+    /// A4：只读围栏校验 —— 数点、给文案，但不改轨迹、不拦提交。
     #[test]
-    fn server_skew_handles_seconds_and_millis() {        let now = crate::crypto::envelope::now_ms();
+    fn fence_check_counts_outside_samples_and_warns_without_blocking() {
+        let track = crate::track::generator::build(
+            2000.0,
+            600,
+            7,
+            (39.9, 116.4),
+            1_700_000_000_000,
+            &[(39.9, 116.4), (39.901, 116.401), (39.902, 116.4)],
+        );
+        // 没有围栏：不做判断、也不告警。
+        assert_eq!(count_points_outside_fences(&track, &[]), 0);
+        assert_eq!(fence_warning(0), None);
+
+        // 围栏在很远的地方：所有采样点都在外面，文案要点明数量与后果。
+        let far = vec![vec![
+            (30.0, 100.0),
+            (30.001, 100.0),
+            (30.001, 100.001),
+            (30.0, 100.001),
+        ]];
+        let all = track.locations.len();
+        assert_eq!(count_points_outside_fences(&track, &far), all);
+        let message = fence_warning(all).unwrap_or_default();
+        assert!(
+            message.contains(&all.to_string()),
+            "文案要带数量：{message}"
+        );
+        assert!(message.contains("围栏外"), "文案要说清问题：{message}");
+        assert!(
+            message.contains("可能被判无效"),
+            "文案要说清后果：{message}"
+        );
+
+        // 把整条轨迹包起来：一个都不在外面。
+        let lats: Vec<f64> = track.locations.iter().map(|p| p.gLat).collect();
+        let lngs: Vec<f64> = track.locations.iter().map(|p| p.gLng).collect();
+        let (lat_lo, lat_hi) = (
+            lats.iter().copied().fold(f64::INFINITY, f64::min) - 0.002,
+            lats.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 0.002,
+        );
+        let (lng_lo, lng_hi) = (
+            lngs.iter().copied().fold(f64::INFINITY, f64::min) - 0.002,
+            lngs.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 0.002,
+        );
+        let around = vec![vec![
+            (lat_lo, lng_lo),
+            (lat_lo, lng_hi),
+            (lat_hi, lng_hi),
+            (lat_hi, lng_lo),
+        ]];
+        assert_eq!(count_points_outside_fences(&track, &around), 0);
+        assert_eq!(fence_warning(0), None, "没问题时不能刷告警");
+        // 校验是只读的：轨迹点一个没少、距离没被改。
+        assert_eq!(track.locations.len(), all);
+        assert!((track.totalDistance - 2000.0).abs() < 0.01);
+    }
+
+    /// A8：要求人脸核验而没提供核验数据时，结论里必须带出这句（UI/CLI 共用 summary）。
+    /// 警告只加文案，不改判定与退出码 —— 提交行为不变。
+    #[test]
+    fn face_required_warning_is_visible_in_the_shared_summary() {
+        let mut out = outcome(2, Verification::from_result(Ok(json!({"complete": true}))));
+        assert_eq!(out.verdict(), RunVerdict::Complete);
+        assert!(
+            !out.summary().contains("人脸核验"),
+            "没有警告时不该出现核验提示"
+        );
+
+        out.warnings
+            .push("已提交，但校方要求人脸核验而未提供核验数据，可能不计入有效次数".to_string());
+        let summary = out.summary();
+        assert!(
+            summary.contains("人脸核验"),
+            "结论里看不到核验提示：{summary}"
+        );
+        assert!(
+            summary.contains("可能不计入有效次数"),
+            "要说明后果：{summary}"
+        );
+        assert!(
+            summary.contains("记录完成"),
+            "原有结论不能被警告替换掉：{summary}"
+        );
+        // 警告不是判定：退出码与机器码都不变。
+        assert_eq!(out.exit_code(), 0);
+        assert_eq!(out.verdict_code(), "complete");
+    }
+
+    #[test]
+    fn server_skew_handles_seconds_and_millis() {
+        let now = crate::crypto::envelope::now_ms();
         // 毫秒级
         let skew = server_skew_ms(now + 10_000);
         assert!((skew - 10_000).abs() <= 2, "毫秒单位换算有误: {skew}");
@@ -771,6 +939,7 @@ mod verification_tests {
             },
             obs_ok,
             verification,
+            warnings: Vec::new(),
         }
     }
 
