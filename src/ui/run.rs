@@ -313,6 +313,26 @@ impl RunPage {
         self.write_plan(dist, pace, dur, start_ms);
     }
 
+    /// 路线算法变了：把已经算好的预览标脏并丢掉。
+    ///
+    /// 三件事缺一不可，否则用户看到的就是「切了模式没反应」：
+    /// - `preview_stale = true`：不置真后台不会重算（原来只有 plan 重掷/路网刷新会置）；
+    /// - 清 `preview` / `check`：不清就会拿**上一种模式**的结果继续画这一种模式的线；
+    /// - 清 `preview_key`：`prepare_preview` 的去重键里没有模式，键不变它就不会重来一遍，
+    ///   旧结果回来时还会被当成这次的结果收下。
+    ///
+    /// 在飞的预览任务用 `cancel` 叫停：它的结果会因 key 不匹配被丢弃（见
+    /// `poll_preview_results`），不必在这里改 `preview_busy`。
+    pub(crate) fn on_route_mode_changed(&mut self) {
+        self.preview_cancel.cancel();
+        self.preview_key.clear();
+        self.preview = None;
+        self.check = None;
+        self.preview_stale = true;
+        self.map_fitted = false;
+        self.base_map_request = None;
+    }
+
     /// 确保方案与当前参数一致（参数变更补齐 / 提交前兜底）。
     ///
     /// 两个一致性判定都在改写方案「之前」求值：否则 regen_shape 会把当前参数写进方案，
@@ -485,12 +505,32 @@ impl App {
                     .on_hover_text(
                         "只用实时点位顺序串联，不要求经过策略必经点；没有路网时按点位连线",
                     );
-                if page.route_mode.requires_network() && self.network.is_none() {
-                    ui.colored_label(theme::warn(), "（正在按学校获取，可到路网页查看）");
+                // 说清「现在是什么模式、还缺什么」：只靠三个按钮名，用户不知道自己
+                // 选的东西眼下能不能出图。
+                let (label, missing) = match page.route_mode {
+                    RouteMode::Legacy => ("经典：按点位拟合，不画道路地图", None),
+                    RouteMode::Road => (
+                        "真实道路：沿校内道路行进，需要学校路网",
+                        self.network.is_none().then_some("路网未就绪"),
+                    ),
+                    RouteMode::Manual => (
+                        "自定义点位：按点位顺序串联，有路网时沿道路",
+                        self.network.is_none().then_some("无路网，将按点位连线"),
+                    ),
+                };
+                ui.colored_label(theme::plain(), format!("（{label}）"));
+                if let Some(missing) = missing {
+                    ui.colored_label(theme::warn(), format!("（{missing}）"));
                 }
             });
         }
 
+        // 路线算法变了：先标脏 + 丢掉旧预览，再决定要不要重新拉学校数据。
+        // 顺序不能反：refresh_points 会重新灌 preview_inputs，旧结果留在那儿会被
+        // 当成新模式的预览画出来。
+        if self.run_page.route_mode != prev_route {
+            self.run_page.on_route_mode_changed();
+        }
         // 切到需要学校数据的模式时按需拉取围栏/点位/路网（经典模式不触发这些端点）。
         if self.run_page.route_mode.needs_school_route() && !prev_route.needs_school_route() {
             self.refresh_points();
@@ -621,7 +661,11 @@ impl App {
     }
 
     fn draw_run_map(&mut self, ui: &mut egui::Ui) {
-        if self.run_page.route_mode != RouteMode::Road {
+        let mode = self.run_page.route_mode;
+        // 只有经典模式没有地图可画：它按点位顺序拟合，不涉及道路/建筑。
+        // 这里原来是 `!= RouteMode::Road`，于是「自定义点位」也掉进这个分支 ——
+        // 选了自定点位既不出图、提示还写着「经典模式」，用户看到的就是「点了没用」。
+        if mode == RouteMode::Legacy {
             ui.label("经典模式仅按点位拟合，不包含建筑避让；需要沿道路行进时请选择真实道路模式。");
             return;
         }
@@ -645,13 +689,25 @@ impl App {
             }
         });
         let Some(net) = self.network.clone() else {
-            ui.colored_label(
-                theme::warn(),
-                &format!(
-                    "学校路网尚未就绪：{}。可点击刷新，或到路网页自动获取。",
-                    self.osm_page.status
-                ),
-            );
+            // 两种模式缺路网的后果不同，提示也要分开说：
+            // Road 拿不到路网就**交不了**，Manual 会退回按点位连线（能交，但不沿道路）。
+            let status = if self.osm_page.status.is_empty() {
+                "尚未加载".to_string()
+            } else {
+                self.osm_page.status.clone()
+            };
+            let hint = if mode == RouteMode::Manual {
+                format!(
+                    "学校路网尚未就绪（{status}）：自定义点位将按点位连线；\
+                     要沿校内道路行进，请点『刷新路线点位与围栏』或到路网页获取。"
+                )
+            } else {
+                format!(
+                    "学校路网尚未就绪（{status}）：真实道路模式需要路网。\
+                     请点『刷新路线点位与围栏』，或到路网页获取。"
+                )
+            };
+            ui.colored_label(theme::warn(), hint);
             return;
         };
         let Some(plan) = self.run_page.plan.clone() else {
@@ -1565,6 +1621,239 @@ mod tests {
         assert!(
             !p.random_window_ok(),
             "今天 03:00 不应被判为在 7:00-20:00 窗口内"
+        );
+    }
+
+    // ── 「路由模式点了好像没用」的两条回归 ───────────────────────────────
+    //
+    // 用户反馈的两件事：① 选「自定义点位」不出图、提示还写着「经典模式」；
+    // ② 切模式不重算，画面留旧结果。两条都用无头 egui 跑真实的 draw_run。
+
+    use crate::api::model::{Config, HeaderIdentity, Session};
+
+    /// 某个价位都能跑的一页（空会话/空配置即可：本组用例不碰网络）。
+    fn mode_app(ctx: &egui::Context) -> App {
+        App::from_state(
+            ctx,
+            HeaderIdentity::default(),
+            Session::default(),
+            Config::default(),
+        )
+    }
+
+    fn run_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        w: f32,
+        h: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, h),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_run(ui));
+            },
+        )
+    }
+
+    /// 画面上所有可见文字（只取未被裁掉的）。
+    fn visible_texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text)
+                    if clipped.clip_rect.contains(
+                        egui::Rect::from_min_size(text.pos, text.galley.size()).center(),
+                    ) =>
+                {
+                    Some(text.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn label_position(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        output.shapes.iter().find_map(|clipped| {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                if text.galley.text() == label && clipped.clip_rect.contains(rect.center()) {
+                    return Some(rect.center());
+                }
+            }
+            None
+        })
+    }
+
+    /// 滚到能看见该标签，再点一下（布局测试同一套做法）。
+    fn click_label(app: &mut App, ctx: &egui::Context, w: f32, h: f32, label: &str) {
+        let mut at = None;
+        for _ in 0..60 {
+            let output = run_frame(app, ctx, w, h, vec![]);
+            if let Some(pos) = label_position(&output, label) {
+                at = Some(pos);
+                break;
+            }
+            let _ = run_frame(
+                app,
+                ctx,
+                w,
+                h,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(w / 2.0, h - 70.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -60.0),
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            for _ in 0..12 {
+                let _ = run_frame(app, ctx, w, h, vec![]);
+            }
+        }
+        let Some(at) = at else {
+            assert!(false, "滚动不到「{label}」");
+            return;
+        };
+        for pressed in [true, false] {
+            let _ = run_frame(
+                app,
+                ctx,
+                w,
+                h,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+    }
+
+    /// ① 自定义点位必须画地图：只有经典模式才该出现「经典模式仅按点位拟合」，
+    /// 而且选了自定义点位后地图区域（基础地图/画布）要真的画出来。
+    #[test]
+    fn manual_route_mode_draws_the_map_instead_of_the_legacy_hint() {
+        let ctx = egui::Context::default();
+        let mut app = mode_app(&ctx);
+        app.run_page.route_mode = RouteMode::Manual;
+        // 空路网也算「有路网」：本用例只关心走没走到画地图那条分支。
+        app.network = Some(std::sync::Arc::new(route_planner::RoadGraph::new()));
+
+        let output = run_frame(&mut app, &ctx, 900.0, 700.0, vec![]);
+        let texts = visible_texts(&output);
+        assert!(
+            !texts.iter().any(|t| t.contains("经典模式仅按点位拟合")),
+            "自定义点位不该再显示经典模式提示：{texts:?}"
+        );
+        // 地图区域被绘制：没有点位数据时会画「基础地图」+ 说明，这就是画布存在的证据。
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("基础地图：道路与建筑已加载") || t.contains("（无预览）")),
+            "自定义点位必须出地图区域：{texts:?}"
+        );
+        // 模式说明也要在场，别让用户猜「现在是什么模式、还缺什么」。
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("自定义点位：按点位顺序串联")),
+            "缺少当前模式说明：{texts:?}"
+        );
+    }
+
+    /// 经典模式仍然只给那句提示（回归保护：别把 Legacy 也改成画图）。
+    #[test]
+    fn legacy_route_mode_keeps_the_classic_hint_without_a_map() {
+        let ctx = egui::Context::default();
+        let mut app = mode_app(&ctx);
+        app.run_page.route_mode = RouteMode::Legacy;
+        app.network = Some(std::sync::Arc::new(route_planner::RoadGraph::new()));
+        let output = run_frame(&mut app, &ctx, 900.0, 700.0, vec![]);
+        let texts = visible_texts(&output);
+        assert!(texts.iter().any(|t| t.contains("经典模式仅按点位拟合")));
+        assert!(!texts
+            .iter()
+            .any(|t| t.contains("基础地图：道路与建筑已加载")));
+    }
+
+    /// ③ 缺路网时的提示要指出「还缺什么、下一步点哪里」，且两种模式后果不同。
+    #[test]
+    fn missing_network_hints_name_the_next_step_per_mode() {
+        let ctx = egui::Context::default();
+        // 自定义点位：能交（按点位连线），提示给出可选的补路网入口。
+        let mut manual = mode_app(&ctx);
+        manual.run_page.route_mode = RouteMode::Manual;
+        let texts = visible_texts(&run_frame(&mut manual, &ctx, 900.0, 700.0, vec![]));
+        assert!(
+            texts.iter().any(|t| t.contains("将按点位连线")),
+            "自定义点位缺路网时要说明会按点位连线：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("刷新路线点位与围栏")),
+            "要告诉用户从哪儿补路网：{texts:?}"
+        );
+
+        // 真实道路：没路网就没法走，提示要说清必须先取得路网。
+        let mut road = mode_app(&ctx);
+        road.run_page.route_mode = RouteMode::Road;
+        let texts = visible_texts(&run_frame(&mut road, &ctx, 900.0, 700.0, vec![]));
+        assert!(
+            texts.iter().any(|t| t.contains("真实道路模式需要路网")),
+            "真实道路缺路网时要说明这是硬前提：{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("刷新路线点位与围栏") || t.contains("路网页")),
+            "要告诉用户从哪儿补路网：{texts:?}"
+        );
+    }
+
+    /// ② 切模式要标脏并丢掉旧预览：否则画面留着上一种模式的结果。
+    #[test]
+    fn switching_route_mode_invalidates_the_previous_preview() {
+        let ctx = egui::Context::default();
+        let mut app = mode_app(&ctx);
+        app.run_page.route_mode = RouteMode::Road;
+        app.network = Some(std::sync::Arc::new(route_planner::RoadGraph::new()));
+        // 造一份「上一种模式算出来的」预览。
+        app.run_page.preview = Some(crate::track::generate_road::RoadPlan {
+            arcs: vec![0.0, 1.0],
+            laps: vec![500.0],
+            route: vec![(39.9, 116.4)],
+            length_m: 500.0,
+            edges: vec![],
+            buildings: vec![],
+            checkpoints: vec![(39.9, 116.4)],
+            fences: vec![],
+        });
+        app.run_page.preview_key = "旧模式的键".into();
+        app.run_page.preview_stale = false;
+        let _ = run_frame(&mut app, &ctx, 900.0, 700.0, vec![]);
+
+        click_label(&mut app, &ctx, 900.0, 700.0, "自定义点位");
+
+        assert_eq!(app.run_page.route_mode, RouteMode::Manual, "点击没切换模式");
+        assert!(app.run_page.preview_stale, "切模式后预览必须标脏");
+        assert!(app.run_page.preview.is_none(), "旧模式的预览必须清掉");
+        assert!(app.run_page.check.is_none(), "旧模式的检查结果必须清掉");
+        assert!(
+            app.run_page.preview_key.is_empty(),
+            "去重键必须清空，否则 prepare_preview 不会重算"
         );
     }
 }
