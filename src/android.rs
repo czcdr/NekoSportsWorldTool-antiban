@@ -261,8 +261,14 @@ pub(crate) fn version_name() -> String {
 }
 
 /// 自更新：把已下载的 APK 交给系统安装器（用户在系统弹窗确认）。
-pub(crate) fn install_apk(path: &str) {
-    with_activity(|env, activity| {
+///
+/// **必须返回结果**：以前 JNI 调用失败会被静默吞掉，用户点完「下载并安装」什么都没发生，
+/// 只看到版本没变（实测反馈）。现在把失败原因带回去，由界面弹窗说明。
+pub(crate) fn install_apk(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("更新包路径为空：请重新下载".into());
+    }
+    let ok = with_activity(|env, activity| {
         let value = env.new_string(path)?;
         env.call_method(
             activity,
@@ -272,6 +278,14 @@ pub(crate) fn install_apk(path: &str) {
         )?;
         Ok(())
     });
+    if ok {
+        Ok(())
+    } else {
+        Err("无法调用系统安装器（Activity 未就绪或安装器不可用）：\
+             请到系统设置允许本应用「安装未知应用」后重试，\
+             或用文件管理器手动安装应用私有目录下的 update.apk"
+            .into())
+    }
 }
 
 pub(crate) fn set_keep_screen_on(enabled: bool) {

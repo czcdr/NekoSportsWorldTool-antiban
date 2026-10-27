@@ -25,6 +25,28 @@ pub struct SemesterResult {
     pub personal_raw: Value,
 }
 
+/// 次数是否可信：`10000` 是业务成功码，出现在计数里说明取到了错误字段/错误对象。
+///
+/// 一学期有效次数不可能上千：`0..=1000` 之外一律当"没拿到"（宁可显示 0，
+/// 也不要把 10000 这种码当成次数展示 —— 那会让人直接不信整个页面）。
+pub fn plausible_count(value: i64) -> Option<i64> {
+    (0..=1000).contains(&value).then_some(value)
+}
+
+/// 从服务端对象里取一个"次数"字段，取到不合理的值就当没有（并留一条日志）。
+fn count_field(source: &serde_json::Value, key: &str, log: &mut dyn FnMut(&str)) -> Option<i64> {
+    let raw = source.get(key).and_then(|v| v.as_i64())?;
+    match plausible_count(raw) {
+        Some(n) => Some(n),
+        None => {
+            log(&format!(
+                "[semester] {key}={raw} 不像次数（10000 是业务成功码），已按 0 处理"
+            ));
+            None
+        }
+    }
+}
+
 pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<SemesterResult, String> {
     // 汇总
     let biz = client.call("POST", SUMMARY_PATH, "{}", &[])?;
@@ -43,17 +65,19 @@ pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Semest
             .get("semesterValidDis")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0),
-        semester_count: data
-            .get("semesterCount")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        semester_valid_count: data
-            .get("semesterValidCount")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
+        semester_count: plausible_count(
+            data.get("semesterCount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
+        semester_valid_count: plausible_count(
+            data.get("semesterValidCount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
     };
-
-    // 个人完成度：学期起止 / 考核方式 / 有效次数
     let personal_raw = match client.call(
         "POST",
         PERSONAL_PATH,
@@ -76,7 +100,7 @@ pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Semest
 
     // 部分学校汇总接口计数恒为 0，有效次数退回个人完成度接口
     if summary.semester_valid_count == 0 {
-        if let Some(n) = personal_raw.get("semesterValid").and_then(|v| v.as_i64()) {
+        if let Some(n) = count_field(&personal_raw, "semesterValid", log) {
             summary.semester_valid_count = n;
         }
     }
@@ -90,11 +114,11 @@ pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Semest
             let body = json!({ "rrid": rrid }).to_string();
             if let Ok(biz) = client.call("POST", super::user::SEMESTER_COMPLETED_PATH, &body, &[]) {
                 let done = super::client::parse_data_field(&biz);
-                if let Some(n) = done.get("semesterGoalCount").and_then(|v| v.as_i64()) {
+                if let Some(n) = count_field(&done, "semesterGoalCount", log) {
                     summary.semester_count = n;
                 }
                 if summary.semester_valid_count == 0 {
-                    if let Some(n) = done.get("semesterValidCount").and_then(|v| v.as_i64()) {
+                    if let Some(n) = count_field(&done, "semesterValidCount", log) {
                         summary.semester_valid_count = n;
                     }
                 }
@@ -106,4 +130,48 @@ pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Semest
         summary: Some(summary),
         personal_raw,
     })
+}
+
+#[cfg(test)]
+mod count_sanity_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 用户实测：日志里出现「有效 10000/0 次」——10000 是业务成功码，不是次数。
+    #[test]
+    fn business_success_code_is_never_shown_as_a_count() {
+        // 10000 本身不可信；0..=1000 才是可能的次数
+        assert_eq!(plausible_count(10000), None);
+        assert_eq!(plausible_count(0), Some(0));
+        assert_eq!(plausible_count(12), Some(12));
+        assert_eq!(plausible_count(1000), Some(1000));
+        assert_eq!(plausible_count(1001), None);
+        assert_eq!(plausible_count(-1), None);
+
+        // 服务端把成功码塞进计数字段时，取数要把它丢掉并留日志
+        let mut logs: Vec<String> = Vec::new();
+        let data = json!({ "error": 10000, "semesterValid": 10000 });
+        let mut log = |line: &str| logs.push(line.to_string());
+        let dropped = count_field(&data, "semesterValid", &mut log);
+        assert_eq!(dropped, None);
+        drop(log);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("10000") && l.contains("不像次数")),
+            "必须留一条日志说明为什么丢：{logs:?}"
+        );
+
+        // 正常响应照常读
+        let healthy = json!({ "error": 10000, "semesterValid": 7 });
+        let mut quiet = |_: &str| {};
+        assert_eq!(count_field(&healthy, "semesterValid", &mut quiet), Some(7));
+    }
+
+    /// 汇总接口的两次计数也要过同一道闸（这里只验证纯函数，不发请求）。
+    #[test]
+    fn summary_counts_use_the_same_gate() {
+        for (raw, want) in [(10000i64, 0i64), (0, 0), (15, 15), (999, 999)] {
+            assert_eq!(plausible_count(raw).unwrap_or(0), want, "raw={raw}");
+        }
+    }
 }

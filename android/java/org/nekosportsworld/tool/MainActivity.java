@@ -221,17 +221,97 @@ public final class MainActivity extends NativeActivity {
                     apk.delete();
                     return;
                 }
+                // 用户实测「下载并安装后版本没变」：versionCode 相同/更低时系统安装器
+                // 只弹「未安装」，看起来像沉默失败。先自己拦下来并说明原因。
+                long incomingCode = incomingVersionCode(apk);
+                long installedCode = currentVersionCode();
+                if (incomingCode <= installedCode) {
+                    showInstallBlockedDialog(
+                        "这个更新包与已安装版本相同或更旧（versionCode "
+                            + incomingCode + " ≤ " + installedCode + "）。\n\n"
+                            + "系统不会用相同或更旧的版本覆盖安装，所以点多少次都不会变。\n"
+                            + "请确认 Release 页的 tag 与包内版本号一致，或到 Release 页手动下载对应版本。",
+                        apk);
+                    return;
+                }
+                // 未授予「安装未知应用」时 startActivity 会"成功"但系统直接吞掉。
+                if (android.os.Build.VERSION.SDK_INT >= 26
+                        && !getPackageManager().canRequestPackageInstalls()) {
+                    showInstallBlockedDialog(
+                        "系统还没有允许本应用安装应用。\n\n"
+                            + "点「去授权」打开设置，允许本应用「安装未知应用」后回来再点一次安装；\n"
+                            + "也可以到文件管理器手动安装：" + apk.getAbsolutePath(),
+                        apk);
+                    return;
+                }
                 android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
                 intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
                 intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 intent.setDataAndType(ApkProvider.uriForUpdate(), "application/vnd.android.package-archive");
+                if (intent.resolveActivity(getPackageManager()) == null) {
+                    showInstallBlockedDialog(
+                        "这台设备上没有可用的应用安装器。\n\n"
+                            + "请到系统设置允许本应用「安装未知应用」，或用文件管理器手动安装："
+                            + apk.getAbsolutePath(),
+                        apk);
+                    return;
+                }
                 startActivity(intent);
             } catch (Exception error) {
-                android.widget.Toast.makeText(this,
-                    "无法启动安装器，请到系统设置允许本应用安装未知应用后重试",
-                    android.widget.Toast.LENGTH_LONG).show();
+                showInstallBlockedDialog(
+                    "无法启动安装器：" + error.getClass().getSimpleName()
+                        + (error.getMessage() == null ? "" : "（" + error.getMessage() + "）")
+                        + "\n\n请到「设置 → 应用 → 本应用 → 安装未知应用」允许后重试，"
+                        + "或用文件管理器手动安装应用私有目录下的 update.apk。",
+                    new java.io.File(path == null ? "" : path));
             }
         });
+    }
+
+    /** 更新包的 versionCode（解析失败返回 -1）。 */
+    private long incomingVersionCode(java.io.File apk) {
+        try {
+            android.content.pm.PackageInfo info = getPackageManager()
+                .getPackageArchiveInfo(apk.getAbsolutePath(), 0);
+            if (info == null) return -1;
+            return android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+        } catch (Exception error) {
+            return -1;
+        }
+    }
+
+    /** 已安装版本的 versionCode。 */
+    private long currentVersionCode() {
+        try {
+            android.content.pm.PackageInfo info =
+                getPackageManager().getPackageInfo(getPackageName(), 0);
+            return android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+        } catch (Exception error) {
+            return -1;
+        }
+    }
+
+    /**
+     * 安装被拦下时统一出口：说清原因 + 给出两条能自己动手的路径
+     * （去授权 / 文件管理器手动安装这个包的绝对路径）。
+     */
+    private void showInstallBlockedDialog(String message, java.io.File apk) {
+        if (isFinishing() || isDestroyed()) return;
+        final String path = apk == null ? "" : apk.getAbsolutePath();
+        new AlertDialog.Builder(this)
+            .setTitle("这次没能启动安装")
+            .setMessage(message + (path.isEmpty() ? "" : "\n\n安装包路径：\n" + path))
+            .setPositiveButton("知道了", null)
+            .setNeutralButton("去授权", (dialog, which) -> {
+                try {
+                    startActivity(new android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        android.net.Uri.parse("package:" + getPackageName())));
+                } catch (Exception ignored) {
+                    // 没有该设置页的 ROM：用户可自行去「设置 → 应用 → 安装未知应用」。
+                }
+            })
+            .show();
     }
 
     /** 校验待安装包：包名一致、签名一致、versionCode 不低于当前。返回 null 表示通过。 */

@@ -193,11 +193,16 @@ pub fn version_name() -> String {
 }
 
 /// Android：把已下载的 APK 交给系统安装器（用户在系统弹窗确认安装）。
-pub fn install_apk(path: &str) {
+pub fn install_apk(path: &str) -> Result<(), String> {
     #[cfg(target_os = "android")]
-    crate::android::install_apk(path);
+    {
+        crate::android::install_apk(path)
+    }
     #[cfg(not(target_os = "android"))]
-    let _ = path;
+    {
+        let _ = path;
+        Err("桌面版没有系统安装器：请直接运行下载好的新版本".into())
+    }
 }
 
 /// 让用户挑一个本地文件（Android：系统文件选择器；桌面：由调用方用 rfd）。

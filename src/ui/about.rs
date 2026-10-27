@@ -75,6 +75,33 @@ impl App {
         if let Some(e) = &self.update.check_error {
             ui.colored_label(theme::err(), format!("× {e}"));
         }
+        // 已下载的更新包留着：安装失败（被拦截/退出安装器）时用户还能再点一次，
+        // 不必重新下载，也不用去 GitHub 手动找。
+        let apk_path = crate::platform::data_dir().join(crate::update::APK_NAME);
+        if let Ok(meta) = std::fs::metadata(&apk_path) {
+            if meta.len() > 0 {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("再次安装已下载的更新包").clicked() {
+                        let text = apk_path.to_string_lossy().to_string();
+                        if let Err(error) = crate::platform::install_apk(&text) {
+                            self.status = format!("× 启动安装器失败：{error}");
+                        } else {
+                            self.status =
+                                "已请求系统安装器（若提示未安装，请允许安装未知应用）".into();
+                        }
+                    }
+                    ui.colored_label(
+                        theme::text_dim(),
+                        format!(
+                            "（{:.1} MB）{}",
+                            meta.len() as f64 / 1024.0 / 1024.0,
+                            apk_path.to_string_lossy()
+                        ),
+                    );
+                });
+            }
+        }
         if let Some(rel) = &self.update.latest {
             ui.add_space(6.0);
             ui.label(format!(
@@ -292,12 +319,26 @@ impl App {
                         }
                     },
                     Some(FinishAction::InstallApk { .. }) => {
-                        crate::platform::install_apk(
-                            &crate::platform::data_dir()
-                                .join(crate::update::APK_NAME)
-                                .to_string_lossy(),
-                        );
-                        self.update.finish = None;
+                        let apk = crate::platform::data_dir().join(crate::update::APK_NAME);
+                        let apk_text = apk.to_string_lossy().to_string();
+                        if let Err(error) = crate::platform::install_apk(&apk_text) {
+                            // 不能静默：用户点完什么都不发生，只会以为「装了但没变」。
+                            self.status = format!("× 启动安装器失败：{error}");
+                            self.popup = Some(super::PopupInfo {
+                                title: "无法启动安装器".into(),
+                                lines: vec![
+                                    error,
+                                    format!("安装包位置：{apk_text}"),
+                                    "手动安装：文件管理器打开上面的路径；若系统提示被拦截，\
+                                         去「设置 → 应用 → 本应用 → 安装未知应用」里允许"
+                                        .into(),
+                                    "也可以在下面的「更新」区点「再次安装」重试".into(),
+                                ],
+                            });
+                        } else {
+                            self.status =
+                                "已请求系统安装器：若提示「未安装/已被拦截」，请允许本应用安装未知应用".into();
+                        }
                     }
                     None => {}
                 }
