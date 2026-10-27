@@ -544,11 +544,33 @@ pub fn build_road(
             dist_acc += d_step;
         }
         positions.push(s);
+        // A6（审计 medium）：有围栏时原先是「整条丢掉 AR(1) 抖动、直接贴路网中心线」。
+        // 真机 GPS 永远有 3–5m 误差，整条轨迹精确落在中心线上比噪声太大更容易被识别
+        // （注释说 boundary mode 跟「实际道路」走，但中心线不是实际道路）。
+        //
+        // 现在保留抖动，但逐个夹进围栏：候选点必须自己落在围栏内，**而且**它到上一个
+        // 已发点的线段也在围栏内（凹多边形下两点在内、连线仍可能出界）；不满足就把偏移
+        // 折半再试，实在不行回退到中心线点 —— 宁可贴中心线，也不出界。
         let (lat, lng) = if net.boundaries.is_empty() {
             to_bd(px, py, c_lat, c_lng)
         } else {
-            // Boundary mode follows the actual road, including exceptional samples.
-            to_bd(x, y, c_lat, c_lng)
+            let prev = locs.last().map(|p| Coord::new(p.gLng, p.gLat));
+            let acceptable = |cand: (f64, f64)| {
+                let c = Coord::new(cand.1, cand.0);
+                route_planner::boundary::contains(&net.boundaries, c)
+                    && prev.map_or(true, |p| {
+                        route_planner::boundary::segment_inside(&net.boundaries, p, c)
+                    })
+            };
+            let mut chosen = to_bd(x, y, c_lat, c_lng);
+            for shrink in [1.0_f64, 0.5, 0.25] {
+                let cand = to_bd(x + (px - x) * shrink, y + (py - y) * shrink, c_lat, c_lng);
+                if acceptable(cand) {
+                    chosen = cand;
+                    break;
+                }
+            }
+            chosen
         };
         alt += 0.04 * (base_alt - alt) + rng.gauss(0.0, alt_sigma);
         // 生物力学联动：v=(cad/60)·stride
@@ -906,6 +928,58 @@ mod preview_tests {
             "两条不同 seed 的 Road 轨迹海拔基准相同（{:?}），基准仍是常量",
             peaks
         );
+    }
+
+    /// A6：有围栏时不能再把 GPS 抖动整条丢掉（旧实现贴死中心线）。
+    ///
+    /// 用一条**笔直走廊**当跑道：中心线只有经度变化、纬度恒定。旧实现（丢弃抖动）
+    /// 会让所有点的纬度几乎完全一致；保留抖动则纬度有 1–5m 量级的横向散布 —— 这个
+    /// 判据不依赖任何内部结构，且与「宁可贴中心线也不出界」的约束同时成立。
+    #[test]
+    fn fenced_road_keeps_lateral_gps_jitter() {
+        let mut net = RoadGraph::new();
+        let a = net.add_node(Coord::new(116.400, 39.900));
+        let b = net.add_node(Coord::new(116.410, 39.900));
+        let edge = route_planner::graph::EdgeData {
+            way_id: 1,
+            oneway: false,
+            highway: "footway".into(),
+            maxspeed_kmh: None,
+            length_m: 850.,
+        };
+        net.add_edge(a, b, edge.clone());
+        net.add_edge(b, a, edge);
+        net.rebuild_index();
+        let fence = [
+            (39.8995, 116.3995),
+            (39.8995, 116.4105),
+            (39.9005, 116.4105),
+            (39.9005, 116.3995),
+        ];
+        let polys: Vec<Vec<Coord>> = vec![fence
+            .iter()
+            .map(|&(lat, lon)| Coord::new(lon, lat))
+            .collect()];
+        let mut fenced = net.clone();
+        fenced.boundaries = polys.clone();
+        let points = vec![(39.900, 116.400), (39.900, 116.410)];
+        let track = build_road(3000.0, 1200, 9, 123_000, &points, &points, &fenced).unwrap();
+
+        let lats: Vec<f64> = track.locations.iter().map(|p| p.gLat).collect();
+        let mean = lats.iter().sum::<f64>() / lats.len() as f64;
+        let variance = lats.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / lats.len() as f64;
+        let lateral_m = variance.sqrt() * 111_320.0;
+        assert!(
+            lateral_m > 0.3,
+            "有围栏时横向抖动被丢弃：纬度标准差只有 {lateral_m:.2} m（几乎贴中心线）"
+        );
+        assert!(lateral_m < 15.0, "横向抖动过大：{lateral_m:.1} m");
+        for point in &track.locations {
+            assert!(
+                route_planner::boundary::contains(&polys, Coord::new(point.gLng, point.gLat)),
+                "抖动把采样点甩出围栏"
+            );
+        }
     }
 
     #[test]
