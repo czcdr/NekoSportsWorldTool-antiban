@@ -30,6 +30,11 @@ pub const MAX_PIXELS: usize = 8 * 1024 * 1024;
 pub const TILE_HOST_PREFIXES: [&str; 4] = ["0", "1", "2", "3"];
 /// 道路像素占比下限：低于它说明这张图基本是纯色/整片建筑，识别不出路。
 pub const MIN_ROAD_RATIO: f64 = 0.004;
+/// 道路像素占比上限：高于它说明整张图是同一种亮色（空白瓦片/占位图）。
+///
+/// 空白瓦片是 256×256 的纯白 PNG（压完才 ~200 字节）：每个像素都比「整幅图均值」
+/// 亮、彩度又是 0，会被整体判成路面、占比接近 100% —— 只有下限是挡不住的。
+pub const MAX_ROAD_RATIO: f64 = 0.55;
 
 /// 生成参数（全部可调，默认值面向百度 `pl` 底图 + 校园尺度）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -876,6 +881,14 @@ fn assemble_graph(lines: &[Vec<(f64, f64)>], merge_m: f64) -> RoadGraph {
     graph
 }
 
+/// 道路像素占比是否落在「像一张真实路网底图」的区间里。
+///
+/// 两头都要卡：下限挡「整张纯色/空地」；上限挡「整张空白瓦片」（纯白图会被
+/// 整片判成路面，占比≈100%）。判据单独成函数，是为了能在离线用例里覆盖两端。
+pub fn road_ratio_is_plausible(ratio: f64) -> bool {
+    (MIN_ROAD_RATIO..=MAX_ROAD_RATIO).contains(&ratio)
+}
+
 /// 全流程：抓图 → 分类 → 细化 → 追踪 → 简化 → 建图 → 写缓存。
 pub fn generate(
     agent: &Agent,
@@ -888,11 +901,18 @@ pub fn generate(
     let mask = classify_roads(&stitched.rgb, stitched.width, stitched.height, cfg);
     let road_px = mask.iter().filter(|v| **v == 1).count();
     let ratio = road_px as f64 / mask.len().max(1) as f64;
-    if ratio < MIN_ROAD_RATIO {
+    if !road_ratio_is_plausible(ratio) {
         return Err(format!(
-            "整张图只识别出 {:.3}% 的道路像素：瓦片可能不是路网底图，或这片区域是空地/水域。\
+            "道路像素占比 {:.2}% 不在合理区间（{:.1}%–{:.0}%）：{}。\
              可换 z 级别重试，或退回「真实道路」/人工导入 OSM 路网",
-            ratio * 100.0
+            ratio * 100.0,
+            MIN_ROAD_RATIO * 100.0,
+            MAX_ROAD_RATIO * 100.0,
+            if ratio < MIN_ROAD_RATIO {
+                "整张图识别不出道路（纯色、空地，或根本不是路网底图）"
+            } else {
+                "整张图几乎全是同一种亮色（空白瓦片/占位图），这种图会被整片判成路面"
+            }
         ));
     }
     let skeleton = thin(&mask, stitched.width, stitched.height);
@@ -1196,6 +1216,35 @@ mod tests {
     }
 
     #[test]
+    /// 冒烟测试暴露的真缺陷：空白瓦片（256×256 纯白 PNG）会被整片判成路面。
+    /// 下限挡不住它（占比≈100%），必须靠上限。
+    #[test]
+    fn blank_or_uniform_tiles_are_rejected_by_the_ratio_guard() {
+        let cfg = TileConfig::default();
+        // 纯白：分类器认为「比背景亮 + 无色」→ 整片路面
+        let white = Canvas::new(32, 32, 255);
+        let mask = classify_roads(&white.rgb, white.width, white.height, &cfg);
+        let ratio = count(&mask) as f64 / mask.len() as f64;
+        assert!(
+            ratio > MAX_ROAD_RATIO,
+            "全白图占比 {ratio:.2}，本该被判成异常"
+        );
+        assert!(!road_ratio_is_plausible(ratio), "全白图必须被拒");
+        // 纯灰：一个点都认不出
+        let gray = Canvas::new(32, 32, 120);
+        let mask = classify_roads(&gray.rgb, gray.width, gray.height, &cfg);
+        let ratio = count(&mask) as f64 / mask.len() as f64;
+        assert!(!road_ratio_is_plausible(ratio), "纯灰图必须被拒");
+        // 正常的十字：落在合理区间里
+        let cross = cross_canvas();
+        let mask = classify_roads(&cross.rgb, cross.width, cross.height, &cfg);
+        let ratio = count(&mask) as f64 / mask.len() as f64;
+        assert!(
+            road_ratio_is_plausible(ratio),
+            "正常十字图的占比 {ratio:.3} 不该被拒"
+        );
+    }
+
     fn too_many_tiles_is_refused_before_fetching() {
         let cfg = TileConfig::default();
         // 6km 见方：z18 下一张瓦片约 153m，一方就要 ~40 张。
