@@ -105,6 +105,10 @@ pub struct App {
     pub ip: String,
     pub identity: HeaderIdentity,
     pub device_buf: HeaderIdentity,
+    /// 城市/锚点「停手自动保存」的计时起点（None = 目前没有未保存的定位修改）。
+    pub(crate) device_dirty_since: Option<std::time::Instant>,
+    /// 上一次看到的（城市, 纬度, 经度）快照：值一变就重置计时，实现去抖。
+    pub(crate) device_last_edit: Option<(String, f64, f64)>,
     pub session: Option<Session>,
     pub config: Config,
 
@@ -457,6 +461,8 @@ impl App {
             ip: String::new(),
             identity,
             device_buf,
+            device_dirty_since: None,
+            device_last_edit: None,
             session: session.is_logged_in().then_some(session),
             config: config.clone(),
             username,
@@ -532,6 +538,22 @@ impl App {
             model::load_session(),
             model::load_config(),
         );
+        // 启动可诊断：一句「城市=包头市（来源：identity.json / config 备份 / 默认值）」。
+        // 用户反馈「更新后城市变回去了」时，这一行能立刻区分「文件没了」与「文件还在、
+        // 只是从备份恢复的差异」，不用再让他翻数据目录。
+        eprintln!(
+            "[identity] 城市={}（来源：{}）",
+            app.identity.city,
+            model::identity_source()
+        );
+        app.log.push(&format!(
+            "设备身份：城市={}（来源：{}）",
+            app.identity.city,
+            model::identity_source()
+        ));
+        if let Some(warning) = model::identity_warning(&app.identity) {
+            app.log.push(&format!("⚠  {warning}"));
+        }
         if app.font_loaded.is_none() {
             app.log
                 .push("未找到中文字体（msyh/simhei/simsun），界面中文可能显示为方块");

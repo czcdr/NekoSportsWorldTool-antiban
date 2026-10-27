@@ -91,6 +91,53 @@ pub struct Config {
     /// 提交行为护栏（深夜/每日次数/批量补签）。缺省即默认开启。
     #[serde(default)]
     pub safety: crate::safety::SafetyPolicy,
+    /// 设备身份的**冗余备份**（identity.json 丢失/损坏时回填）。
+    ///
+    /// 只存恢复必需的最小字段：城市、锚点经纬度、device_id。
+    /// 为什么需要：手机上「应用内更新 + 安装」之后，私有目录里的 identity.json
+    /// 被系统/文件层清掉或换成默认值的情况真实发生过（用户的城市「包头市」变回
+    /// 默认「大连市」，而代码里没有任何地方删它 —— 见 `review/IDENTITY-PERSIST.md`）。
+    /// 代码改变不了那件事，能做的是「丢了能恢复」。
+    #[serde(default)]
+    pub identity_backup: Option<IdentityBackup>,
+}
+
+/// `config.json` 里的身份备份（与 identity.json 同一份数据，但独立成文件）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct IdentityBackup {
+    #[serde(default)]
+    pub city: String,
+    #[serde(default)]
+    pub anchor_lat: f64,
+    #[serde(default)]
+    pub anchor_lon: f64,
+    #[serde(default)]
+    pub device_id: String,
+    /// 备份写入时间（毫秒），排障时看「这份备份是什么时候的」。
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+impl IdentityBackup {
+    /// 从身份里抽备份字段。城市为空时不抽（没有可恢复的东西）。
+    fn from_identity(id: &crate::crypto::header::HeaderIdentity) -> Option<Self> {
+        let city = id.city.trim();
+        if city.is_empty() {
+            return None;
+        }
+        Some(Self {
+            city: city.to_string(),
+            anchor_lat: id.anchor_lat,
+            anchor_lon: id.anchor_lon,
+            device_id: id.device_id.clone(),
+            updated_at_ms: crate::crypto::envelope::now_ms(),
+        })
+    }
+
+    /// 这份备份是否还有可用内容（城市为空即无意义）。
+    fn is_useful(&self) -> bool {
+        !self.city.trim().is_empty()
+    }
 }
 
 fn default_route_mode() -> String {
@@ -141,6 +188,7 @@ impl Default for Config {
             osm_path: String::new(),
             route_mode: default_route_mode(),
             safety: crate::safety::SafetyPolicy::default(),
+            identity_backup: None,
         }
     }
 }
@@ -190,11 +238,11 @@ fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> 
 }
 
 /// 原子写：先写同目录临时文件并落盘，再 rename 覆盖。
-///
+//
 /// 直接 `fs::write` 会在崩溃/断电时留下半截 JSON，而读取端只能解析失败；
 /// 凭据与身份文件一旦这样坏掉，用户看到的是"设置被清空"。
 /// Unix 上把权限收紧到 0600（默认 umask 往往给同机其他用户留了读权限）。
-///
+//
 /// 临时文件名必须**全局唯一**：只用 `文件名.PID.tmp` 时，同一进程里两个线程
 /// 同时保存同一目标会共同截断/写入同一个临时文件，再互相 rename —— 原子写承诺
 /// 就不成立了（写出来的可能是两段 JSON 的交错残片）。这里再拼上线程 id 与
@@ -252,24 +300,123 @@ pub fn load_identity() -> HeaderIdentity {
     load_identity_for_platform("android")
 }
 
-fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
-    let mut id: HeaderIdentity = read_json("identity.json").unwrap_or_else(|| {
-        let mut identity = HeaderIdentity::default();
-        if platform == "android" {
-            identity.platform = "android".into();
-            // 机型/系统版本留空，交给下面的统一派生填成机型库里的真机组合。
-            // 写死 "Android"/"16" 这类占位值会让 header 的 deviceName/osVersion
-            // 与 UA 各说各话（占位值本身也不是任何一台真机的 Build.MODEL）。
-            identity.device_name.clear();
-            identity.os_version.clear();
+// 身份来源诊断（`identity.json` / `.bak` / config 备份 / 默认值）。
+//
+// 启动时打一行日志，用户反馈「城市变回去了」时能立刻看出这份身份是从哪儿来的。
+thread_local! {
+    // 线程局部：界面在主线程读、测试各线程各写，互不干扰。
+    static IDENTITY_SOURCE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// 最近一次 `load_identity` 的来源（给界面/日志用）。未加载过时返回空串。
+pub fn identity_source() -> String {
+    IDENTITY_SOURCE.with(|s| s.borrow().clone())
+}
+
+/// 按优先级找一个能解析的身份文件：主文件 → 我们自己的 `.bak` → 被隔离的 `.corrupt`。
+//
+/// `.corrupt` 是 `read_json` 把**坏文件**改名后的位置，正常它解析不出来；但如果某次
+/// 是「文件被换成一段坏内容」，早先的 `.corrupt` 里可能还留着上一份好内容，试一下不亏。
+fn read_identity_file() -> (Option<crate::crypto::header::HeaderIdentity>, &'static str) {
+    let dir = exe_dir();
+    for (name, label) in [
+        ("identity.json", "identity.json"),
+        ("identity.json.bak", "identity.json.bak"),
+        ("identity.json.corrupt", "identity.json.corrupt"),
+    ] {
+        let path = dir.join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match serde_json::from_str::<crate::crypto::header::HeaderIdentity>(&text) {
+            Ok(id) => return (Some(id), label),
+            Err(error) => {
+                if name == "identity.json" {
+                    // 留档 + 告警（沿用 `read_json` 的老行为，避免静默当没发生）。
+                    let bad = path.with_extension("json.corrupt");
+                    let _ = std::fs::rename(&path, &bad);
+                    eprintln!(
+                        "[data] identity.json 解析失败（{error}），已备份为 {}，尝试用备份恢复",
+                        bad.display()
+                    );
+                }
+            }
         }
-        identity
+    }
+    (None, "")
+}
+
+fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
+    let (loaded, mut source) = read_identity_file();
+    let mut id = match loaded {
+        Some(id) => id,
+        None => {
+            let mut identity = HeaderIdentity::default();
+            if platform == "android" {
+                identity.platform = "android".into();
+                // 机型/系统版本留空，交给下面的统一派生填成机型库里的真机组合。
+                // 写死 "Android"/"16" 这类占位值会让 header 的 deviceName/osVersion
+                // 与 UA 各说各话（占位值本身也不是任何一台真机的 Build.MODEL）。
+                identity.device_name.clear();
+                identity.os_version.clear();
+            }
+            identity
+        }
+    };
+    // ② 冗余恢复：文件没了 / 被换成默认值 / 解析失败时，用 config.json 里的备份回填。
+    //
+    // 判据要比「文件是否存在」更宽：用户报的是「文件在，但城市变回默认大连」。
+    // 所以只要「当前城市是空或系统默认值」且备份里有别的城市，就按备份恢复；
+    // device_id 也一并恢复（换 device_id = 服务端当新设备，直接 10121 风控）。
+    let backup = load_config()
+        .identity_backup
+        .filter(IdentityBackup::is_useful);
+    if let Some(backup) = &backup {
+        let city_is_default =
+            id.city.trim().is_empty() || id.city.trim() == crate::location::default_city();
+        if city_is_default && backup.city.trim() != id.city.trim() {
+            eprintln!(
+                "[identity] 已从 config.json 备份恢复城市={}（文件里的值是「{}」）",
+                backup.city,
+                if id.city.trim().is_empty() {
+                    "空"
+                } else {
+                    id.city.as_str()
+                }
+            );
+            id.city = backup.city.clone();
+            id.anchor_lat = backup.anchor_lat;
+            id.anchor_lon = backup.anchor_lon;
+            source = "config 备份";
+        }
+    }
+    if id.device_id.is_empty() {
+        match backup
+            .as_ref()
+            .map(|b| b.device_id.trim())
+            .filter(|s| !s.is_empty())
+        {
+            Some(id_from_backup) => {
+                // 不重置 device_id：重置等于让服务端把这台手机当新设备（10121）。
+                eprintln!("[identity] 已从 config.json 备份恢复 device_id");
+                id.device_id = id_from_backup.to_string();
+                if source.is_empty() {
+                    source = "config 备份";
+                }
+            }
+            None => {
+                id.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+            }
+        }
+    }
+    IDENTITY_SOURCE.with(|slot| {
+        *slot.borrow_mut() = if source.is_empty() {
+            "默认值".into()
+        } else {
+            source.to_string()
+        };
     });
     let mut dirty = false;
-    if id.device_id.is_empty() {
-        id.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
-        dirty = true;
-    }
     if id.app_install_time <= 0 {
         id.app_install_time =
             crate::crypto::header::HeaderIdentity::fresh_install_time(&id.platform);
@@ -372,8 +519,67 @@ pub fn identity_with_device_info(
     Ok(updated)
 }
 
-pub fn save_identity(id: &HeaderIdentity) -> Result<(), String> {
-    write_json("identity.json", id)
+/// 保存设备身份：主文件 + 滚动备份 + config.json 冗余备份。
+//
+/// 三层是为了「丢了能恢复」：
+/// 1. `identity.json`（主）；
+/// 2. `identity.json.bak`（上一次成功保存的副本 —— 主文件被写成半截时还能救）；
+/// 3. `config.json` 的 `identity_backup`（另一份文件里的最小字段集）。
+//
+/// 主文件写失败就整体报错（调用方要弹窗）；后两层失败只记日志 ——
+/// 主文件已经是新的了，不该因为备份没写成让用户以为保存失败。
+pub fn save_identity(id: &crate::crypto::header::HeaderIdentity) -> Result<(), String> {
+    write_json("identity.json", id)?;
+    let dir = exe_dir();
+    // ② 滚动备份：先写临时文件再改名（复用原子写），失败只记日志。
+    if let Ok(json) = serde_json::to_string_pretty(id) {
+        if let Err(error) = write_secret_file(&dir.join("identity.json.bak"), json.as_bytes()) {
+            eprintln!("[data] identity.json.bak 写入失败：{error}");
+        }
+    }
+    // ③ config.json 冗余备份：城市/锚点/device_id。
+    match IdentityBackup::from_identity(id) {
+        Some(backup) => {
+            let mut config = load_config();
+            let unchanged = config.identity_backup.as_ref().is_some_and(|old| {
+                old.city == backup.city
+                    && (old.anchor_lat - backup.anchor_lat).abs() < 1e-9
+                    && (old.anchor_lon - backup.anchor_lon).abs() < 1e-9
+                    && old.device_id == backup.device_id
+            });
+            if !unchanged {
+                config.identity_backup = Some(backup);
+                if let Err(error) = save_config(&config) {
+                    eprintln!("[data] config.json 身份备份写入失败：{error}");
+                }
+            }
+        }
+        None => eprintln!("[data] 城市为空，跳过 config.json 身份备份"),
+    }
+    Ok(())
+}
+
+/// 备份里记录的城市（没有备份返回 None）——给界面显示「备份里的城市」用。
+pub fn identity_backup_city() -> Option<String> {
+    load_config()
+        .identity_backup
+        .filter(IdentityBackup::is_useful)
+        .map(|b| b.city)
+}
+
+/// 身份加载后的告警文案：城市/锚点还是默认值时提醒用户去填。
+//
+/// 「备份也丢了」时这是唯一能做的事 —— 明确告诉用户当前是默认值、去哪儿改，
+/// 而不是等他在跑步页才发现定位落在隔壁城市。
+pub fn identity_warning(id: &crate::crypto::header::HeaderIdentity) -> Option<String> {
+    if !id.has_unconfigured_default_location() {
+        return None;
+    }
+    Some(format!(
+        "设备身份没有可用的城市/锚点（当前是默认「{}」）：请到设备页填写城市与定位锚点并保存。\
+         刚更新过应用的话，identity.json 与 config.json 的备份可能一起丢了，需要重新填一次",
+        id.city.trim()
+    ))
 }
 
 /// AI 项目列表永久缓存：拉取成功即落盘，网络异常时兜底展示。
@@ -386,10 +592,10 @@ pub fn save_ai_sports(list: &[crate::api::ai::AiSport]) -> Result<(), String> {
 }
 
 /// 敏感字段落盘前的加密改写：`plain` 非空时写成 `sealed` 密文并清空明文。
-///
+//
 /// 结构体本身不加密（内存里必须是明文才能登录），只有写盘这一层改写 JSON；
 /// 这样既不动 `Config`/`Session` 的字段，也不影响任何读代码 —— 迁移面最小。
-///
+//
 /// 加密不可用时**拒绝写盘**，而不是退回明文：数据目录只读时保存本来也会失败，
 /// 但"悄悄写明文口令"是另一类问题，不能按普通路径处理。
 fn seal_field(v: &mut serde_json::Value, plain: &str, sealed: &str) -> Result<(), String> {
@@ -436,7 +642,7 @@ fn open_field(v: &mut serde_json::Value, plain: &str, sealed: &str) {
 }
 
 /// 宽松反序列化：**字段级**容错。
-///
+//
 /// `serde_json::from_value(..).unwrap_or_default()` 会让一个字段类型写错
 /// （比如 `"daily_runs": "1"`）把整份配置或登录态重置成默认值：用户看到的是
 /// 「设置/账号莫名其妙没了」。这里逐个字段试解析，坏字段回落默认值、其余保留。
@@ -1270,5 +1476,133 @@ mod lenient_persistence_tests {
         let loaded = load_config();
         assert_eq!(loaded.password, "plain-text-pass");
         assert_eq!(loaded.username, "alice");
+    }
+}
+
+/// 身份冗余恢复：config 备份 / .bak / 半截文件的容错。
+#[cfg(test)]
+mod identity_backup_tests {
+    use super::*;
+    use crate::crypto::header::HeaderIdentity;
+
+    struct Temp(std::path::PathBuf);
+
+    impl Temp {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("neko-ident-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(dir.clone()));
+            Self(dir)
+        }
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn configured() -> HeaderIdentity {
+        let mut id = HeaderIdentity::default();
+        id.platform = "android".into();
+        id.city = "包头市".into();
+        id.anchor_lat = 40.657_000;
+        id.anchor_lon = 109.840_000;
+        id.device_id = "AAAA-BBBB-CCCC-DDDD".into();
+        id
+    }
+
+    /// ① 保存后 config.json 里有备份；主文件被换成默认值时按备份恢复。
+    #[test]
+    fn config_backup_restores_a_defaulted_city() {
+        let temp = Temp::new();
+        let saved = configured();
+        save_identity(&saved).unwrap();
+
+        let backup = load_config().identity_backup.expect("应写入 config 备份");
+        assert_eq!(backup.city, "包头市");
+        assert_eq!(backup.device_id, saved.device_id);
+
+        // 模拟「文件在、但城市回到默认」：写一份默认身份回主文件
+        let mut reset = saved.clone();
+        reset.city = crate::location::default_city().into();
+        reset.anchor_lat = crate::location::default_anchor().latitude;
+        reset.anchor_lon = crate::location::default_anchor().longitude;
+        write_json("identity.json", &reset).unwrap();
+
+        let loaded = load_identity_for_platform("android");
+        assert_eq!(loaded.city, "包头市", "应从 config 备份恢复城市");
+        assert!((loaded.anchor_lat - 40.657).abs() < 1e-9, "锚点也要恢复");
+        assert_eq!(loaded.device_id, saved.device_id);
+        assert_eq!(identity_source(), "config 备份");
+    }
+
+    /// ② identity.json 半截（解析失败）→ 从 .bak 恢复，device_id 不能变。
+    #[test]
+    fn truncated_identity_json_recovers_from_rolling_backup() {
+        let temp = Temp::new();
+        let saved = configured();
+        save_identity(&saved).unwrap();
+        assert!(temp.path("identity.json.bak").is_file(), "应写滚动备份");
+
+        // 半截 JSON（真实故障形态：写到一半断电/被截断）
+        std::fs::write(temp.path("identity.json"), r#"{"city":"包头"#).unwrap();
+
+        let loaded = load_identity_for_platform("android");
+        assert_eq!(loaded.city, "包头市");
+        assert_eq!(
+            loaded.device_id, saved.device_id,
+            "恢复时**不能**换 device_id（换=服务端当新设备，10121 风控）"
+        );
+        assert!(identity_source().contains("bak"), "来源应标明来自备份文件");
+        // 坏文件要被留档，便于排障
+        assert!(temp.path("identity.json.corrupt").is_file());
+    }
+
+    /// ③ 主文件坏 + 滚动备份也坏 → 仍能用 config 备份救回城市与 device_id。
+    #[test]
+    fn corrupt_identity_and_bak_fall_back_to_config_backup() {
+        let temp = Temp::new();
+        let saved = configured();
+        save_identity(&saved).unwrap();
+        std::fs::write(temp.path("identity.json"), "{ half").unwrap();
+        std::fs::write(temp.path("identity.json.bak"), "{ half").unwrap();
+
+        let loaded = load_identity_for_platform("android");
+        assert_eq!(loaded.city, "包头市");
+        assert_eq!(loaded.device_id, saved.device_id);
+        assert_eq!(identity_source(), "config 备份");
+    }
+
+    /// ④ 什么都没了 → 回落默认值，但仍给出可操作的告警文案。
+    #[test]
+    fn missing_everything_falls_back_to_defaults_with_a_warning() {
+        let _temp = Temp::new();
+        let loaded = load_identity_for_platform("android");
+        assert_eq!(loaded.city, crate::location::default_city());
+        assert_ne!(loaded.device_id, "", "仍要有一个 device_id");
+        assert_eq!(identity_source(), "默认值");
+        let warning = identity_warning(&loaded).expect("默认值必须给出告警");
+        assert!(warning.contains("默认"), "{warning}");
+        assert!(warning.contains("设备页"), "{warning}");
+    }
+
+    /// ⑤ 城市为空时不写备份（没有可恢复的东西），也不会把旧备份冲掉成空值。
+    #[test]
+    fn empty_city_does_not_overwrite_a_useful_backup() {
+        let _temp = Temp::new();
+        save_identity(&configured()).unwrap();
+        let mut blank = configured();
+        blank.city = "  ".into();
+        save_identity(&blank).unwrap();
+        assert_eq!(
+            load_config().identity_backup.map(|b| b.city).as_deref(),
+            Some("包头市"),
+            "空城市不该把有用备份冲掉"
+        );
     }
 }
