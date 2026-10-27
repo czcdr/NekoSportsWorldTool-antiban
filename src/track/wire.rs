@@ -225,6 +225,16 @@ pub(crate) fn build_windows(track: &Track) -> (Vec<Value>, Vec<Value>) {
         let max_steps = (MAX_STEP_FREQ_PER_MIN * window_s / 60.0).ceil() as i64;
         let win_steps = ((b.value as f64 * frac).round() as i64).min(max_steps.max(0));
         let id = id_base + i as i64;
+        // A3（审计 medium）：`avgDiff/maxDiff/minDiff` 以前写死 0.0 / 0.0 / 1000.0 ——
+        // 每个窗、每个账号、每一次提交都完全一致，而且这三个字段在**明文 body** 里
+        // （不在 OBS 的 gzip 里），服务端一眼可见。真机的步差统计不可能「最大值恒 0、
+        // 最小值恒 1000、均值恒 0」。
+        //
+        // 现在由该窗内相邻采样点的步数差分（= 每段走了几步）算均值 / 最大 / 最小；
+        // 空窗或单点没有相邻差可算时，由该窗自己的步数与时长推一个自洽量级，
+        // 绝不回落到那组「全窗一致」的常量。
+        let diffs = window_step_diffs(track, lo, hi);
+        let (avg_diff, max_diff, min_diff) = step_diff_stats(&diffs, win_steps, window_s);
         sp.push(json!({
             "beginTime": start_ms + lo * 1000,
             "distance": win_dist,
@@ -235,13 +245,13 @@ pub(crate) fn build_windows(track: &Track) -> (Vec<Value>, Vec<Value>) {
             "state": 0,
         }));
         stf.push(json!({
-            "avgDiff": 0.0,
+            "avgDiff": avg_diff,
             "beginTime": start_ms + lo * 1000,
             "endTime": start_ms + hi * 1000,
             "flag": start_ms,
             "id": id,
-            "maxDiff": 0.0,
-            "minDiff": 1000.0,
+            "maxDiff": max_diff,
+            "minDiff": min_diff,
             "queueNum": i as i64,
             "state": 0,
             "stepsNum": win_steps,
@@ -249,6 +259,47 @@ pub(crate) fn build_windows(track: &Track) -> (Vec<Value>, Vec<Value>) {
         lo = hi;
     }
     (sp, stf)
+}
+
+/// 窗口 `[lo, hi)`（秒）内相邻采样点的步数差分。
+///
+/// 采样点自带累计步数（`Track::locations[].steps`），相邻两点的差就是「这段走了几步」。
+/// 点数不足 2 个时返回空——由调用方给自洽默认值。
+fn window_step_diffs(track: &Track, lo: i64, hi: i64) -> Vec<f64> {
+    let steps: Vec<i64> = track
+        .locations
+        .iter()
+        .filter(|p| p.totalTime >= lo && p.totalTime < hi)
+        .map(|p| p.steps)
+        .collect();
+    steps
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).max(0) as f64)
+        .collect()
+}
+
+/// 步差的均值 / 最大 / 最小。
+///
+/// 有相邻差就直接统计；空窗（没有采样点、或只有一个点）时用该窗自己的步数与时长
+/// 推一个量级（每段约几步），保证 `minDiff <= avgDiff <= maxDiff` 且跨窗不恒定。
+fn step_diff_stats(diffs: &[f64], win_steps: i64, window_s: f64) -> (f64, f64, f64) {
+    if !diffs.is_empty() {
+        let count = diffs.len() as f64;
+        let sum: f64 = diffs.iter().sum();
+        let max = diffs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = diffs.iter().copied().fold(f64::INFINITY, f64::min);
+        return (
+            round_to(sum / count, 2),
+            round_to(max, 2),
+            round_to(min, 2),
+        );
+    }
+    let typical = round_to(win_steps as f64 / window_s.max(1.0), 2).max(0.01);
+    (
+        typical,
+        round_to((typical * 1.5).max(typical), 2),
+        round_to(typical * 0.5, 2),
+    )
 }
 
 /// 圈（每 1000m 一圈，末圈 isFullLap=false）。
@@ -536,10 +587,66 @@ mod window_and_position_tests {
         }
     }
 
+    /// A3：步差三字段必须由该窗自己的采样点算出来。
+    ///
+    /// 旧实现是 `avgDiff: 0.0, maxDiff: 0.0, minDiff: 1000.0` —— 每个窗、每个账号、
+    /// 每次提交完全一致，而且这三个字段在明文 body 里。这里用一条**真实**生成器轨迹
+    /// 证明：不同窗的 avgDiff 不再相同，也不再是那组哨兵值；空窗（没有采样点）同样
+    /// 不回落。
+    #[test]
+    fn step_diff_fields_are_derived_from_each_window() {
+        let track = crate::track::generator::build(
+            2000.0,
+            600,
+            42,
+            (39.9, 116.4),
+            1_700_000_000_000,
+            &[(39.9, 116.4), (39.901, 116.401), (39.902, 116.4)],
+        );
+        let (_, stf) = build_windows(&track);
+        assert!(stf.len() >= 3, "样本太短，验证不了跨窗差异");
+        let avg: Vec<f64> = stf
+            .iter()
+            .map(|w| w["avgDiff"].as_f64().unwrap_or(-1.0))
+            .collect();
+        assert!(avg.iter().all(|v| *v >= 0.0), "avgDiff 必须是非负数字：{avg:?}");
+        assert!(
+            avg.windows(2).any(|w| (w[0] - w[1]).abs() > f64::EPSILON),
+            "同一轨迹不同窗的 avgDiff 不该完全相同：{avg:?}"
+        );
+        for window in &stf {
+            let triple = (
+                window["avgDiff"].as_f64(),
+                window["maxDiff"].as_f64(),
+                window["minDiff"].as_f64(),
+            );
+            assert_ne!(
+                triple,
+                (Some(0.0), Some(0.0), Some(1000.0)),
+                "仍是旧的哨兵常量组合"
+            );
+            if let (Some(mean), Some(hi), Some(lo)) = triple {
+                assert!(
+                    lo <= mean + 1e-9 && mean <= hi + 1e-9,
+                    "minDiff <= avgDiff <= maxDiff 不成立：{triple:?}"
+                );
+            }
+        }
+        // 没有采样点（locations 为空）的轨迹也不能回落到那组常量。
+        let (_, empty) = build_windows(&track_with(60));
+        for window in &empty {
+            let triple = (
+                window["avgDiff"].as_f64(),
+                window["maxDiff"].as_f64(),
+                window["minDiff"].as_f64(),
+            );
+            assert_ne!(triple, (Some(0.0), Some(0.0), Some(1000.0)));
+        }
+    }
+
     /// 末窗不足 10s 时按实际时长缩放，避免详情页算出 300+ 步/分。
     #[test]
-    fn last_partial_window_keeps_cadence_sane() {
-        let (sp, stf) = build_windows(&track_with(1237));
+    fn last_partial_window_keeps_cadence_sane() {        let (sp, stf) = build_windows(&track_with(1237));
         let last = stf.last().unwrap();
         let secs = ((last["endTime"].as_i64().unwrap() - last["beginTime"].as_i64().unwrap())
             as f64
