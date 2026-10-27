@@ -64,6 +64,20 @@ fn gee_check(
         skip,
         if skip { "跳过 GT4" } else { "走 GT4 流程" }
     ));
+    // 除 `data` 之外还有字段时原样记一行：服务端若在这里回传 captchaId / businessType /
+    // 场景值，那正是「/verify 过了但 geevalidate 判失败」最可能的解释（密钥对不上）。
+    // 脱敏后截断，不会带出账号信息。
+    let extra_keys = biz
+        .as_object()
+        .map(|map| map.keys().filter(|key| key.as_str() != "data").count())
+        .unwrap_or(0);
+    if extra_keys > 0 {
+        let detail = crate::textlog::redact_json(&biz);
+        log(&format!(
+            "[gee] checkGeeUse 原始响应：{}",
+            truncate(&detail.to_string(), 300)
+        ));
+    }
     Ok(skip)
 }
 
@@ -222,7 +236,7 @@ pub fn login_with(
                     .unwrap_or(0),
             ));
 
-            let body = json!({
+            let body_value = json!({
                 "lotNumber": creds["lotNumber"],
                 "captchaOutput": creds["captchaOutput"],
                 "passToken": creds["passToken"],
@@ -234,54 +248,68 @@ pub fn login_with(
                 "businessType": 0,
                 "uuid": uuid_value,
                 "username": username,
-            })
-            .to_string();
+            });
+            let body = body_value.to_string();
             let url = format!("{HOST}{GEEVALIDATE_PATH}");
             // UA 必须由身份拼出：写死 iOS UA 会让同一账号的登录与其余请求分属两台设备。
             let ua = crate::crypto::header::ua_for(&client.identity);
 
-            // 只发一次。
+            // 只发一次主请求。
             //
             // 之前「拿不到业务码就重发一次」的写法有三个问题：
-            // ① 极验的四凭证是一次性的，同一条 `lot_number` 再交给服务端复验，
-            //    会拿到「重复校验」的失败 —— 表现就是**明明过了滑块却回 10003**；
+            // ① 同一条 `lot_number` 再交给服务端复验，可能拿到「重复校验」的失败；
             // ② 业务码可能是字符串 "10000"（`as_i64()` 读到 None），于是第一次
-            //    明明通过了也被当成「读不到码」而重发，正好踩上 ①；
+            //    明明通过了也被当成「读不到码」而重发；
             // ③ 一次失败被记成两次判错，冷却直接跳到 10 分钟。
-            // 现在：判码兼容字符串；读不出来就如实报错，不重发。
+            // 现在：判码兼容字符串；读不出来就如实报错，不盲目重发。
             let out = client.envelope_request("POST", &url, &body, &ua, &[])?;
             let dec = out.decrypted.ok_or_else(|| {
                 format!(
-                    "验证码校验结果无法解密（HTTP {}，{} 字节）{}；本次没有重发同一凭证（会被当成重放）",
+                    "验证码校验结果无法解密（HTTP {}，{} 字节）{}；本次没有重发同一凭证",
                     out.http_status, out.raw_len, out.raw_head
                 )
             })?;
-            match business_code(&dec.business) {
-                Some(10000) => {
-                    super::captcha_guard::record_success();
-                    log("[geevalidate] 验证通过");
-                }
+            let code = business_code(&dec.business);
+            // 三个分支要么赋值要么直接 return，所以不需要初始值。
+            let validated;
+            match code {
+                Some(10000) => validated = true,
                 Some(10003) => {
-                    // 手动模式下这条不代表「拖错了」：人已经拖对了，是服务端/业务侧
-                    // 不认这次凭证。进冷却只会把一个业务问题变成十分钟不能试。
-                    let wait = if manual {
-                        "；请稍后重试，或切换另一种过码方式".to_string()
-                    } else {
-                        let secs = super::captcha_guard::record_rejection();
-                        if secs > 0 {
-                            format!("，请{}后再试", super::captcha_guard::cooldown_hint(secs))
-                        } else {
-                            "，请稍后再试".to_string()
-                        }
-                    };
+                    // 手动模式下这条不代表「拖错了」：人已经拖对了，是服务端不认这次凭证。
+                    // 进冷却只会把一个业务问题变成十分钟不能试。
                     let detail = crate::textlog::redact_json(&dec.business);
                     log(&format!(
                         "[geevalidate] 10003 原始响应：{}",
                         truncate(&detail.to_string(), 300)
                     ));
-                    return Err(format!(
-                        "服务端拒绝了验证码校验（10003）{wait}（与账号密码无关）"
-                    ));
+                    // 服务端只回一句「验证失败」，看不出是凭证被拒、captchaId 不匹配，
+                    // 还是某个字段类型不对。用同一凭证换口径各问一次（geetest 的
+                    // validate 是读取校验结果，不是一次性消费），哪一变体拿到 10000
+                    // 就说明真正原因是字段口径，而不是凭证无效。
+                    match try_geevalidate_variants(client, &url, &body_value, &ua, log)? {
+                        Some(10000) => {
+                            log("[geevalidate] 变体口径通过（10000）—— 之前的字段口径与服务端不一致");
+                            validated = true;
+                        }
+                        _ => {
+                            let wait = if manual {
+                                "；请稍后重试，或切换另一种过码方式".to_string()
+                            } else {
+                                let secs = super::captcha_guard::record_rejection();
+                                if secs > 0 {
+                                    format!(
+                                        "，请{}后再试",
+                                        super::captcha_guard::cooldown_hint(secs)
+                                    )
+                                } else {
+                                    "，请稍后再试".to_string()
+                                }
+                            };
+                            return Err(format!(
+                                "服务端拒绝了验证码校验（10003）{wait}（与账号密码无关；日志里有变体试跑结果）"
+                            ));
+                        }
+                    }
                 }
                 other => {
                     let detail = crate::textlog::redact_json(&dec.business);
@@ -296,6 +324,10 @@ pub fn login_with(
                             .unwrap_or_else(|| "无（响应里没有 error 字段）".into())
                     ));
                 }
+            }
+            if validated {
+                super::captcha_guard::record_success();
+                log("[geevalidate] 验证通过");
             }
             // 验证码刚过就立刻登录同样是个特征；真实用户点「登录」之间会有停顿。
             let pause = 1_200 + (crate::crypto::envelope::now_ms().max(0) as u64 % 2_300);
@@ -437,6 +469,75 @@ fn business_code(biz: &Value) -> Option<i64> {
         Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// 10003 之后换口径再问一遍：同一凭证、不同字段形状，各发一次。
+///
+/// 为什么值得这么做：服务端只回一句「验证失败」，看不出是凭证被拒、captchaId 不匹配，
+/// 还是某个字段类型不对。geetest 的 validate 是「读取校验结果」而不是一次性消费，
+/// 所以同一 lot 在有效期内可以被多次询问。一旦某个变体拿到 10000，就说明真正原因是
+/// **字段口径**，而不是「滑块没拖对」——这也是把用户从“怎么拖都失败”里捞出来的唯一
+/// 低成本办法（真凶若在服务端密钥，那几次请求也不会比现在更糟）。
+///
+/// 返回第一个成功的业务码（目前只有 10000 算成功）。
+fn try_geevalidate_variants(
+    client: &mut ApiClient,
+    url: &str,
+    base: &Value,
+    ua: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<Option<i64>, String> {
+    let mut variants: Vec<(&str, Value)> = Vec::new();
+
+    // ① businessType 与 `checkGeeUse` 的 type 对齐：现在两条请求一个 0 一个 2，
+    //    如果服务端按 businessType 选极验密钥，这一条就是决定性的。
+    let mut body = base.clone();
+    body["businessType"] = json!(2);
+    variants.push(("businessType=2（与 checkGeeUse 的 type 对齐）", body));
+
+    // ② genTime 类型反转：服务端若按 long 解析，字符串会被当成 0 → 过期。
+    let mut body = base.clone();
+    body["genTime"] = match &base["genTime"] {
+        Value::String(text) => text
+            .trim()
+            .parse::<i64>()
+            .map(|value| json!(value))
+            .unwrap_or_else(|_| base["genTime"].clone()),
+        other => json!(other.to_string()),
+    };
+    variants.push(("genTime 类型反转", body));
+
+    // ③ osType 反转：占位客户端曾把 Android 身份写成 iOS。
+    let mut body = base.clone();
+    body["osType"] = if base["osType"].as_i64() == Some(0) {
+        json!(1)
+    } else {
+        json!(0)
+    };
+    variants.push(("osType 反转", body));
+
+    for (label, body) in variants {
+        // 变体之间留间隔：一串等距请求本身就是特征。
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        let out = client.envelope_request("POST", url, &body.to_string(), ua, &[])?;
+        let Some(dec) = out.decrypted else {
+            log(&format!(
+                "[geevalidate] 变体「{label}」响应无法解密（HTTP {}，{} 字节）",
+                out.http_status, out.raw_len
+            ));
+            continue;
+        };
+        let code = business_code(&dec.business);
+        let detail = crate::textlog::redact_json(&dec.business);
+        log(&format!(
+            "[geevalidate] 变体「{label}」→ {code:?}：{}",
+            truncate(&detail.to_string(), 160)
+        ));
+        if code == Some(10000) {
+            return Ok(Some(10000));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
