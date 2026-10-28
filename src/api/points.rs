@@ -35,6 +35,33 @@ pub fn fetch_points(
     fetch_points_ext(client, anchor, None, 2000.0, log)
 }
 
+/// 点位请求的明文 body。
+///
+/// 抽成一个纯函数只为一件事：**锚点偏移只改 `latitude`/`longitude`，不新增字段**
+/// 这条约定必须能被测试直接断言 —— 真正的报文会被信封加密，测试看不到明文。
+pub(crate) fn request_body(
+    anchor: Coordinate,
+    run_area_id: Option<&str>,
+    unid: &str,
+    sign: &str,
+    uuid: &str,
+    runec: &str,
+) -> Value {
+    let mut body = json!({
+        "sportType": 4,
+        "longitude": anchor.longitude,
+        "latitude": anchor.latitude,
+        "sign": sign,
+        "uuid": uuid,
+        "selectedUnid": unid,
+        "runec": runec,
+    });
+    if let Some(area) = run_area_id {
+        body["runAreaId"] = json!(area);
+    }
+    body
+}
+
 /// run_area_id：学校配置了区域时 App 会附带；未配置则不传（与 App 一致）。
 pub fn fetch_points_ext(
     client: &mut ApiClient,
@@ -82,18 +109,16 @@ pub fn fetch_points_ext(
     let runec_env = build_envelope(&mut client.session, &runec_input, OuterOrder::Observed);
     let runec = runec_env.json;
 
-    let mut body = json!({
-        "sportType": 4,
-        "longitude": lon,
-        "latitude": lat,
-        "sign": md5_url_sign(&url),
-        "uuid": uuid::Uuid::new_v4().to_string(),
-        "selectedUnid": unid,
-        "runec": runec,
-    });
-    if let Some(area) = run_area_id {
-        body["runAreaId"] = json!(area);
-    }
+    // 明文 body 由 `request_body` 统一构造：锚点偏移只能影响这里的 latitude/longitude
+    // （`runec` 的输入串由同一份 lon/lat 派生，因此自动一致，不会「body 挪了、签名没挪」）。
+    let body = request_body(
+        anchor,
+        run_area_id.as_deref(),
+        &unid,
+        &md5_url_sign(&url),
+        &uuid::Uuid::new_v4().to_string(),
+        &runec,
+    );
     let body = body.to_string();
 
     // 点位与策略/围栏同属"这条轨迹"：UA 也必须来自同一套身份。
@@ -159,6 +184,161 @@ pub fn route_points(required: &[(f64, f64)], live: &[Value]) -> Vec<(f64, f64)> 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod anchor_offset_tests {
+    use super::*;
+
+    /// 按 `keys()` 的**原始迭代顺序**取键。
+    ///
+    /// 不能用 sort 后的集合：`serde_json` 开了 `preserve_order`，请求体的字段顺序
+    /// 是稳定契约（服务端按字节看报文的场合不少），排序会把顺序问题掩盖掉。
+    fn keys_in_order(value: &Value) -> Vec<String> {
+        value
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// anchor_offset_m = 0：请求里的坐标必须与精确锚点**逐位相同**。
+    #[test]
+    fn zero_offset_request_coordinate_equals_the_exact_anchor() {
+        let exact = Coordinate::new(39.9042, 116.4074, 0.0).unwrap();
+        let plan_anchor = crate::location::plan_anchor(exact, 0.0, 7);
+        let body = request_body(plan_anchor, Some("73"), "77", "sign", "uuid", "runec");
+        assert_eq!(
+            body["latitude"].as_f64().unwrap().to_bits(),
+            exact.latitude.to_bits()
+        );
+        assert_eq!(
+            body["longitude"].as_f64().unwrap().to_bits(),
+            exact.longitude.to_bits()
+        );
+    }
+
+    /// 偏移只改经纬度数值：**字段顺序**与取值都不能动。
+    #[test]
+    fn offset_changes_only_latitude_and_longitude() {
+        let exact = Coordinate::new(39.9042, 116.4074, 0.0).unwrap();
+        let base = request_body(exact, Some("73"), "77", "sign", "uuid", "runec");
+        let moved_anchor = crate::location::plan_anchor(exact, 50.0, 7);
+        let moved = request_body(moved_anchor, Some("73"), "77", "sign", "uuid", "runec");
+
+        assert_eq!(
+            keys_in_order(&base),
+            keys_in_order(&moved),
+            "偏移改变了字段或字段顺序"
+        );
+        // 除经纬度外每个字段都必须完全一样。
+        for key in keys_in_order(&base) {
+            if key == "latitude" || key == "longitude" {
+                continue;
+            }
+            assert_eq!(base[&key], moved[&key], "字段 {key} 不该被偏移影响");
+        }
+        let dy = (moved["latitude"].as_f64().unwrap() - exact.latitude)
+            * crate::track::geom::MET_PER_DEG_LAT;
+        let dx = (moved["longitude"].as_f64().unwrap() - exact.longitude)
+            * crate::track::geom::MET_PER_DEG_LNG;
+        let shift = dx.hypot(dy);
+        assert!(
+            (39.5..=60.5).contains(&shift),
+            "50 m 配置下实际偏移 {shift:.2} m"
+        );
+        // 本地参数名一个都不许出现在请求里。
+        let text = moved.to_string();
+        for forbidden in ["gps_spread", "anchor_offset", "anchorOffset", "gpsSpread"] {
+            assert!(!text.contains(forbidden), "点位请求里出现 {forbidden}");
+        }
+    }
+
+    /// 同一计划两次取到同一份偏移，新计划（新 seed）必然重抽。
+    #[test]
+    fn offset_is_stable_within_a_plan_and_redrawn_for_a_new_plan() {
+        let exact = Coordinate::new(39.9042, 116.4074, 0.0).unwrap();
+        let a = request_body(
+            crate::location::plan_anchor(exact, 50.0, 7),
+            None,
+            "77",
+            "s",
+            "u",
+            "r",
+        );
+        let b = request_body(
+            crate::location::plan_anchor(exact, 50.0, 7),
+            None,
+            "77",
+            "s",
+            "u",
+            "r",
+        );
+        assert_eq!(a, b, "同一计划（同 seed）两份请求坐标必须相同");
+        let c = request_body(
+            crate::location::plan_anchor(exact, 50.0, 8),
+            None,
+            "77",
+            "s",
+            "u",
+            "r",
+        );
+        assert_ne!(a, c, "新计划必须重抽偏移");
+    }
+
+    /// 请求体的**字段顺序**钉死：`sportType` 首位，`runAreaId` 补在末位，
+    /// 且「有区域 / 无区域」「偏移前 / 偏移后」三种情况顺序完全一致。
+    ///
+    /// 这条替代了原来 sort 后比较的写法 —— 排序比较对顺序错误是盲的。
+    #[test]
+    fn request_body_key_order_is_stable() {
+        let exact = Coordinate::new(39.9042, 116.4074, 0.0).unwrap();
+        let with_area = request_body(exact, Some("73"), "77", "sign", "uuid", "runec");
+        let order = keys_in_order(&with_area);
+        assert_eq!(
+            order,
+            vec![
+                "sportType",
+                "longitude",
+                "latitude",
+                "sign",
+                "uuid",
+                "selectedUnid",
+                "runec",
+                "runAreaId",
+            ],
+            "点位请求的字段顺序被改动"
+        );
+        assert_eq!(
+            order.first().map(String::as_str),
+            Some("sportType"),
+            "首位变了"
+        );
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("runAreaId"),
+            "末位变了"
+        );
+
+        // 未配置区域：runAreaId 不出现，其余顺序原样。
+        let without_area = request_body(exact, None, "77", "sign", "uuid", "runec");
+        let order_without = keys_in_order(&without_area);
+        assert_eq!(
+            order_without,
+            order[..order.len() - 1].to_vec(),
+            "无区域时字段顺序应等于「有区域」去掉末位"
+        );
+
+        // 50 m 偏移不改变顺序（只改两个数值）。
+        let moved = request_body(
+            crate::location::plan_anchor(exact, 50.0, 7),
+            Some("73"),
+            "77",
+            "sign",
+            "uuid",
+            "runec",
+        );
+        assert_eq!(keys_in_order(&moved), order, "偏移改变了字段顺序");
+    }
 }
 
 #[cfg(test)]

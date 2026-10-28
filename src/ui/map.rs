@@ -17,7 +17,14 @@ pub struct MapState {
     pub offset: Vec2,
     /// 最近是否被拖拽过（供外部判断）。
     pub dragged: bool,
+    /// 触摸/鼠标手势状态机（双指缩放、拖拽、点按判别）。
+    pub gesture: Gestures,
 }
+
+/// 最小缩放（每米像素）：0.002 ≈ 全国视野。
+pub const MIN_SCALE: f32 = 0.002;
+/// 最大缩放（每米像素）：200 ≈ 5 mm/像素，够贴近看楼。
+pub const MAX_SCALE: f32 = 200.0;
 
 impl Default for MapState {
     fn default() -> Self {
@@ -26,7 +33,136 @@ impl Default for MapState {
             scale: 0.3,
             offset: Vec2::ZERO,
             dragged: false,
+            gesture: Gestures::default(),
         }
+    }
+}
+
+// ── 手势状态机 ───────────────────────────────────────────────────────────
+//
+// 只读 `raw_scroll_delta` 时，Android 的双指捏合是**完全失效**的：egui 把多点触摸
+// 的缩放放进 `zoom_delta()`（触屏捏合会合成 `Event::Zoom`，滚轮槽位保持 0），
+// 所以滚轮和捏合必须两条都读。优先级是「捏合 > 拖拽」：边捏边拖时指针位移是两指
+// 中点的漂移，跟着走会让地图乱跳。tap 判据单独记（按下→抬起之间没移动才算点按），
+// 不然手指按下去那几帧的 0.5 px 抖动就会被当成拖拽，点位点不中。
+
+/// 一帧的原始输入（与 egui 解耦，便于单测）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GestureInput {
+    /// 指针是否在画布内。
+    pub inside: bool,
+    /// 主指针是否按下（触屏=至少一根手指在屏幕上）。
+    pub down: bool,
+    /// egui 是否已判定为拖拽（`is_decidedly_dragging`）。
+    pub dragging: bool,
+    /// 本帧指针位移（像素）。
+    pub delta: Vec2,
+    /// 本帧缩放倍率（1.0 = 无变化；双指 = `zoom_delta()`）。
+    pub zoom: f32,
+}
+
+impl Default for GestureInput {
+    /// 关键：`zoom` 的零值是 0.0，但它的**中性值**是 1.0。用 derive 会让
+    /// 「没有缩放的帧」被当成缩放因子 0（= 缩到最小），所以手写。
+    fn default() -> Self {
+        Self {
+            inside: false,
+            down: false,
+            dragging: false,
+            delta: Vec2::ZERO,
+            zoom: 1.0,
+        }
+    }
+}
+
+/// 状态机的输出：这一帧该怎么动。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GestureOutput {
+    /// 平移量（像素）。
+    pub pan: Vec2,
+    /// 缩放倍率（1.0 = 不缩放）。
+    pub zoom: f32,
+    /// 本帧是否在拖拽（写回 `MapState::dragged`）。
+    pub dragged: bool,
+    /// 本帧是否完成一次点按（按下到抬起全程没移动）。
+    pub tapped: bool,
+    /// 当前状态（调试/测试用）。
+    pub state: GestureState,
+}
+
+impl Default for GestureOutput {
+    fn default() -> Self {
+        Self {
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+            dragged: false,
+            tapped: false,
+            state: GestureState::Idle,
+        }
+    }
+}
+
+/// 手势状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GestureState {
+    /// 没有手势（或只是按着没动）。
+    #[default]
+    Idle,
+    /// 单指/左键拖拽。
+    Dragging,
+    /// 双指捏合缩放。
+    Pinching,
+}
+
+/// 触摸/鼠标手势状态机。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Gestures {
+    state: GestureState,
+    pressed: bool,
+    moved: bool,
+}
+
+impl Gestures {
+    /// 当前手势状态（诊断/测试用）。
+    #[allow(dead_code)]
+    pub fn state(&self) -> GestureState {
+        self.state
+    }
+
+    /// 吃一帧输入，给出平移/缩放/点按。
+    pub fn update(&mut self, input: GestureInput) -> GestureOutput {
+        let mut out = GestureOutput {
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+            dragged: false,
+            tapped: false,
+            state: self.state,
+        };
+        if input.down && !self.pressed {
+            self.pressed = true;
+            self.moved = false;
+        }
+        let pinching = input.inside && (input.zoom - 1.0).abs() > 1e-3;
+        if pinching {
+            self.state = GestureState::Pinching;
+            self.moved = true;
+            out.zoom = input.zoom;
+        } else if input.inside && input.down && input.dragging {
+            self.state = GestureState::Dragging;
+            self.moved = true;
+            out.pan = input.delta;
+            out.dragged = true;
+        } else {
+            self.state = GestureState::Idle;
+        }
+        if !input.down && self.pressed {
+            self.pressed = false;
+            out.tapped = !self.moved;
+            self.moved = false;
+            self.state = GestureState::Idle;
+        }
+        out.state = self.state;
+        out
     }
 }
 
@@ -93,26 +229,73 @@ impl MapState {
     }
 
     /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
+    ///
+    /// 双指捏合（`zoom_delta()`）与滚轮（`raw_scroll_delta`）都能缩放；两者互斥，
+    /// 捏合时 egui 不给滚轮量，所以不会双算。缩放以指针为不动点。
     pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
-        self.dragged = false;
-        let (drag, scroll) = ui.input(|i| {
-            let hover = i
+        let (input, pointer) = ui.input(|i| {
+            let inside = i
                 .pointer
                 .interact_pos()
+                .or_else(|| i.pointer.hover_pos())
                 .map(|p| rect.contains(p))
                 .unwrap_or(false);
-            let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (dragging, if hover { i.raw_scroll_delta.y } else { 0.0 })
+            (
+                GestureInput {
+                    inside,
+                    down: i.pointer.primary_down(),
+                    dragging: i.pointer.is_decidedly_dragging(),
+                    delta: i.pointer.delta(),
+                    zoom: i.zoom_delta(),
+                },
+                i.pointer.interact_pos(),
+            )
         });
-        if drag {
-            let d = ui.input(|i| i.pointer.delta());
-            self.offset += d;
-            self.dragged = true;
+        let out = self.gesture.update(input);
+        if out.dragged {
+            self.offset += out.pan;
         }
+        self.dragged = out.dragged;
+        let scroll = ui.input(|i| {
+            if input.inside {
+                i.raw_scroll_delta.y
+            } else {
+                0.0
+            }
+        });
+        let mut factor = if (out.zoom - 1.0).abs() > 1e-4 {
+            out.zoom
+        } else {
+            1.0
+        };
         if scroll != 0.0 {
-            let factor = (scroll * 0.0015).exp() as f32;
-            self.scale = (self.scale * factor).clamp(0.002, 200.0);
+            factor *= (scroll * 0.0015).exp();
         }
+        if (factor - 1.0).abs() > 1e-4 {
+            let anchor = pointer
+                .filter(|p| rect.contains(*p))
+                .unwrap_or_else(|| rect.center());
+            self.zoom_about(rect, anchor, factor);
+        }
+    }
+
+    /// 以 `anchor`（屏幕坐标）为不动点缩放：双指与滚轮共用。
+    ///
+    /// 推导：屏幕位置 = 中心 + (世界差 × 系数 × scale) + offset，要让 `anchor` 下的
+    /// 世界点不动，缩放 k 倍后 offset' = rel − (rel − offset)·k（rel = anchor − 中心）。
+    pub fn zoom_about(&mut self, rect: Rect, anchor: Pos2, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let old = self.scale;
+        let new = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
+        if (new - old).abs() <= f32::EPSILON {
+            return;
+        }
+        let k = new / old;
+        let rel = anchor - rect.center();
+        self.offset = rel - (rel - self.offset) * k;
+        self.scale = new;
     }
 
     pub fn draw_polyline(

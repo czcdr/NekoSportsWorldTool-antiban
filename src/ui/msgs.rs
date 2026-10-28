@@ -364,7 +364,6 @@ impl App {
                 );
                 self.popup = Some(run_popup(&val));
                 self.refresh_data_page();
-                self.run_page.preview_stale = true;
             } else if val
                 .get("submitted")
                 .and_then(|b| b.as_bool())
@@ -375,10 +374,15 @@ impl App {
                 self.status = format!("跑步已提交，但未确认完成：{summary}");
                 self.popup = Some(run_popup(&val));
                 self.refresh_data_page();
-                self.run_page.preview_stale = true;
             } else {
                 self.status = format!("跑步操作失败：{}", val["message"].as_str().unwrap_or(""));
             }
+            // 提交结束（成功 / 部分成功 / 失败**都一样**）：上一份方案作废。
+            //
+            // 这是唯一的清理点 —— 三个分支各写一遍必然漏一个，而漏的那一个就是
+            // 「同参数再跑一次、记录逐字段复刻上一条」的回归入口。
+            // 只在这一刻清：提交在飞时清掉，「预览与提交同一份方案」就不成立了。
+            self.run_page.clear_plan_cache();
         }
         if let Some(v) = done_ai {
             self.ai_submit_active = false;

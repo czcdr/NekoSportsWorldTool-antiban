@@ -547,6 +547,21 @@ pub fn tile_request_spec(
     Ok((filled, cfg.headers.clone()))
 }
 
+/// 错误信息里的 URL 脱敏：保留 `scheme://host/path`，query/fragment 一律缩成 `?…`。
+///
+/// 为什么必须做：`url_template` 是**用户可输入**的，常见形态带 `key=` / `ak=` /
+/// `token=`（百度 ak、高德 Web Key 都是 query 参数）。这些错误信息会进日志页与
+/// 状态栏，用户随手截图或贴 issue 就把凭据带出去了 —— 而「Key 不进日志」是本项目
+/// 对用户明说过的承诺。
+pub fn redact_tile_url(url: &str) -> String {
+    let head = url.split(['?', '#']).next().unwrap_or("");
+    if head.len() < url.len() {
+        format!("{head}?…")
+    } else {
+        head.to_string()
+    }
+}
+
 /// 校验一条已填好的瓦片 URL：只允许 `https://` 绝对地址 + 白名单主机，并拒绝私网/回环字面量。
 ///
 /// 为什么必须做：`url_template` 是**用户可输入**的，不做校验等于给程序塞了一个
@@ -577,7 +592,7 @@ pub fn validate_tile_url(url: &str, cfg: &TileConfig) -> Result<(), String> {
         .trim_matches(['[', ']'])
         .to_string();
     if host.is_empty() {
-        return Err(format!("瓦片 URL 解析不出主机名：{url}"));
+        return Err(format!("瓦片 URL 解析不出主机名：{}", redact_tile_url(url)));
     }
     // 私网 / 回环 / 本地名一律拒绝：这些是 SSRF 最直接的目标。
     let private = host == "localhost"
@@ -644,27 +659,37 @@ fn fetch_one(
     y: i64,
     index: usize,
 ) -> Result<Vec<u8>, String> {
-    let (url, headers) = tile_request_spec(cfg, x, y, cfg.z, index)?;
+    let (url, _headers) = tile_request_spec(cfg, x, y, cfg.z, index)?;
+    fetch_tile_bytes(agent, cfg, &url)
+}
+
+/// 抓取一张**已经填好**的瓦片：白名单校验 + 限速 + 失败重试 1 次 + 单张读取上限 + 占位图判定。
+///
+/// 抽出来是为了让「瓦片底图」（`ui/tiles.rs`）复用**同一套**抓取语义：
+/// 单张 2 MiB 上限、`is_placeholder_tile` 判据、一次重试，以及最重要的
+/// `validate_tile_url`（https + 主机白名单 + 拒私网/回环）。底图不另写 HTTP 栈，
+/// 免得两处限额/校验口径漂移（一处严一处松，松的那处就是 SSRF 口子）。
+pub fn fetch_tile_bytes(agent: &Agent, cfg: &TileConfig, url: &str) -> Result<Vec<u8>, String> {
+    validate_tile_url(url, cfg)?;
     // 同一出口连打瓦片比连打接口更容易被限流，慢一点更稳。
     std::thread::sleep(std::time::Duration::from_millis(180));
     let mut last = String::new();
     for attempt in 0..2 {
         let mut request = agent
-            .get(&url)
+            .get(url)
             .set("User-Agent", crate::crypto::header::UA_IOS);
-        for (key, value) in &headers {
+        for (key, value) in &cfg.headers {
             request = request.set(key, value);
         }
         match request.call() {
             Ok(resp) => {
                 let status = resp.status();
                 let mut buf = Vec::new();
-                // 上限 +1 是为了区分「正好等于上限」和「超了」。
                 let mut reader = resp.into_reader();
                 // 上限 +1 是为了区分「正好等于上限」和「超了」。
                 let limited = std::io::Read::take(&mut reader, MAX_TILE_BYTES as u64 + 1);
                 std::io::Read::read_to_end(&mut { limited }, &mut buf)
-                    .map_err(|e| format!("瓦片读取失败（z{} x{x} y{y}）：{e}", cfg.z))?;
+                    .map_err(|e| format!("瓦片读取失败（{}）：{e}", redact_tile_url(url)))?;
                 if buf.len() > MAX_TILE_BYTES {
                     last = format!(
                         "瓦片超过单张读取上限（{} MiB），按坏图处理",
@@ -683,7 +708,7 @@ fn fetch_one(
                     return Ok(buf);
                 }
             }
-            Err(e) => last = format!("瓦片请求失败（z{} x{x} y{y}）：{e}", cfg.z),
+            Err(e) => last = format!("瓦片请求失败（{}）：{e}", redact_tile_url(url)),
         }
         if attempt == 0 {
             std::thread::sleep(std::time::Duration::from_millis(600));
@@ -693,6 +718,23 @@ fn fetch_one(
         "{last}。默认源是 {DEFAULT_URL_TEMPLATE}（免鉴权）；自定义源请确认模板与 header 与浏览器里抓到的完全一致。\
          也可以切回「真实道路」，或到路网页人工导入 OSM 路网"
     ))
+}
+
+/// 解码一张瓦片 PNG → 宽、高、RGBA8（像素行优先）。
+///
+/// 与 `blit` 共用同一组解码限额：瓦片来自网络，`load_from_memory` 不限尺寸的话
+/// 一张伪造的超大图就能把内存吃光。底图（`ui/tiles.rs`）走这条，不另开一套限额。
+pub fn decode_tile_rgba(png: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_TILE_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_TILE_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_TILE_IMAGE_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|e| format!("解码失败：{e}"))?;
+    let rgba = decoded.to_rgba8();
+    Ok((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
 /// 把一张 PNG 瓦片贴到大图（越界像素丢弃）。
@@ -1704,6 +1746,28 @@ mod tests {
             road_ratio_is_plausible(ratio),
             "正常十字图的占比 {ratio:.3} 不该被拒"
         );
+    }
+
+    /// URL 里可能带 `key=`/`ak=`/`token=`：错误信息与日志必须先脱敏，
+    /// 否则用户截图/贴 issue 就把凭据带出去了。
+    #[test]
+    fn redact_tile_url_strips_query_credentials() {
+        assert_eq!(
+            redact_tile_url("https://maponline0.bdimg.com/tile/?qt=tile&x=1&ak=SECRET123"),
+            "https://maponline0.bdimg.com/tile/?…"
+        );
+        assert_eq!(
+            redact_tile_url("https://tile.openstreetmap.org/18/1/2.png"),
+            "https://tile.openstreetmap.org/18/1/2.png",
+            "无 query 的 URL 必须原样保留"
+        );
+        assert_eq!(
+            redact_tile_url("https://x.example.com/t.png#token=abc"),
+            "https://x.example.com/t.png?…",
+            "fragment 里的凭据也一并去掉"
+        );
+        let leaked = "https://h/t?ak=SECRET123";
+        assert!(!redact_tile_url(leaked).contains("SECRET123"));
     }
 
     /// ① URL 模板：占位符替换正确；缺 `{x}` 明确报错（且不发出坏请求）。

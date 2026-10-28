@@ -81,9 +81,14 @@ pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, St
     let current = current_version();
     let mut best: Option<ReleaseInfo> = None;
     let mut last_err: Option<String> = None;
+    // 只要有一个仓库成功取到 Release（哪怕里面没有本平台资产），就不该把
+    // 「没有可更新的版本」报成错误：桌面端自 0.8.0 起停发后，「有 Release 但没桌面
+    // 资产」就是常态，把它当成故障会让每次检查更新都显示失败、CLI 退出码变 1。
+    let mut fetched = false;
     for repo in repos() {
         match fetch_release(&repo, want, log) {
             Ok(Some(rel)) => {
+                fetched = true;
                 if best
                     .as_ref()
                     .map(|b| is_newer(&b.tag, &rel.tag))
@@ -92,7 +97,7 @@ pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, St
                     best = Some(rel);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => fetched = true,
             Err(e) => {
                 log(&format!("[update] {repo}: {e}"));
                 last_err = Some(e);
@@ -114,6 +119,10 @@ pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, St
                 log(&format!("√ [update] 已是最新版本（v{current}）"));
                 Ok(None)
             }
+        }
+        None if fetched => {
+            log(&format!("√ [update] 没有可更新的版本（v{current}）"));
+            Ok(None)
         }
         None => Err(last_err.unwrap_or_else(|| "更新源没有可用的发布资产".into())),
     }
@@ -146,6 +155,18 @@ fn fetch_release(
         return Err("Release 缺少 tag".into());
     }
     let Some(asset) = pick_asset(&v, want) else {
+        // 自 0.8.0 起桌面端只发布 Windows x64 与 Linux（x64/arm64，CLI-only），
+        // macOS 停止发布。
+        //
+        // 这里**只能写日志，不能返回 Err**：桌面端每次「检查更新」都会走到这条路径，
+        // 返回 Err 会让 UI 显示「检查更新失败」、让 CLI 退出码变 1，把「本平台已
+        // 停止发布」伪装成网络/签名故障。用户在日志页能看到这句说明，界面仍是正常
+        // 的「已是最新」。
+        if !want.ends_with(".apk") && is_newer(&current_version(), &tag) {
+            log(&format!(
+                "√ [update] {tag} 没有当前平台的产物：自 0.8.0 起桌面端只发布 Windows x64 与 Linux，macOS 已停发；移动端提供 Android APK"
+            ));
+        }
         return Ok(None);
     };
     log(&format!(

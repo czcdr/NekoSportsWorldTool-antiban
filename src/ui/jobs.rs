@@ -131,6 +131,15 @@ impl App {
             .as_ref()
             .map(|p| p.dist)
             .unwrap_or(2000.0);
+        // 上传锚点的计划级偏移：预览与提交都用**同一个种子来源**派生同一份偏移。
+        // 没有方案时必须按提交的同一规则回落（`fixed_seed` 优先），不能一律用 0：
+        // 「开了偏移 + 勾了固定种子 + 当前还没有方案」时，0 和 fixed_seed 会派生出
+        // 两份相差 40–60 m 的锚点，预览的打卡点与提交的打卡点就分叉了。
+        let plan_seed = self.run_page.plan_seed_for_anchor();
+        // 偏移量取**页面上的值**（提交前 `start_run` 会把同一个值写进 config），
+        // 不读 config：滑块刚动、尚未落盘时 config 还是旧值，读它会让预览用旧锚点
+        // 拉点位、提交用新锚点重拉 —— 两边打卡点不一致。
+        let anchor_offset_m = self.run_page.effective_anchor_offset_m();
         #[cfg(test)]
         let route_fixture = self.route_fixture.clone();
         self.osm_page.status = "正在获取学校点位、围栏及路网…".into();
@@ -227,12 +236,17 @@ impl App {
                 // Preview metadata is optional for displaying the road graph.
                 let anchor =
                     preview_anchor.ok_or("请在设备信息页配置当前城市和定位锚点，再刷新路线点位")?;
+                // 点位请求用**偏移后的锚点**（提交链路用同一 seed 派生同一份偏移）；
+                // `PreviewInputs.anchor` 仍存精确锚点：设备锚点本身不变，
+                // 界面/围栏去重比较也都以精确值为准。
+                let request_anchor =
+                    crate::location::plan_anchor(anchor, anchor_offset_m, plan_seed);
                 stage("获取当前学校策略与路线点位…");
                 let policy = crate::api::policy::fetch_policy(&mut client)?;
                 control.check()?;
                 let pts = crate::api::points::fetch_points_ext(
                     &mut client,
-                    anchor,
+                    request_anchor,
                     run_area_id,
                     plan_dist,
                     &mut log,

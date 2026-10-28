@@ -333,6 +333,14 @@ fn required_route(
 ///
 /// `route_bd[0]` 为起点；`route_bd` 和 `must_bd` 合并为强制必经点。
 /// 不使用离路吸附；平滑路线和最终采样均须经过全部点位的 40 米范围。
+///
+/// GPS 抖动幅度沿用旧行为（每个 seed 在 2.8–4.2 m 之间自动抽样）。
+/// 需要指定幅度（配置项 `gps_spread_m`）用 [`build_road_tuned`]。
+///
+/// 保留旧签名是有意的：调用方（测试、以及只想用默认幅度的入口）不必关心
+/// 新参数；非测试构建里只有 `build_road_tuned` 被主流程调用，所以这里
+/// 显式允许 dead_code，而不是为了消警告去改一堆调用点。
+#[allow(dead_code)]
 pub fn build_road(
     dist: f64,
     dur: i64,
@@ -341,6 +349,32 @@ pub fn build_road(
     route_bd: &[(f64, f64)],
     must_bd: &[(f64, f64)],
     net: &RoadGraph,
+) -> Result<Track, String> {
+    build_road_tuned(dist, dur, seed, start_ms, route_bd, must_bd, net, 0.0)
+}
+
+/// 同 [`build_road`]，但可指定 GPS 抖动幅度。
+///
+/// `gps_spread_m` 是**单点稳态标准差**（米）：
+/// - `0.0` 沿用旧行为：每个 seed 在 2.8–4.2 m 之间自动抽样（与改动前逐点一致）；
+/// - `>0` 用指定值（钳在 0–20 m）替代自动抽样。
+///
+/// 代价要写明：非 0 时是**同一幅度贯穿所有计划**（不再每 seed 抽样），
+/// 对「所有人幅度都一样」这件事没有缓解作用 —— 这一项是给「显式要求更小/更大
+/// 抖动」的人用的，不是隐私增强开关（配置默认值因此是 0）。
+///
+/// 实现上**无论是否指定都会先抽一次自动值**，所以 RNG 序列完全不变：
+/// 改幅度只影响每个点的经纬度，点位类型/时间轴/海拔/步频步幅一个都不变。
+#[allow(clippy::too_many_arguments)]
+pub fn build_road_tuned(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    route_bd: &[(f64, f64)],
+    must_bd: &[(f64, f64)],
+    net: &RoadGraph,
+    gps_spread_m: f64,
 ) -> Result<Track, String> {
     if dur <= 0 || !dist.is_finite() || dist <= 0.0 {
         return Err("距离和时长必须为正数".into());
@@ -468,7 +502,14 @@ pub fn build_road(
     // 落在 2.8–4.2 m；旧值 0.72/0.75 的稳态 std 仅 ≈1.08 m，轨迹贴线贴得像尺子画的。
     // 稳态 std = σ_step/√(1−α²)，所以这里由目标稳态值反解 σ_step。
     let jitter_alpha = rng.uniform(0.86, 0.95);
-    let jitter_steady = rng.uniform(2.8, 4.2);
+    // 先无条件抽一次自动值：即使调用方指定了幅度，RNG 消耗也与旧版完全一致，
+    // 于是「只改幅度」不会连带改掉点位类型/时间轴/海拔等其它抽样结果。
+    let jitter_auto = rng.uniform(2.8, 4.2);
+    let jitter_steady = if gps_spread_m.is_finite() && gps_spread_m > 0.0 {
+        gps_spread_m.clamp(0.0, crate::api::model::GPS_SPREAD_MAX_M)
+    } else {
+        jitter_auto
+    };
     let jitter_sigma = jitter_steady * (1.0 - jitter_alpha * jitter_alpha).sqrt();
     let mut jitter = GpsJitter::new(jitter_alpha, jitter_sigma, rng.uniform(0.25, 0.65));
 
@@ -1074,6 +1115,162 @@ mod preview_tests {
         let bad = route_planner::check::inspect(&net, &[Coord::new(117., 40.)], 5000.);
         assert_eq!(bad.issues[0].point, Some(0));
         assert!(bad.issues[0].position.is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // GPS 抖动幅度（配置 gps_spread_m）：0 = 与改动前逐点一致
+    // ---------------------------------------------------------------
+
+    /// 改动前（HEAD）的 `build_road(2000, 800, seed=7)` 逐点坐标哈希。
+    /// 用 `git archive HEAD` 的干净副本跑同一段代码得到，不是改完之后自己算的。
+    const PRE_CHANGE_COORD_HASH: u64 = 0x0636_2cc3_b04e_c766;
+
+    /// 固定几何：4 节点方形路网（WGS84）+ 其 BD-09 角点。
+    fn snapshot_fixture() -> (RoadGraph, Vec<(f64, f64)>) {
+        let mut net = RoadGraph::new();
+        let wgs = [
+            (39.9, 116.4),
+            (39.9, 116.402),
+            (39.902, 116.402),
+            (39.902, 116.4),
+        ];
+        let nodes: Vec<_> = wgs
+            .iter()
+            .map(|&(lat, lon)| net.add_node(Coord::new(lon, lat)))
+            .collect();
+        for i in 0..4 {
+            let edge = route_planner::graph::EdgeData {
+                way_id: i as u64,
+                oneway: false,
+                highway: "footway".into(),
+                maxspeed_kmh: None,
+                length_m: 200.0,
+            };
+            net.add_edge(nodes[i], nodes[(i + 1) % 4], edge.clone());
+            net.add_edge(nodes[(i + 1) % 4], nodes[i], edge);
+        }
+        net.compute_anchor();
+        net.rebuild_index();
+        align_network(&mut net);
+        let points = wgs.iter().map(|&(a, b)| wgs84_to_bd09(a, b)).collect();
+        (net, points)
+    }
+
+    fn coord_hash(track: &Track) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for p in &track.locations {
+            for v in [p.gLat, p.gLng] {
+                h ^= v.to_bits();
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn gps_spread_zero_reproduces_the_pre_change_track_point_by_point() {
+        let (net, points) = snapshot_fixture();
+        // 旧入口（默认幅度 = 自动区间）与新入口显式传 0 必须都等于改动前的轨迹。
+        let old_api = build_road(2000.0, 800, 7, 0, &points, &points, &net).unwrap();
+        let zero = build_road_tuned(2000.0, 800, 7, 0, &points, &points, &net, 0.0).unwrap();
+        // 负值/NaN 也按「关闭」处理，落到同一条旧路径。
+        let nan = build_road_tuned(2000.0, 800, 7, 0, &points, &points, &net, f64::NAN).unwrap();
+
+        for (name, track) in [("old_api", &old_api), ("zero", &zero), ("nan", &nan)] {
+            assert_eq!(track.locations.len(), 164, "{name}: 点数变了");
+            assert_eq!(track.totalSteps, 2352, "{name}: 步数变了");
+            assert_eq!(track.totalDistance.to_bits(), 2000.0f64.to_bits());
+            assert_eq!(
+                coord_hash(track),
+                PRE_CHANGE_COORD_HASH,
+                "{name}: 坐标与改动前不一致（gps_spread_m=0 必须逐点相同）"
+            );
+        }
+        // 可读证据：首点与改动前一致（不只是哈希相等）。
+        assert!((zero.locations[0].gLat - 39.9077201).abs() < 1e-9);
+        assert!((zero.locations[0].gLng - 116.4126209).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gps_spread_changes_only_coordinates_not_any_other_field() {
+        let (net, points) = snapshot_fixture();
+        let zero = build_road_tuned(2000.0, 800, 7, 0, &points, &points, &net, 0.0).unwrap();
+        let wide = build_road_tuned(2000.0, 800, 7, 0, &points, &points, &net, 8.0).unwrap();
+        assert_ne!(
+            coord_hash(&zero),
+            coord_hash(&wide),
+            "指定幅度必须真的改变抖动"
+        );
+        assert_eq!(zero.locations.len(), wide.locations.len());
+        assert_eq!(zero.totalSteps, wide.totalSteps);
+        assert_eq!(zero.totalDistance, wide.totalDistance);
+        assert_eq!(zero.totalTime, wide.totalTime);
+        // 除了经纬度，每个点的报文取值都必须一致：幅度只作用于位置抖动。
+        for (a, b) in zero.locations.iter().zip(&wide.locations) {
+            assert_eq!(a.totalTime, b.totalTime);
+            assert_eq!(a.ptype, b.ptype);
+            assert_eq!(a.flag, b.flag);
+            assert_eq!(a.steps, b.steps);
+            assert_eq!(a.speed.to_bits(), b.speed.to_bits());
+            assert_eq!(a.avgSpeed.to_bits(), b.avgSpeed.to_bits());
+            assert_eq!(a.bdA.to_bits(), b.bdA.to_bits());
+            assert_eq!(a.radius.to_bits(), b.radius.to_bits());
+            assert_eq!(a.accuracy.to_bits(), b.accuracy.to_bits());
+        }
+        // 幅度确实更大：两条独立抖动序列之间的平均坐标差应在数米量级。
+        let n = zero.locations.len() as f64;
+        let mean_delta: f64 = zero
+            .locations
+            .iter()
+            .zip(&wide.locations)
+            .map(|(a, b)| {
+                (((a.gLat - b.gLat) * MET_PER_DEG_LAT).powi(2)
+                    + ((a.gLng - b.gLng) * MET_PER_DEG_LNG).powi(2))
+                .sqrt()
+            })
+            .sum::<f64>()
+            / n;
+        assert!(
+            mean_delta > 1.0,
+            "8 m 幅度与自动幅度的坐标差只有 {mean_delta:.2} m，幅度没生效"
+        );
+    }
+
+    #[test]
+    fn new_generation_knobs_never_enter_the_wire_payload() {
+        // 举证：`gps_spread_m` / `anchor_offset_m` 只影响本地生成参数，
+        // 轨迹序列化出来的键集与幅度取值无关，也不含这两个名字。
+        let (net, points) = snapshot_fixture();
+        let zero = build_road_tuned(2000.0, 800, 7, 0, &points, &points, &net, 0.0).unwrap();
+        let wide = build_road_tuned(2000.0, 800, 7, 0, &points, &points, &net, 20.0).unwrap();
+        let a = serde_json::to_value(&zero).unwrap();
+        let b = serde_json::to_value(&wide).unwrap();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(keys(&a), keys(&b), "幅度不该改变轨迹的报文形状");
+        let text = a.to_string();
+        for forbidden in ["gps_spread", "anchor_offset", "anchorOffset", "gpsSpread"] {
+            assert!(
+                !text.contains(forbidden),
+                "轨迹报文里出现了本地参数 {forbidden}"
+            );
+        }
+        let point_keys = a["locations"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let point_keys_b = b["locations"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(point_keys, point_keys_b);
     }
 
     #[test]

@@ -40,6 +40,9 @@ fn fit_speeds(w: &mut [f64], dts: &[f64], target: f64) {
 }
 
 /// 轨迹生成主入口。points_bd 为 BD 系打卡点。
+///
+/// GPS 抖动沿用旧行为（AR(1) α=0.72、σ=0.75 → 单点稳态 ≈1.08 m）。
+/// 需要指定幅度（配置项 `gps_spread_m`）用 [`build_tuned`]。
 pub fn build(
     dist: f64,
     dur: i64,
@@ -47,6 +50,27 @@ pub fn build(
     _center: (f64, f64),
     start_ms: i64,
     points_bd: &[(f64, f64)],
+) -> Track {
+    build_tuned(dist, dur, seed, _center, start_ms, points_bd, 0.0)
+}
+
+/// 同 [`build`]，但可指定 GPS 抖动幅度（单点稳态标准差，米）。
+///
+/// - `0.0` 沿用旧行为：α=0.72、σ=0.75（稳态 ≈1.08 m），逐点输出与改动前一致；
+/// - `>0` 由目标稳态值反解 σ：`σ = S·√(1−α²)`，α 与旧版相同。
+///
+/// 与 Road 路径的区别要记住：经典模式的「旧行为」是**固定** 1.08 m（不是 2.8–4.2
+/// 抽样），所以把配置改成非 0 时两条路径才第一次变得完全一致 —— 配置默认值因此是 0。
+///
+/// 这里不消耗任何额外随机数，所以 RNG 序列与旧版完全一致，只有抖动幅度变。
+pub fn build_tuned(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    _center: (f64, f64),
+    start_ms: i64,
+    points_bd: &[(f64, f64)],
+    gps_spread_m: f64,
 ) -> Track {
     let mut rng = Rng::new(seed);
     let dur_f = dur as f64;
@@ -163,6 +187,15 @@ pub fn build(
     let mut t_acc = 0.0f64;
     let mut dist_acc = 0.0f64;
     let mut steps_acc = 0.0f64;
+    // AR(1) 抖动系数与旧版一致（α=0.72）；幅度按目标稳态标准差反解。
+    // 旧版 σ 恒为 0.75（稳态 = 0.75/√(1−0.72²) ≈ 1.08 m），这里 0 时原样保留。
+    const JITTER_ALPHA: f64 = 0.72;
+    let jitter_sigma = if gps_spread_m.is_finite() && gps_spread_m > 0.0 {
+        gps_spread_m.clamp(0.0, crate::api::model::GPS_SPREAD_MAX_M)
+            * (1.0 - JITTER_ALPHA * JITTER_ALPHA).sqrt()
+    } else {
+        0.75
+    };
     let mut jx = 0.0f64;
     let mut jy = 0.0f64;
     // 基准海拔按每次跑步抽一次：常量 82m 会让所有记录的 bdA 都围绕同一个值，
@@ -190,8 +223,8 @@ pub fn build(
             let (bx, by) = pos(s);
             x = bx;
             y = by;
-            jx = 0.72 * jx + rng.gauss(0.0, 0.75);
-            jy = 0.72 * jy + rng.gauss(0.0, 0.75);
+            jx = JITTER_ALPHA * jx + rng.gauss(0.0, jitter_sigma);
+            jy = JITTER_ALPHA * jy + rng.gauss(0.0, jitter_sigma);
             px = bx + jx;
             py = by + jy;
             rad = round_to(
@@ -336,4 +369,86 @@ pub fn build(
     };
     super::stats::rebuild(&mut track);
     track
+}
+
+#[cfg(test)]
+mod gps_spread_tests {
+    use super::*;
+
+    /// 改动前（HEAD）的 `build(2000, 800, seed=7)` 逐点坐标哈希。
+    /// 该数字来自 `git archive HEAD` 的干净副本，不是改完之后自己算的。
+    const PRE_CHANGE_COORD_HASH: u64 = 0x144f_36bf_ee9e_3f76;
+
+    fn points() -> [(f64, f64); 4] {
+        [
+            (39.9077201, 116.4126209),
+            (39.9077201, 116.4146209),
+            (39.9097201, 116.4146209),
+            (39.9097201, 116.4126209),
+        ]
+    }
+
+    fn coord_hash(track: &Track) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for p in &track.locations {
+            for v in [p.gLat, p.gLng] {
+                h ^= v.to_bits();
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn legacy_gps_spread_zero_reproduces_the_pre_change_track() {
+        let p = points();
+        let old_api = build(2000.0, 800, 7, (39.9, 116.4), 0, &p);
+        let zero = build_tuned(2000.0, 800, 7, (39.9, 116.4), 0, &p, 0.0);
+        let nan = build_tuned(2000.0, 800, 7, (39.9, 116.4), 0, &p, f64::NAN);
+        for (name, track) in [("old_api", &old_api), ("zero", &zero), ("nan", &nan)] {
+            assert_eq!(track.locations.len(), 164, "{name}: 点数变了");
+            assert_eq!(track.totalSteps, 1916, "{name}: 步数变了");
+            assert_eq!(
+                coord_hash(track),
+                PRE_CHANGE_COORD_HASH,
+                "{name}: 经典模式 gps_spread_m=0 必须与改动前逐点一致"
+            );
+        }
+        assert!((zero.locations[0].gLat - 39.9083108).abs() < 1e-9);
+        assert!((zero.locations[0].gLng - 116.4148486).abs() < 1e-9);
+    }
+
+    #[test]
+    fn legacy_gps_spread_changes_only_coordinates() {
+        let p = points();
+        let zero = build_tuned(2000.0, 800, 7, (39.9, 116.4), 0, &p, 0.0);
+        let wide = build_tuned(2000.0, 800, 7, (39.9, 116.4), 0, &p, 10.0);
+        assert_ne!(coord_hash(&zero), coord_hash(&wide), "幅度没生效");
+        assert_eq!(zero.locations.len(), wide.locations.len());
+        assert_eq!(zero.totalSteps, wide.totalSteps);
+        assert_eq!(zero.totalDistance, wide.totalDistance);
+        for (a, b) in zero.locations.iter().zip(&wide.locations) {
+            assert_eq!(a.totalTime, b.totalTime);
+            assert_eq!(a.ptype, b.ptype);
+            assert_eq!(a.steps, b.steps);
+            assert_eq!(a.speed.to_bits(), b.speed.to_bits());
+            assert_eq!(a.bdA.to_bits(), b.bdA.to_bits());
+        }
+        let n = zero.locations.len() as f64;
+        let mean_delta: f64 = zero
+            .locations
+            .iter()
+            .zip(&wide.locations)
+            .map(|(a, b)| {
+                (((a.gLat - b.gLat) * MET_PER_DEG_LAT).powi(2)
+                    + ((a.gLng - b.gLng) * MET_PER_DEG_LNG).powi(2))
+                .sqrt()
+            })
+            .sum::<f64>()
+            / n;
+        assert!(
+            mean_delta > 1.0,
+            "10 m 幅度与自动幅度只差 {mean_delta:.2} m"
+        );
+    }
 }

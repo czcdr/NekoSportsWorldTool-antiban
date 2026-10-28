@@ -79,6 +79,10 @@ pub struct RunPage {
     pub pace_max: f32,
     /// 手动绝对海拔（米）；空白表示使用生成器默认海拔。
     pub manual_altitude: String,
+    /// GPS 抖动幅度（单点稳态标准差，米）；0 = 旧的自动区间 2.8–4.2 m。
+    pub gps_spread_m: f64,
+    /// 上传锚点的计划级随机偏移（米）；0 = 精确锚点。
+    pub anchor_offset_m: f64,
     /// 0=随机时刻 1=指定时刻
     pub start_mode: usize,
     pub days_ago: i64,
@@ -92,10 +96,17 @@ pub struct RunPage {
     pub settings_dirty: bool,
     /// 预计算方案：参数变更时重抽样，提交直接使用
     pub plan: Option<RunPlan>,
+    /// 用户**显式钉住**的计划种子（复现用）；`None` = 每次重新抽。
+    ///
+    /// 故意**不落盘**：固定种子一旦写进 config.json，之后每次跑步都会复刻同一条
+    /// 记录 —— 那正是本模块 `clear_plan_cache` 要消灭的形态。它只活在本次会话里。
+    pub fixed_seed: Option<u64>,
     /// 路线算法模式
     pub route_mode: RouteMode,
     /// 地图视图状态
     pub map: MapState,
+    /// 瓦片底图（显示层，默认关闭；与 `map` 相互独立，失败不影响矢量绘制）
+    pub tiles: super::tiles::TileLayer,
     /// 路网预览（真实道路路由）
     pub preview: Option<crate::track::generate_road::RoadPlan>,
     /// 预览是否过期（参数变更后置真）
@@ -106,6 +117,8 @@ pub struct RunPage {
     pub preview_busy: bool,
     pub preview_cancel: std::sync::Arc<crate::task_control::Control>,
     pub preview_key: String,
+    /// 上传锚点偏移改过、等松手后重取点位（拖动中不重取，见 `on_anchor_offset_changed`）。
+    pub anchor_offset_dirty: bool,
     pub preview_changed_at: Option<std::time::Instant>,
     pub preview_status: String,
     /// 地图视野是否已适配
@@ -129,6 +142,8 @@ pub struct RunSettings {
     pub face_check: bool,
     pub route_mode: RouteMode,
     pub manual_altitude: String,
+    pub gps_spread_m: f64,
+    pub anchor_offset_m: f64,
 }
 
 impl RunSettings {
@@ -141,6 +156,8 @@ impl RunSettings {
             face_check: page.face_check,
             route_mode: page.route_mode,
             manual_altitude: page.manual_altitude.clone(),
+            gps_spread_m: page.gps_spread_m,
+            anchor_offset_m: page.anchor_offset_m,
         }
     }
 
@@ -153,6 +170,19 @@ impl RunSettings {
         config.pace_max = self.pace_max;
         config.face_check = self.face_check;
         config.route_mode = self.route_mode.as_str().into();
+        // 两个米制参数在写入前按各自上限归一，界面/磁盘/生成器读到的是同一个值。
+        config.gps_spread_m = if self.gps_spread_m.is_finite() {
+            self.gps_spread_m
+                .clamp(0.0, crate::api::model::GPS_SPREAD_MAX_M)
+        } else {
+            config.gps_spread_m
+        };
+        config.anchor_offset_m = if self.anchor_offset_m.is_finite() {
+            self.anchor_offset_m
+                .clamp(0.0, crate::api::model::ANCHOR_OFFSET_MAX_M)
+        } else {
+            config.anchor_offset_m
+        };
         match crate::track::altitude::parse_spec(&self.manual_altitude) {
             Ok(None) => {
                 config.manual_altitude = None;
@@ -295,8 +325,81 @@ impl RunPage {
             pace,
             dur,
             start_ms,
-            seed: rand::random::<u64>(),
+            // 用户钉住就照用（复现用）；否则每次重新抽。
+            seed: self.fixed_seed.unwrap_or_else(rand::random::<u64>),
         });
+        self.preview_stale = true;
+        // 种子换了 ⇒ 计划级锚点偏移跟着换 ⇒ 已经拉回来的点位不再属于这份计划：
+        // 预览画的是「旧锚点拉的点」，提交却会按新锚点重拉（缓存按锚点索引，必然 miss），
+        // 两边打卡点就对不上了。所以这里标记「待重取」，真正的网络请求留在 UI
+        // 松手之后触发（见 `draw_run_content` 末尾对 `anchor_offset_dirty` 的消费），
+        // 拖动滑块/连续改参数时不会每帧打一次点位接口。
+        //
+        // 偏移关着（默认 0）时不用重取：那时锚点就是精确值，点位与种子无关。
+        // 钉住种子时也不用重取：`plan_seed_for_anchor` 让预览与提交都吃同一个
+        // fixed_seed，偏移恒定（见该函数的注释）。
+        if self.fixed_seed.is_none() && self.effective_anchor_offset_m() > 0.0 {
+            self.anchor_offset_dirty = true;
+        }
+    }
+
+    /// 派生锚点偏移用的计划种子 —— **预览与提交必须用同一个来源**。
+    ///
+    /// 提交侧的规则是 `write_plan` 里的 `fixed_seed.unwrap_or(random)`；
+    /// 预览侧（`refresh_school_route`）在「当前还没有方案」时必须按同一规则回落，
+    /// 而不是一律用 0。
+    ///
+    /// 反例（可复现）：开偏移 50 + 勾固定种子（勾选会 `clear_plan_cache`，此刻
+    /// 还没有新方案）+ 立刻点『刷新路线点位与围栏』—— 若这里回落成 0，
+    /// 预览按 `seed=0` 派生锚点、提交按 `fixed_seed` 派生另一个，
+    /// 两边锚点差 40–60 m，预览的打卡点与提交的打卡点就对不上。
+    pub fn plan_seed_for_anchor(&self) -> u64 {
+        self.plan
+            .as_ref()
+            .map(|p| p.seed)
+            .or(self.fixed_seed)
+            .unwrap_or(0)
+    }
+
+    /// 当前生效的上传锚点偏移（米）—— **UI 值是唯一真值**。
+    ///
+    /// - 预览：`refresh_school_route` 用它算点位请求的锚点；
+    /// - 提交：`start_run` 把它写进 config，`flow` 再从 config 读同一个数。
+    ///
+    /// 两处同源才不会有「预览按 A 锚点拉点位、提交按 B 锚点重拉」这种错位。
+    /// 非有限值一律当 0（= 关闭偏移），宁可保守也不用脏值去挪上传坐标。
+    pub fn effective_anchor_offset_m(&self) -> f64 {
+        if self.anchor_offset_m.is_finite() {
+            self.anchor_offset_m
+                .clamp(0.0, crate::api::model::ANCHOR_OFFSET_MAX_M)
+        } else {
+            0.0
+        }
+    }
+
+    /// 让「这一份方案」失效 —— **整个程序里唯一该清方案缓存的地方**。
+    ///
+    /// 为什么必须清：预览与提交共用同一份 `RunPlan`（start_ms / seed / 距离 / 配速），
+    /// 这是「预览画的就是要提交的那条」的前提。但这张缓存一旦活到下一次点击，
+    /// 同参数再跑一次就会逐字段复刻上一条记录（开始时间、轨迹、步频、总步数全一样）——
+    /// 平台上最容易被判成「同一条记录重复提交」的形态，ScienseRunner v1.0.10 的公告
+    /// 里专门修的就是这个。
+    ///
+    /// 清掉的是「这一次抽到的东西」，**不是用户的选择**：距离/配速区间、路线模式、
+    /// `fixed_seed` 全部保留；下一次 `ensure_plan` 用同一组参数重新抽取距离/配速/
+    /// 种子/开始时间（t4 的锚点偏移跟着新 seed 一起重抽）。
+    ///
+    /// 调用点只有两处，都必须在「没有提交在飞」的时候：
+    /// - `poll_messages` 的 `__RUN_DONE__` 处理末尾（成功 / 部分成功 / 失败都走同一处）；
+    /// - 用户改「固定种子」开关时。
+    ///
+    /// **提交进行中禁止调用**：清了它，预览与提交就不是同一份方案了。
+    pub(crate) fn clear_plan_cache(&mut self) {
+        self.preview_cancel.cancel();
+        self.plan = None;
+        self.preview = None;
+        self.check = None;
+        self.preview_key.clear();
         self.preview_stale = true;
     }
 
@@ -331,6 +434,32 @@ impl RunPage {
         self.preview_stale = true;
         self.map_fitted = false;
         self.base_map_request = None;
+    }
+
+    /// GPS 抖动幅度变了：已算好的预览是按旧幅度画的，必须重新规划。
+    ///
+    /// 与切模式同理，三件事缺一不可 —— 尤其 `preview_key.clear()`：
+    /// `prepare_preview` 的去重键里没有幅度，键不变它就认为结果还新鲜，
+    /// 用户会看着「改了幅度没反应」。
+    pub(crate) fn on_gps_spread_changed(&mut self) {
+        self.preview_cancel.cancel();
+        self.preview_key.clear();
+        self.preview = None;
+        self.check = None;
+        self.preview_stale = true;
+    }
+
+    /// 上传锚点偏移变了：点位是用**偏移后的锚点**拉回来的，旧点位不能再用。
+    ///
+    /// 这里只作废预览并置脏，真正重取点位留给松手后（`flush_refresh_on_settle`）：
+    /// 拖动滑块时每帧重取会打爆点位接口。
+    pub(crate) fn on_anchor_offset_changed(&mut self) {
+        self.preview_cancel.cancel();
+        self.preview_key.clear();
+        self.preview = None;
+        self.check = None;
+        self.preview_stale = true;
+        self.anchor_offset_dirty = true;
     }
 
     /// 确保方案与当前参数一致（参数变更补齐 / 提交前兜底）。
@@ -375,6 +504,8 @@ impl App {
         let prev_route = self.run_page.route_mode;
         // 进入本帧前的参数快照：画完比对，变了就标脏（见 draw_run_content 末尾）。
         let settings_before = RunSettings::from_page(&self.run_page);
+        let gps_spread_before = self.run_page.gps_spread_m;
+        let anchor_offset_before = self.run_page.anchor_offset_m;
         {
             let page = &mut self.run_page;
             let compact = mobile::compact_ui(ui);
@@ -448,6 +579,45 @@ impl App {
                     120.0,
                 );
                 ui.label("留空自动；可填 17.2 或 11.6-22.8");
+            });
+            // 本地生成参数（不进协议字段）：抖动幅度 + 上传锚点偏移。
+            mobile::row(ui, |ui| {
+                ui.label("GPS 抖动（米）：");
+                mobile::drag_f64(
+                    ui,
+                    "run_gps_spread",
+                    &mut page.gps_spread_m,
+                    0.0..=crate::api::model::GPS_SPREAD_MAX_M,
+                    0.1,
+                    1,
+                );
+                ui.label("0 = 旧行为（道路/瓦片：每 seed 2.8–4.2 m；经典：固定 1.08 m）");
+                ui.separator();
+                ui.label("锚点偏移（米）：");
+                mobile::drag_f64(
+                    ui,
+                    "run_anchor_offset",
+                    &mut page.anchor_offset_m,
+                    0.0..=crate::api::model::ANCHOR_OFFSET_MAX_M,
+                    1.0,
+                    0,
+                );
+                ui.label("默认 0（关闭）；开启后每份计划偏移约 40–60 m，可能让点位更贴近围栏边缘");
+            });
+            // 固定种子（复现用，不落盘）：默认不钉，每次重新抽。
+            mobile::row(ui, |ui| {
+                let mut pinned = page.fixed_seed.is_some();
+                if ui.checkbox(&mut pinned, "固定种子").changed() {
+                    page.fixed_seed = pinned.then_some(page.fixed_seed.unwrap_or(7));
+                    // 抽取规则变了：旧方案是按旧规则算的，重来一份。
+                    page.clear_plan_cache();
+                }
+                if let Some(seed) = page.fixed_seed.as_mut() {
+                    let mut value = (*seed).min(i64::MAX as u64) as i64;
+                    mobile::drag_i64(ui, "run_fixed_seed", &mut value, 0..=i64::MAX, 1.0, "", "");
+                    *seed = value.max(0) as u64;
+                }
+                ui.label("不勾 = 每次重新抽取（提交后也会重抽）");
             });
             mobile::row(ui, |ui| {
                 ui.label("开始时间：");
@@ -650,6 +820,21 @@ impl App {
         // 不再依赖「开始跑步」——那正是 faceCheck 勾了却丢失的原因。
         if RunSettings::from_page(&self.run_page) != settings_before {
             self.run_page.settings_dirty = true;
+        }
+        // 两个本地生成参数改了要作废预览：抖动幅度改的是轨迹点位置，
+        // 锚点偏移改的是点位请求的坐标 —— 两者都不能拿旧预览继续画。
+        if self.run_page.gps_spread_m != gps_spread_before {
+            self.run_page.on_gps_spread_changed();
+        }
+        if self.run_page.anchor_offset_m != anchor_offset_before {
+            self.run_page.on_anchor_offset_changed();
+        }
+        // 偏移只在**松手**后重取点位，避免拖动滑块时每一帧都发一次点位请求。
+        if self.run_page.anchor_offset_dirty && !ui.ctx().is_using_pointer() {
+            self.run_page.anchor_offset_dirty = false;
+            if self.run_page.route_mode.needs_school_route() {
+                self.refresh_points();
+            }
         }
         if self.run_page.settings_dirty && !ui.ctx().is_using_pointer() {
             self.persist_run_settings();
@@ -866,6 +1051,17 @@ impl App {
             );
         }
 
+        // 底图工具条在画布上方：切换即落盘（默认 off，不联网）。
+        if super::tiles::toolbar(
+            ui,
+            &mut self.config.basemap,
+            &mut self.run_page.tiles,
+            self.config.map_cache_limit_mb,
+        ) {
+            if let Err(error) = crate::ui::save_config(&self.config) {
+                self.status = error;
+            }
+        }
         ui.add_space(4.0);
         let rect = ui.available_rect_before_wrap();
         let (response, painter) = ui.allocate_painter(
@@ -878,6 +1074,15 @@ impl App {
             egui::Rounding::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
+        // 底图垫在矢量图下面；加载失败只写状态栏，绝不挡矢量绘制。
+        // 放在 fit 之后：否则首帧的瓦片按「未适配的视野」画、矢量按新视野画，会闪一下。
+        let basemap = super::tiles::BasemapSource::parse(&self.config.basemap);
+        self.run_page
+            .tiles
+            .draw(&painter, ui.ctx(), &self.run_page.map, canvas, basemap);
+        if let Some(message) = self.run_page.tiles.take_notice() {
+            self.status = message;
+        }
 
         // 首次预览后适配视野：优先以电子围栏为中点/范围，无围栏时退化为路线+打卡点+道路
         if !self.run_page.map_fitted {
@@ -1063,6 +1268,16 @@ impl App {
                 ("建筑", egui::Color32::from_rgb(214, 182, 158)),
             ],
         );
+        if super::tiles::toolbar(
+            ui,
+            &mut self.config.basemap,
+            &mut self.run_page.tiles,
+            self.config.map_cache_limit_mb,
+        ) {
+            if let Err(error) = crate::ui::save_config(&self.config) {
+                self.status = error;
+            }
+        }
         let (response, painter) = ui.allocate_painter(
             egui::vec2(ui.available_width().max(200.), 240.),
             egui::Sense::drag(),
@@ -1084,6 +1299,13 @@ impl App {
             egui::Rounding::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
+        let basemap = super::tiles::BasemapSource::parse(&self.config.basemap);
+        self.run_page
+            .tiles
+            .draw(&painter, ui.ctx(), &self.run_page.map, canvas, basemap);
+        if let Some(message) = self.run_page.tiles.take_notice() {
+            self.status = message;
+        }
         self.run_page.map.draw_network(&painter, canvas, net);
         self.run_page.map.interact(ui, canvas);
     }
@@ -1127,8 +1349,20 @@ impl App {
         self.config.manual_altitude = manual_altitude;
         self.config.manual_altitude_range = manual_altitude_range;
         self.config.route_mode = route_mode.as_str().into();
+        // 两个本地生成参数也从**页面**取值并落盘：预览就是按这两个数算的，
+        // 提交链路（flow.rs）读 config —— 同源才不会出现「预览按 A 锚点拉点位、
+        // 提交按 B 锚点重拉」这种两边打卡点不一致。
+        self.config.gps_spread_m = page.gps_spread_m;
+        self.config.anchor_offset_m = page.effective_anchor_offset_m();
         if let Err(e) = crate::ui::save_config(&self.config) {
-            self.status = e;
+            // **写盘失败就中止本次提交**，而不是只写状态栏。
+            //
+            // 提交链路（`flow.rs`）是从**磁盘**读 `anchor_offset_m` / `gps_spread_m`
+            // 和 `safety` 的：磁盘满/目录只读时它读到的还是上一次的旧值 ——
+            // 开了锚点偏移就是「预览按新锚点拉点位、提交按旧锚点重拉」，
+            // 护栏也会按旧策略放行。与其按两套参数跑一次，不如让用户先解决写盘问题。
+            self.status = format!("{e}（配置未能写入，已取消本次提交）");
+            return;
         }
 
         let identity = self.identity.clone();
@@ -1899,6 +2133,363 @@ mod tests {
         assert!(
             app.run_page.preview_key.is_empty(),
             "去重键必须清空，否则 prepare_preview 不会重算"
+        );
+    }
+
+    /// 改 GPS 抖动幅度必须让预览失效：`prepare_preview` 的去重键里没有幅度，
+    /// 键不清空它就认为结果还新鲜，用户会看着「改了幅度没反应」。
+    #[test]
+    fn changing_gps_spread_invalidates_the_previous_preview() {
+        let mut page = RunPage::default();
+        page.preview = Some(crate::track::generate_road::RoadPlan {
+            arcs: vec![0.0, 1.0],
+            laps: vec![500.0],
+            route: vec![(39.9, 116.4)],
+            length_m: 500.0,
+            edges: vec![],
+            buildings: vec![],
+            checkpoints: vec![(39.9, 116.4)],
+            fences: vec![],
+        });
+        page.preview_key = "旧幅度的键".into();
+        page.preview_stale = false;
+        page.gps_spread_m = 6.0;
+
+        page.on_gps_spread_changed();
+
+        assert!(page.preview_stale, "改幅度后预览必须标脏");
+        assert!(page.preview.is_none(), "旧幅度的预览必须清掉");
+        assert!(page.check.is_none(), "旧的检查结果必须清掉");
+        assert!(page.preview_key.is_empty(), "去重键必须清空");
+    }
+
+    /// 改锚点偏移：只标脏 + 置「待重取点位」，不当场发请求（拖动中不重取）。
+    #[test]
+    fn changing_anchor_offset_defers_the_points_refresh_until_settle() {
+        let mut page = RunPage::default();
+        page.preview_key = "旧锚点的键".into();
+        page.preview_stale = false;
+        page.anchor_offset_m = 80.0;
+
+        page.on_anchor_offset_changed();
+
+        assert!(page.preview_stale);
+        assert!(page.preview_key.is_empty());
+        assert!(page.anchor_offset_dirty, "必须留下「松手后重取点位」的标记");
+        assert!(page.preview.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // 提交结束后清空计划缓存（避免同参数两次记录完全一致）
+    // ---------------------------------------------------------------
+
+    /// 提交结束 → 方案作废 → 下一次重新抽取。
+    ///
+    /// `days_ago = 1` 是刻意的：随机时刻的窗口是「那一天的 7:00–20:00」，
+    /// 用今天的话凌晨跑 CI 会把窗口压成一个点，`start_ms` 就不再是随机的了，
+    /// 断言会变成偶发失败。
+    #[test]
+    fn finished_run_clears_the_plan_so_the_next_one_differs() {
+        let mut p = page(0, 1);
+        p.ensure_plan();
+        let first = p.plan.clone().expect("方案应已抽出");
+        p.preview = Some(crate::track::generate_road::RoadPlan {
+            arcs: vec![0.0, 1.0],
+            laps: vec![500.0],
+            route: vec![(39.9, 116.4)],
+            length_m: 500.0,
+            edges: vec![],
+            buildings: vec![],
+            checkpoints: vec![(39.9, 116.4)],
+            fences: vec![],
+        });
+        p.check = Some(Default::default());
+        p.preview_key = "旧方案的键".into();
+        p.preview_stale = false;
+
+        p.clear_plan_cache();
+
+        assert!(p.plan.is_none(), "提交结束后 plan 必须清空");
+        assert!(p.preview.is_none(), "提交结束后预览必须清掉");
+        assert!(p.check.is_none(), "旧的检查结果必须清掉");
+        assert!(p.preview_key.is_empty(), "去重键必须清空");
+        assert!(p.preview_stale, "预览必须标脏，下一帧才会重算");
+
+        p.ensure_plan();
+        let second = p.plan.clone().expect("应重新抽出方案");
+        assert_ne!(second.seed, first.seed, "新方案必须重新抽种子");
+        assert_ne!(
+            second.start_ms, first.start_ms,
+            "新方案必须重新抽开始时间（否则两条记录的开始时间一样）"
+        );
+        // 用户选的区间与模式不能被「清理」改掉。
+        assert_eq!(second.dist_min, first.dist_min);
+        assert_eq!(second.dist_max, first.dist_max);
+        assert_eq!(second.pace_min, first.pace_min);
+        assert_eq!(second.pace_max, first.pace_max);
+        assert_eq!(second.start_mode, first.start_mode);
+    }
+
+    /// 显式钉住种子时，清理只清掉「这一次的抽样」，种子必须照用。
+    #[test]
+    fn pinned_seed_survives_the_post_run_clear() {
+        let mut p = page(0, 1);
+        p.fixed_seed = Some(424_242);
+        p.ensure_plan();
+        assert_eq!(p.plan.as_ref().unwrap().seed, 424_242, "固定种子没生效");
+
+        p.clear_plan_cache();
+        assert!(p.plan.is_none());
+        assert_eq!(p.fixed_seed, Some(424_242), "清理不该动用户的固定种子");
+
+        p.ensure_plan();
+        assert_eq!(
+            p.plan.as_ref().unwrap().seed,
+            424_242,
+            "固定种子下重新抽也必须用同一个种子"
+        );
+    }
+
+    /// 端到端：提交在飞时 plan 原样保留；`__RUN_DONE__` 到达（失败也算）才清。
+    #[test]
+    fn run_done_clears_the_plan_cache_but_an_in_flight_run_keeps_it() {
+        let ctx = egui::Context::default();
+        let mut app = mode_app(&ctx);
+        app.run_page.ensure_plan();
+        let planned = app.run_page.plan.clone().expect("方案应已抽出");
+        app.run_page.preview_key = "旧方案的键".into();
+
+        // ① 提交进行中：只来 stage 消息，方案必须原样留着 —— 预览与提交共用它。
+        app.run_busy = true;
+        app.tx
+            .send("__RUN_STAGE__[track] 生成轨迹".to_string())
+            .unwrap();
+        app.poll_messages();
+        assert!(app.run_busy, "stage 消息不该结束提交");
+        assert!(app.run_page.plan.is_some(), "提交进行中不能清方案");
+        assert_eq!(
+            app.run_page.plan.as_ref().unwrap().seed,
+            planned.seed,
+            "提交进行中方案被换掉了，预览与提交会指向两条轨迹"
+        );
+        assert_eq!(app.run_page.preview_key, "旧方案的键");
+
+        // ② 提交结束（失败分支也算「结束」）：清空，下一次重新抽。
+        let payload = serde_json::json!({"ok": false, "message": "fixture 失败"}).to_string();
+        app.tx
+            .send(format!("{}{}", crate::ui::RUN_DONE, payload))
+            .unwrap();
+        app.poll_messages();
+        assert!(!app.run_busy);
+        assert!(app.run_page.plan.is_none(), "提交结束后必须清空方案");
+        assert!(app.run_page.preview.is_none());
+        assert!(app.run_page.preview_key.is_empty());
+
+        // ③ 下一帧 `ensure_plan` 会抽到新种子（同参数也不复刻上一条记录）。
+        app.run_page.ensure_plan();
+        assert_ne!(
+            app.run_page.plan.as_ref().unwrap().seed,
+            planned.seed,
+            "同参数再跑必须换一个种子"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // F3：换 seed ⇒ 计划级锚点偏移变 ⇒ 必须重取点位（否则预览≠提交）
+    // ---------------------------------------------------------------
+
+    /// 新方案 = 新 seed = 新偏移：必须标记「点位要重取」，否则预览手里的点位
+    /// 还是按旧锚点拉的，而提交会按新锚点重拉（缓存按锚点索引，必然 miss）。
+    #[test]
+    fn new_plan_marks_points_for_refetch_only_when_the_offset_is_on() {
+        let mut p = page(0, 1);
+        p.anchor_offset_m = 50.0;
+        p.ensure_plan();
+        assert!(p.anchor_offset_dirty, "开了偏移后新方案必须重取点位");
+
+        // 消费掉标记（等价于 UI 在松手后跑完 `refresh_points`）。
+        p.anchor_offset_dirty = false;
+        // 参数没变：不该每帧都重取。
+        p.ensure_plan();
+        assert!(!p.anchor_offset_dirty, "方案没变就不该重取点位");
+
+        // 换一版 = 新 seed = 新偏移 → 又要重取。
+        p.regen_plan();
+        assert!(p.anchor_offset_dirty, "换一版必须重取点位");
+
+        // 偏移关着（默认）：点位与 seed 无关，不该白打一次点位接口。
+        let mut off = page(0, 1);
+        assert_eq!(off.effective_anchor_offset_m(), 0.0, "默认必须是关闭");
+        off.ensure_plan();
+        assert!(!off.anchor_offset_dirty, "偏移关闭时重取点位是白费请求");
+        off.regen_plan();
+        assert!(!off.anchor_offset_dirty);
+
+        // 固定种子：偏移不随计划变（同 seed 同偏移），也不用重取。
+        let mut pinned = page(0, 1);
+        pinned.anchor_offset_m = 50.0;
+        pinned.fixed_seed = Some(7);
+        pinned.ensure_plan();
+        assert!(
+            !pinned.anchor_offset_dirty,
+            "固定种子下偏移恒定，重取点位是白费请求"
+        );
+    }
+
+    /// 预览（页面值）与提交（启动时写进 config 的值）必须读同一个偏移。
+    #[test]
+    fn preview_and_submit_read_the_same_anchor_offset() {
+        let mut p = page(0, 1);
+        p.anchor_offset_m = 80.0;
+        p.gps_spread_m = 6.0;
+        let mut config = crate::api::model::Config::default();
+        assert_eq!(config.resolved_anchor_offset_m(), 0.0, "默认关闭");
+
+        // `start_run` 落盘用的是这两个值，预览读的是 `effective_anchor_offset_m`。
+        RunSettings::from_page(&p).apply_to(&mut config).unwrap();
+        assert_eq!(
+            config.resolved_anchor_offset_m(),
+            p.effective_anchor_offset_m(),
+            "预览与提交的偏移量必须同源"
+        );
+        assert_eq!(config.gps_spread_m, p.gps_spread_m);
+
+        // 同一个计划 seed 派生出同一个锚点：预览与提交各算一次也一致。
+        let exact = crate::location::Coordinate::new(39.9042, 116.4074, 0.0).unwrap();
+        assert_eq!(
+            crate::location::plan_anchor(exact, p.effective_anchor_offset_m(), 7),
+            crate::location::plan_anchor(exact, config.resolved_anchor_offset_m(), 7),
+            "同一 seed + 同一偏移量 → 同一锚点"
+        );
+
+        // 越界/脏值一律当关闭，不会把上传坐标挪走。
+        let mut dirty = page(0, 1);
+        dirty.anchor_offset_m = f64::NAN;
+        assert_eq!(dirty.effective_anchor_offset_m(), 0.0);
+        dirty.anchor_offset_m = -5.0;
+        assert_eq!(dirty.effective_anchor_offset_m(), 0.0);
+        dirty.anchor_offset_m = 1e9;
+        assert_eq!(
+            dirty.effective_anchor_offset_m(),
+            crate::api::model::ANCHOR_OFFSET_MAX_M
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // M1：固定种子 + 开启偏移 + 还没有方案 —— 预览与提交必须同一锚点
+    // ---------------------------------------------------------------
+
+    /// 盲审抓到的真实分叉：`plan` 为空时预览曾把种子回落成 0，而提交用
+    /// `fixed_seed`，两份锚点差 40–60 m（打卡点跟着分叉）。
+    #[test]
+    fn pinned_seed_without_a_plan_keeps_preview_and_submit_on_one_anchor() {
+        let mut p = page(0, 1);
+        p.anchor_offset_m = 50.0;
+        p.fixed_seed = Some(424_242);
+        // 勾选「固定种子」→ clear_plan_cache 之后的真实状态：有种子、没方案。
+        p.plan = None;
+        assert!(p.preview.is_none() && p.plan.is_none());
+
+        // 预览侧：此刻用来派生锚点的种子。
+        let preview_seed = p.plan_seed_for_anchor();
+        assert_eq!(
+            preview_seed, 424_242,
+            "没有方案时必须回落到 fixed_seed，而不是 0"
+        );
+
+        // 提交侧：ensure_plan 写进 RunPlan 的种子。
+        p.ensure_plan();
+        let submit_seed = p.plan.as_ref().unwrap().seed;
+        assert_eq!(submit_seed, 424_242);
+
+        let exact = crate::location::Coordinate::new(39.9042, 116.4074, 0.0).unwrap();
+        let offset = p.effective_anchor_offset_m();
+        let preview_anchor = crate::location::plan_anchor(exact, offset, preview_seed);
+        let submit_anchor = crate::location::plan_anchor(exact, offset, submit_seed);
+        assert_eq!(
+            preview_anchor.latitude.to_bits(),
+            submit_anchor.latitude.to_bits(),
+            "预览与提交的锚点必须逐位相同"
+        );
+        assert_eq!(
+            preview_anchor.longitude.to_bits(),
+            submit_anchor.longitude.to_bits(),
+            "预览与提交的锚点必须逐位相同"
+        );
+
+        // 回归守卫：旧的 `.unwrap_or(0)` 回落确实会算出另一个锚点，
+        // 否则这条用例证明不了任何东西。
+        let old_fallback = crate::location::plan_anchor(exact, offset, 0);
+        assert_ne!(
+            old_fallback.latitude.to_bits(),
+            submit_anchor.latitude.to_bits(),
+            "0 回落应产生不同锚点，说明这条守卫有效"
+        );
+    }
+
+    /// 有方案时依旧取方案种子（固定种子与随机种子两种情形都成立）。
+    #[test]
+    fn plan_seed_for_anchor_prefers_the_plan_then_the_pin() {
+        let mut p = page(0, 1);
+        p.ensure_plan();
+        let planned = p.plan.as_ref().unwrap().seed;
+        assert_eq!(p.plan_seed_for_anchor(), planned, "有方案时取方案种子");
+
+        p.fixed_seed = Some(9);
+        // 方案还在：仍以方案种子为准（下一份方案才会变成 9）。
+        assert_eq!(p.plan_seed_for_anchor(), planned);
+
+        p.plan = None;
+        assert_eq!(p.plan_seed_for_anchor(), 9, "没有方案时用钉住的种子");
+
+        p.fixed_seed = None;
+        assert_eq!(p.plan_seed_for_anchor(), 0, "两者都没有时才回落 0");
+    }
+
+    // ---------------------------------------------------------------
+    // L1：config 写不进去就不提交
+    // ---------------------------------------------------------------
+
+    /// 磁盘写不进去时 `flow` 会读到旧参数（锚点偏移/抖动/护栏），
+    /// 宁可中止提交并说清原因，也不要按两套参数跑一次。
+    #[test]
+    fn failed_config_write_aborts_the_submission() {
+        // 把数据目录指到一个**普通文件**上：写 `<file>/config.json` 必然 ENOTDIR。
+        let blocker =
+            std::env::temp_dir().join(format!("neko-run-blocker-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&blocker, b"x").unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(blocker.clone()));
+
+        let ctx = egui::Context::default();
+        let mut app = mode_app(&ctx);
+        // 有会话：若代码没被拦住，它会真的起提交任务（run_busy 变 true）。
+        app.session = Some(crate::api::model::Session {
+            uid: 42,
+            token: "fixture-token".into(),
+            unid: "77".into(),
+            ..Default::default()
+        });
+        app.run_page.ensure_plan();
+        let planned = app.run_page.plan.clone().expect("方案应已抽出");
+
+        app.start_run();
+
+        let busy = app.run_busy;
+        let status = app.status.clone();
+        let plan_alive = app.run_page.plan.is_some();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+        let _ = std::fs::remove_file(&blocker);
+
+        assert!(!busy, "配置写不进去时不该起提交任务（状态栏：{status}）");
+        assert!(
+            status.contains("已取消本次提交"),
+            "要明说为什么没提交，实际：{status}"
+        );
+        assert!(plan_alive, "取消提交不该顺手清掉方案");
+        assert_eq!(
+            app.run_page.plan.as_ref().unwrap().seed,
+            planned.seed,
+            "取消提交不该换方案"
         );
     }
 }

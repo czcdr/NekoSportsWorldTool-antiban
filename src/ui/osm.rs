@@ -35,6 +35,8 @@ pub struct OsmPage {
     pub busy: bool,
     pub status: String,
     pub map: MapState,
+    /// 瓦片底图（显示层，默认关闭；与 `map` 相互独立）
+    pub tiles: super::tiles::TileLayer,
     pub fitted: bool,
 }
 
@@ -54,6 +56,7 @@ impl Default for OsmPage {
             busy: false,
             status: String::new(),
             map: MapState::default(),
+            tiles: super::tiles::TileLayer::default(),
             fitted: false,
         }
     }
@@ -236,6 +239,16 @@ impl App {
         }
 
         ui.add_space(4.0);
+        if super::tiles::toolbar(
+            ui,
+            &mut self.config.basemap,
+            &mut self.osm_page.tiles,
+            self.config.map_cache_limit_mb,
+        ) {
+            if let Err(error) = crate::ui::save_config(&self.config) {
+                self.osm_page.status = error;
+            }
+        }
         if self.network.is_some() {
             super::map::legend(
                 ui,
@@ -309,6 +322,14 @@ impl App {
             egui::Rounding::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
+        // 底图垫在矢量图下面；失败只写状态栏，绝不挡矢量绘制。
+        let basemap = super::tiles::BasemapSource::parse(&self.config.basemap);
+        self.osm_page
+            .tiles
+            .draw(&painter, ui.ctx(), &self.osm_page.map, canvas, basemap);
+        if let Some(message) = self.osm_page.tiles.take_notice() {
+            self.osm_page.status = message;
+        }
         if let Some(net) = &self.network {
             self.osm_page.map.draw_network(&painter, canvas, net);
         } else {

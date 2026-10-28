@@ -224,17 +224,28 @@ struct Chain {
 ///
 /// `start_ms` 固定取**北京时间当天 12:00**：护栏的深夜判定按北京时间算，
 /// 用本地时区的话，UTC-5 的 CI 上"中午"会落到北京时间凌晨，整条链被护栏拦掉。
+///
+/// `safety.enabled=false` 是**必须**的，不只是省事：深夜护栏判的是「**现在**几点」
+/// （`safety::check_night`），而本文件把提交时刻钉在今天 12:00 —— 于是在
+/// 23:00–06:00 之间跑这组用例必然被拦，`请求集合不完整；实际：[]`
+/// （2026-10-28 23:0x 实测复现，与协议行为无关）。护栏本身由 `safety::tests`
+/// 覆盖（含 `night_window_blocks_late_and_early_submissions`），这里要的是一条
+/// 与墙钟无关的干净全链。
 fn drive(platform: &str) -> Chain {
+    drive_with_config(
+        platform,
+        r#"{"safety":{"enabled":false,"allow_timezone_mismatch":true}}"#,
+    )
+}
+
+/// 同 [`drive`]，但可以指定 config.json 内容（用于 `gps_spread_m` / `anchor_offset_m`）。
+fn drive_with_config(platform: &str, config_json: &str) -> Chain {
     let root = std::env::temp_dir().join(format!("fake-run-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(root.clone()));
     // 全链会检查设备时区必须是 UTC+8。CI 跑在 UTC 上，若这里不放行，
     // 整条链在「时区」就停了 —— 与要验证的协议行为无关。
-    std::fs::write(
-        root.join("config.json"),
-        r#"{"safety":{"allow_timezone_mismatch":true}}"#,
-    )
-    .unwrap();
+    std::fs::write(root.join("config.json"), config_json).unwrap();
 
     let (host, hits, stop) = start_mock();
     let (lat, lon) = crate::track::geom::wgs84_to_bd09(39.9, 116.4);
@@ -457,4 +468,93 @@ fn ios_identity_is_refused_before_the_submit_request() {
             hit.path
         );
     }
+}
+
+// ---------------------------------------------------------------
+// 上传锚点偏移（配置 anchor_offset_m）
+//
+// 点位请求的**明文**被信封加密（`envelope_request`），wire 上只有密文，所以坐标
+// 数值本身在 `api::points::anchor_offset_tests` 里对 `request_body` 断言（那就是
+// 进信封前的原文）。这里能断言的是另外两件同样重要的事：
+// ① 偏移不新增任何请求字段（0 偏移与 50 m 的外层信封键集必须一致）；
+// ② 偏移不改变设备锚点本身，整条链在两种配置下都跑得通。
+// ---------------------------------------------------------------
+
+/// 抓到的那一条 `/points` 请求的**外层信封** body。
+fn points_envelope(chain: &Chain) -> Value {
+    let hit = chain
+        .hits
+        .iter()
+        .find(|h| h.path.starts_with(crate::api::points::POINTS_PATH_PREFIX))
+        .unwrap_or_else(|| panic!("没抓到点位请求；请求：{:#?}", seen(&chain.hits)));
+    serde_json::from_str(&hit.body).unwrap_or_else(|e| {
+        panic!("点位请求 body 不是 JSON（{e}）：{}", hit.body);
+    })
+}
+
+fn sorted_keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn anchor_offset_adds_no_request_field_and_keeps_the_device_anchor() {
+    let baseline = drive_with_config(
+        "android",
+        r#"{"safety":{"enabled":false,"allow_timezone_mismatch":true},"anchor_offset_m":0.0}"#,
+    );
+    let offset = drive_with_config(
+        "android",
+        r#"{"safety":{"enabled":false,"allow_timezone_mismatch":true},"anchor_offset_m":50.0}"#,
+    );
+    for chain in [&baseline, &offset] {
+        assert!(
+            chain.outcome.is_ok(),
+            "全链失败：{:?}\n日志：{:#?}",
+            chain.outcome.as_ref().err(),
+            chain.log
+        );
+    }
+    // ① 请求集合不变（偏移不该让链路变成另一条），字段集合也不变。
+    assert_eq!(seen(&baseline.hits), seen(&offset.hits), "请求集合变了");
+    let base_body = points_envelope(&baseline);
+    let moved_body = points_envelope(&offset);
+    assert_eq!(
+        sorted_keys(&base_body),
+        sorted_keys(&moved_body),
+        "偏移不该改变点位请求的字段集合"
+    );
+    let text = moved_body.to_string();
+    for forbidden in ["anchor_offset", "anchorOffset", "gps_spread", "offset"] {
+        assert!(
+            !text.contains(forbidden),
+            "点位请求里出现了本地参数 {forbidden}"
+        );
+    }
+    // ② 设备锚点本身没被改：身份里的经纬度仍是精确值（偏移只用于请求）。
+    let exact = offset.identity.anchor_coordinate().unwrap();
+    assert_eq!(
+        offset.identity.anchor_lat.to_bits(),
+        exact.latitude.to_bits()
+    );
+    assert_eq!(
+        offset.identity.anchor_lon.to_bits(),
+        exact.longitude.to_bits()
+    );
+    // ③ 计划级偏移：同一计划两次相同，新计划重抽（与 flow 无关的纯函数保证，
+    //    预览与提交都用 plan.seed 派生，所以必然一致）。
+    let expected = crate::location::plan_anchor(exact, 50.0, 7);
+    assert_eq!(crate::location::plan_anchor(exact, 50.0, 7), expected);
+    assert_ne!(crate::location::plan_anchor(exact, 50.0, 8), expected);
+    assert_eq!(
+        crate::location::plan_anchor(exact, 0.0, 7)
+            .latitude
+            .to_bits(),
+        exact.latitude.to_bits(),
+        "0 偏移必须逐位等于精确锚点"
+    );
 }

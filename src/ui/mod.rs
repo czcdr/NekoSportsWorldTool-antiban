@@ -12,6 +12,7 @@ pub mod ai;
 pub mod captcha;
 pub mod data;
 pub mod device;
+pub mod draw_track;
 pub mod fonts;
 pub mod jobs;
 pub mod log;
@@ -24,6 +25,7 @@ pub mod records;
 mod road_tools;
 pub mod run;
 pub mod theme;
+pub mod tiles;
 pub mod user;
 
 use crate::api::login::CaptchaMode;
@@ -421,7 +423,10 @@ impl App {
                 4 => self.draw_user(ui),
                 5 => self.draw_device(ui),
                 6 => self.log.render(ui),
-                7 => self.draw_osm_page(ui),
+                7 => {
+                    self.draw_track_editor(ui);
+                    self.draw_osm_page(ui);
+                }
                 _ => self.draw_about(ui),
             }
         });
@@ -499,6 +504,9 @@ impl App {
                 hour: 12,
                 minute: 0,
                 face_check: config.face_check,
+                // 本地生成参数：抖动幅度 / 上传锚点偏移（0 分别表示旧行为与精确锚点）。
+                gps_spread_m: config.resolved_gps_spread_m(),
+                anchor_offset_m: config.resolved_anchor_offset_m(),
                 plan: None,
                 route_mode: crate::track::generate_road::RouteMode::from_str(&config.route_mode),
                 map: map::MapState::default(),

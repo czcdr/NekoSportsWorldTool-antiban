@@ -9,7 +9,7 @@ use super::records::fetch_one_record;
 use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::location::Coordinate;
 use crate::track::generate_road::RouteMode;
-use crate::track::generator::build as gen_track;
+use crate::track::generator::build_tuned as gen_track_tuned;
 use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
 use serde_json::Value;
 
@@ -428,7 +428,24 @@ pub fn run_full_flow_cancellable(
     if client.identity.has_unconfigured_default_location() {
         return Err("请先在设备信息页填写本次跑步所在城市和定位锚点，不能使用大连默认配置".into());
     }
-    let anchor: Coordinate = client.identity.anchor_coordinate()?;
+    let exact_anchor: Coordinate = client.identity.anchor_coordinate()?;
+    // 计划级上传锚点偏移（配置 anchor_offset_m，0 = 精确锚点）：
+    // 只改点位请求里的 latitude/longitude（`runec` 输入串同源派生，因此自动一致），
+    // 设备身份锚点、围栏、轨迹生成用的锚点都还是精确值。
+    // 偏移由本次计划的 seed 派生 → 同一计划内预览与提交拿到同一份偏移。
+    let anchor = crate::location::plan_anchor(
+        exact_anchor,
+        super::model::load_config().resolved_anchor_offset_m(),
+        params.seed,
+    );
+    if anchor != exact_anchor {
+        let dy = (anchor.latitude - exact_anchor.latitude) * crate::track::geom::MET_PER_DEG_LAT;
+        let dx = (anchor.longitude - exact_anchor.longitude) * crate::track::geom::MET_PER_DEG_LNG;
+        log(&format!(
+            "[points] 上传锚点按计划偏移 {:.1} m（设备锚点本身不变）",
+            dx.hypot(dy)
+        ));
+    }
     let area_id = (fences.area.run_area_id >= 0).then(|| fences.area.run_area_id.to_string());
     // 点位集合随目标距离变化（官方路径 `/distance/<米>`），这里传本次目标距离
     let pts = points::fetch_points_ext(client, anchor, area_id, params.dist, log)?;
@@ -468,6 +485,8 @@ pub fn run_full_flow_cancellable(
     ));
     // 随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s），轨迹/提交/OBS/五点统一使用；
     // 已在占位之前算好（`start_ms`），这里不再二次抽样。
+    // GPS 抖动幅度（配置 gps_spread_m，0 = 旧行为）；只读一次，供下面各模式共用。
+    let gps_spread_m = super::model::load_config().resolved_gps_spread_m();
     let mut track = match params.route_mode {
         RouteMode::Road => {
             if !fences.polygons.is_empty() {
@@ -490,7 +509,7 @@ pub fn run_full_flow_cancellable(
             } else {
                 "[road] 在学校围栏内沿点位闭环重复补足距离"
             });
-            crate::track::generate_road::build_road(
+            crate::track::generate_road::build_road_tuned(
                 params.dist,
                 params.dur,
                 params.seed,
@@ -498,6 +517,7 @@ pub fn run_full_flow_cancellable(
                 &route_pts,
                 &route_pts,
                 &filtered,
+                gps_spread_m,
             )
             .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
         }
@@ -526,7 +546,7 @@ pub fn run_full_flow_cancellable(
                     let filtered =
                         crate::track::generate_road::apply_fences(&net, &fences.polygons);
                     log("[manual] 沿道路按点位顺序串联；不要求经过策略必经点");
-                    crate::track::generate_road::build_road(
+                    crate::track::generate_road::build_road_tuned(
                         params.dist,
                         params.dur,
                         params.seed,
@@ -534,29 +554,32 @@ pub fn run_full_flow_cancellable(
                         &manual_pts,
                         &[],
                         &filtered,
+                        gps_spread_m,
                     )
                     .map_err(|e| format!("自定义点位路由失败：{e}；可留空路网退回按点位连线"))?
                 }
                 Err(e) => {
                     log(&format!("[manual] 无可用路网（{e}），退回按点位连线"));
-                    gen_track(
+                    gen_track_tuned(
                         params.dist,
                         params.dur,
                         params.seed,
                         (anchor.latitude, anchor.longitude),
                         start_ms,
                         &manual_pts,
+                        gps_spread_m,
                     )
                 }
             }
         }
-        RouteMode::Legacy => gen_track(
+        RouteMode::Legacy => gen_track_tuned(
             params.dist,
             params.dur,
             params.seed,
             (anchor.latitude, anchor.longitude),
             start_ms,
             &route_pts,
+            gps_spread_m,
         ),
         // 第 4 种模式：瓦片矢量化路网。与 Road 的唯一差别是「路网从哪来」——
         // 这里读本地瓦片缓存（`tile_road::load`），之后的裁剪/路由完全复用同一套。
@@ -587,7 +610,7 @@ pub fn run_full_flow_cancellable(
             } else {
                 "[tiles] 在瓦片路网里沿点位闭环重复补足距离"
             });
-            crate::track::generate_road::build_road(
+            crate::track::generate_road::build_road_tuned(
                 params.dist,
                 params.dur,
                 params.seed,
@@ -595,6 +618,7 @@ pub fn run_full_flow_cancellable(
                 &route_pts,
                 &route_pts,
                 &filtered,
+                gps_spread_m,
             )
             .map_err(|e| {
                 format!("瓦片路网路由失败：{e}；可在跑步页重新生成瓦片路网，或切回经典模式")

@@ -103,6 +103,51 @@ pub struct Config {
     /// 瓦片源额外请求头，形如 Referer: https://map.baidu.com/（每行一条）。
     #[serde(default)]
     pub tile_headers: String,
+    /// 地图底图源：`off`（默认，**绝不联网**）/ `amap`（高德栅格）/ `osm`（OSM XYZ）。
+    ///
+    /// 认不出的值（含老 config.json 里没有这个键）一律按 `off`：底图是纯显示层，
+    /// 用户没明确表态时不该有出网行为。
+    #[serde(default = "default_basemap")]
+    pub basemap: String,
+    /// 底图瓦片磁盘缓存上限（MiB）。0 视为 1；默认 100。
+    #[serde(default = "default_cache_limit_mb")]
+    pub map_cache_limit_mb: u32,
+    /// 轨迹 GPS 抖动幅度（单点稳态标准差，米），范围 0–20。**默认 0**。
+    ///
+    /// **0 = 沿用旧行为，而且两条生成路径的「旧行为」本身不同**（别把它们混成一句）：
+    /// - `Road` / `Tiles` / `Manual`（`generate_road.rs`）：每个 seed 在 **2.8–4.2 m
+    ///   之间自动抽样**，人人不同、每次不同；
+    /// - `Legacy` 经典模式（`generator.rs`）：**固定 σ=0.75**（AR(1) α=0.72，
+    ///   单点稳态 ≈1.08 m），改动前就是这样。
+    ///
+    /// 所以默认必须是 0：填 2.0 会把 Road 从「随机 2.8–4.2」压成固定 2.0、把 Legacy
+    /// 从 1.08 抬到 2.0，等于**静默改掉所有老用户的输出**，而且是全体同一个值。
+    ///
+    /// > 0 时才用用户值。代价要说清：那时是**同一幅度贯穿全程**（Road 也一样，
+    /// > 不再是每 seed 抽样），因此对「所有用户幅度都一样」这件事没有缓解作用 ——
+    /// > `generate_road.rs` 里那句「固定 σ 等于给每个人发同一枚指纹」的顾虑依然成立，
+    /// > 这一项是为「显式要求更小/更大抖动」的人准备的，不是隐私增强开关。
+    ///
+    /// 只影响轨迹里每个点的经纬度抖动幅度，不改变点位类型/时间轴/海拔/步频步幅，
+    /// 也不进任何协议字段。
+    #[serde(default = "default_gps_spread_m")]
+    pub gps_spread_m: f64,
+    /// 上传锚点的**计划级**随机偏移（米），范围 0–200。**默认 0 = 关闭**。
+    ///
+    /// - `0`：上传坐标 = 精确锚点，与 v0.7.0 **完全一致**（默认不改行为，
+    ///   要用自己开 —— 与 `basemap` 默认 `off`、`gps_spread_m` 默认 `0` 同一口径）；
+    /// - `>0`：每份新计划按随机方向偏移，幅度取 `0.8–1.2 ×` 该值
+    ///   （默认参考值 50 m ⇒ 约 40–60 m，见 ScienseRunner v1.0.10 的做法）。
+    ///
+    /// 风险要说清：偏移后点位集合可能更贴近围栏边缘，小校区下甚至可能被
+    /// `apply_fences` 裁成空图；所以它不是一个可以默认打开的开关。
+    ///
+    /// 只改点位请求里的 `latitude`/`longitude` 数值（以及与它们同源的 `runec` 输入串），
+    /// 设备身份里的锚点、围栏查询、界面显示全部保持精确值；也不新增任何请求字段。
+    /// 偏移由**计划的 seed** 派生：同一计划的预览与提交必然拿到同一份偏移，
+    /// 换一版（新 seed）才重抽 —— 逐请求漂移会让点位和围栏自相矛盾。
+    #[serde(default = "default_anchor_offset_m")]
+    pub anchor_offset_m: f64,
     /// 设备身份的**冗余备份**（identity.json 丢失/损坏时回填）。
     ///
     /// 只存恢复必需的最小字段：城市、锚点经纬度、device_id。
@@ -179,6 +224,42 @@ fn default_update_check() -> String {
     "silent".into()
 }
 
+/// GPS 抖动幅度上限（米）。
+pub const GPS_SPREAD_MAX_M: f64 = 20.0;
+/// 上传锚点偏移上限（米）。
+pub const ANCHOR_OFFSET_MAX_M: f64 = 200.0;
+
+fn default_gps_spread_m() -> f64 {
+    // 0 = 沿用旧行为（Road 自动 2.8–4.2 m 抽样；Legacy 固定 σ=0.75）。
+    // 不能默认非 0：那会静默改掉所有老用户的输出幅度。
+    0.0
+}
+fn default_anchor_offset_m() -> f64 {
+    // 0 = 精确锚点，与 v0.7.0 一致；非 0 才启用「按计划随机偏移上传锚点」。
+    // 不能默认非 0：那会让升级后的所有用户上传坐标整体挪开 40–60 m，
+    // 小校区围栏下还可能把点位裁空 —— 默认不改行为，要用自己开。
+    0.0
+}
+
+/// 米制参数归一：非有限值回落默认，其余钳在 0–max（负数一律当 0 = 关闭）。
+fn sanitize_meters(value: f64, max: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, max)
+    } else {
+        fallback
+    }
+}
+
+/// 底图默认关闭：首次启动不发任何瓦片请求。
+fn default_basemap() -> String {
+    "off".into()
+}
+
+/// 底图缓存上限默认 100 MiB。
+fn default_cache_limit_mb() -> u32 {
+    100
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -204,6 +285,10 @@ impl Default for Config {
             tile_url_template: String::new(),
             tile_allowed_hosts: String::new(),
             tile_headers: String::new(),
+            basemap: default_basemap(),
+            map_cache_limit_mb: default_cache_limit_mb(),
+            gps_spread_m: default_gps_spread_m(),
+            anchor_offset_m: default_anchor_offset_m(),
             identity_backup: None,
         }
     }
@@ -216,6 +301,18 @@ impl Config {
     /// 大小写/别名规则、最后「界面显示手动、登录却按自动跑」。
     pub fn resolved_captcha_mode(&self) -> crate::api::login::CaptchaMode {
         crate::api::login::CaptchaMode::parse(&self.captcha_mode)
+    }
+    /// 有效 GPS 抖动幅度（米）：越界钳到 0–20，0 表示沿用旧的自动区间。
+    pub fn resolved_gps_spread_m(&self) -> f64 {
+        sanitize_meters(self.gps_spread_m, GPS_SPREAD_MAX_M, default_gps_spread_m())
+    }
+    /// 有效上传锚点偏移（米）：越界钳到 0–200，0 表示精确锚点。
+    pub fn resolved_anchor_offset_m(&self) -> f64 {
+        sanitize_meters(
+            self.anchor_offset_m,
+            ANCHOR_OFFSET_MAX_M,
+            default_anchor_offset_m(),
+        )
     }
     /// 把配置里的瓦片源设置组成 `TileConfig`（默认 OSM）。
     ///
@@ -1661,5 +1758,97 @@ mod identity_backup_tests {
             Some("包头市"),
             "空城市不该把有用备份冲掉"
         );
+    }
+}
+
+#[cfg(test)]
+mod generation_knob_tests {
+    use super::*;
+
+    /// 旧 config.json（没有这两个键）必须照样能加载，并回落到默认值。
+    ///
+    /// 少了 `#[serde(default = …)]` 会让整份配置反序列化失败 —— 而
+    /// `load_config` 的兜底是「重置成默认值」，等于把用户账号/路网一起清了。
+    #[test]
+    fn old_config_without_the_new_knobs_still_loads_with_defaults() {
+        let old: Config =
+            serde_json::from_str(r#"{"username":"alice","route_mode":"road"}"#).unwrap();
+        assert_eq!(old.username, "alice");
+        // 两个默认值都必须是「不改行为」：0 = 沿用旧幅度 / 0 = 精确锚点。
+        // 一旦默认非 0，老用户升级后轨迹幅度或上传坐标会被静默改掉。
+        assert_eq!(old.gps_spread_m, 0.0, "默认抖动幅度必须是「沿用旧行为」");
+        assert_eq!(old.anchor_offset_m, 0.0, "默认锚点偏移必须是「精确锚点」");
+        assert_eq!(Config::default().gps_spread_m, 0.0);
+        assert_eq!(Config::default().anchor_offset_m, 0.0);
+    }
+
+    /// 默认值必须是**逐位**等于 v0.7.0 的上传坐标，而不是「差不多」。
+    ///
+    /// 直接拿默认配置喂给 `plan_anchor`：0 偏移必须原样返回精确锚点，
+    /// 这样「升级后提交载荷与 v0.7.0 一致」才有一行可执行的证明。
+    #[test]
+    fn default_anchor_offset_is_the_exact_anchor_bit_for_bit() {
+        let exact = crate::location::Coordinate::new(39.9042, 116.4074, 3.5).unwrap();
+        let offset = Config::default().resolved_anchor_offset_m();
+        assert_eq!(offset, 0.0, "默认必须关闭偏移");
+        for seed in [0u64, 7, 42, u64::MAX] {
+            let got = crate::location::plan_anchor(exact, offset, seed);
+            assert_eq!(
+                got.latitude.to_bits(),
+                exact.latitude.to_bits(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                got.longitude.to_bits(),
+                exact.longitude.to_bits(),
+                "seed {seed}"
+            );
+            assert_eq!(got.accuracy.to_bits(), exact.accuracy.to_bits());
+        }
+    }
+
+    #[test]
+    fn knob_ranges_are_clamped_and_non_finite_values_fall_back() {
+        let mut config = Config::default();
+        config.gps_spread_m = 999.0;
+        assert_eq!(config.resolved_gps_spread_m(), GPS_SPREAD_MAX_M);
+        config.gps_spread_m = -3.0;
+        assert_eq!(config.resolved_gps_spread_m(), 0.0, "负数视为关闭");
+        config.gps_spread_m = f64::NAN;
+        assert_eq!(
+            config.resolved_gps_spread_m(),
+            0.0,
+            "NaN 回落默认（= 旧行为）"
+        );
+        config.gps_spread_m = 7.5;
+        assert_eq!(config.resolved_gps_spread_m(), 7.5);
+
+        config.anchor_offset_m = 5000.0;
+        assert_eq!(config.resolved_anchor_offset_m(), ANCHOR_OFFSET_MAX_M);
+        config.anchor_offset_m = -1.0;
+        assert_eq!(config.resolved_anchor_offset_m(), 0.0, "0 = 精确锚点");
+        config.anchor_offset_m = f64::INFINITY;
+        assert_eq!(
+            config.resolved_anchor_offset_m(),
+            0.0,
+            "NaN/∞ 回落默认（= 关闭）"
+        );
+        config.anchor_offset_m = 0.0;
+        assert_eq!(config.resolved_anchor_offset_m(), 0.0);
+        // 显式开启后按值生效（50 m 是参考值，不是默认值）。
+        config.anchor_offset_m = 50.0;
+        assert_eq!(config.resolved_anchor_offset_m(), 50.0);
+    }
+
+    /// 两个新键只落在 config.json 里；名字稳定（用户可手改），且不与旧键冲突。
+    #[test]
+    fn new_knobs_are_plain_config_keys() {
+        let json = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(json["gps_spread_m"], 0.0);
+        assert_eq!(json["anchor_offset_m"], 0.0);
+        // 它们不是任何请求参数结构的一部分：提交参数（RunParams）里没有这两个名字。
+        let config_text = json.to_string();
+        assert!(config_text.contains("gps_spread_m"));
+        assert!(config_text.contains("anchor_offset_m"));
     }
 }
