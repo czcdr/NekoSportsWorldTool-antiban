@@ -569,7 +569,16 @@ pub fn run_full_flow_cancellable(
     // 不改这一条，报文里就是「selDistance = 学校门槛 / totalDis = 更短 / complete = true」
     // 三件互相矛盾的事实（默认距离区间 1.0–1.5 km 撞上 2000 m 门槛，每跑一次矛盾一次）。
     // 学校门槛是校方规则，工具不下调它来凑达标；提前拦住也省得白跑一次还吃一次风控计数。
-    reject_below_min_distance(params.dist, pol.min_distance)?;
+    // 复审 R1：`reject_below_min_distance` 在这里就 `return Err`，而 `warnings` 要到
+    // 579 行才建 —— 默认区间撞门槛的**那条最该被看见的路径**上，`pending_floor_warning`
+    // 永远进不了 warnings（注释曾写着「并入 warnings」，与实际行为不符）。
+    // 所以把两者拼进同一条错误：既保住拒绝，也不让解释只停在日志里。
+    if let Err(e) = reject_below_min_distance(params.dist, pol.min_distance) {
+        return Err(match &pending_floor_warning {
+            Some(warning) => format!("{e}\n{warning}"),
+            None => e,
+        });
+    }
     // 人脸核验：服务端要不要，本工具都**不执行**核验。这里只把事实摆出来 ——
     // 让「这条记录可能被判无效」在跑之前就可见，而不是等详情页异常才发现。
     //
@@ -1114,8 +1123,8 @@ mod verification_tests {
 
     /// N4：形态度量的标定 —— 圆环 vs 瘦长三角环，短长轴比要拉开一个数量级。
     ///
-    /// 这两个数字就是 `THIN_SHAPE_AXIS_RATIO = 0.40` 的依据：形状正常的环在 0.9 以上，
-    /// 真实被封样本那类「三点近似共线」的瘦长三角环在 0.25 以下。
+    /// 这两个数字就是 `THIN_SHAPE_AXIS_RATIO = 0.45` 的依据：形状正常的环在 0.9 以上，
+    /// 2:1 跑道环 0.57、3:1 环 0.35，真实被封样本那类「三点近似共线」的瘦长三角环在 0.01 附近。
     #[test]
     fn shape_axis_ratio_separates_thin_triangle_from_round_ring() {
         let round: Vec<(f64, f64)> = crate::track::generator::build(

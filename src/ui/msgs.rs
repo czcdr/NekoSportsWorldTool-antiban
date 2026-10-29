@@ -3,8 +3,8 @@
 use super::about::FinishAction;
 use super::{
     captcha, recover_panel, App, PopupInfo, AI_DETAIL, AI_DONE, AI_LIST, AI_RECORDS, CHEAT, IP,
-    LOGIN_DONE, POINTS_DONE, RANK, RECORDS, RECOVER, RECOVER_FIX, RUN_DETAIL, RUN_DONE, SEMESTER,
-    UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
+    LOGIN_DONE, POINTS_DONE, RANK, RECORDS, RECORD_BADGES, RECOVER, RECOVER_FIX, RUN_DETAIL,
+    RUN_DONE, SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
 };
 use crate::api::model;
 use chrono::TimeZone;
@@ -20,6 +20,8 @@ impl App {
         self.ai_busy = self.ai_submit_active;
         self.records_page.detail_loading = false;
         self.records_page.ai_detail_loading = false;
+        // 会话没了：徽标缓存和取消把手都是上一个 token 的产物，一起收掉。
+        self.records_page.badges.clear();
         self.data_page.cheat = None;
         self.data_page.cheat_checking = false;
         self.data_page.cheat_error = Some("登录已失效，请重新登录后检查".into());
@@ -95,6 +97,8 @@ impl App {
         let mut ai_records_json = None;
         let mut ai_detail_raw = None;
         let mut detail_raw = None;
+        // 徽标回填是「一条消息一条结果」：同一帧可能到好几条，必须逐条应用，不能只留最后一条。
+        let mut badge_json: Vec<serde_json::Value> = Vec::new();
         let mut recover_json = None;
         let mut recover_fix_json = None;
         let mut update_chk = None;
@@ -166,6 +170,10 @@ impl App {
                     {
                         detail_raw = Some(raw);
                     }
+                }
+            } else if let Some(v) = msg.strip_prefix(RECORD_BADGES) {
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(v) {
+                    badge_json.push(raw);
                 }
             } else if let Some(v) = msg.strip_prefix(AI_DETAIL) {
                 if let Ok(raw) = serde_json::from_str::<serde_json::Value>(v) {
@@ -602,6 +610,13 @@ impl App {
         if let Some(raw) = detail_raw {
             self.records_page.detail_raw = Some(raw);
             self.records_page.detail_loading = false;
+        }
+        // 徽标回填结果：只写徽标状态，**不碰列表数据**（失败也只是没徽标）。
+        if !badge_json.is_empty() {
+            let now_ms = crate::crypto::envelope::now_ms();
+            for raw in badge_json {
+                self.records_page.badges.apply(&raw, now_ms);
+            }
         }
         if let Some(v) = update_chk {
             self.update.checking = false;

@@ -104,11 +104,67 @@ pub struct RunDetail {
     pub start_time: i64,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+/// `reasonList` 的一项：服务端给的一条判定。
+///
+/// # 为什么多留两个「结构」字段
+/// 用户要的区分是「规则没过（未达标）」和「规则全过但被另外标记（异常）」。实测
+/// v70260 的条目只有 `reason` + `complete`，但那只是**当前版本**的形态；有的版本/
+/// 有的条目会带规则标识（`ruleId` / `rule` / `type` …）。所以解析阶段把这类字段
+/// **原样留下**，让 `ui::record_status` 能先按结构判断，结构确实没有区分时再退回
+/// 文案匹配（见那里的注释）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasonItem {
+    #[serde(default)]
     pub reason: String,
+    #[serde(default)]
     pub complete: bool,
+    /// 规则标识：来自 `ruleId` / `rule` / `ruleCode` / `ruleKey`（取第一个非空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// 条目类型：来自 `type` / `kind` / `category`（取第一个非空）。
+    ///
+    /// 序列化名是 `kindHint` —— 它既可能是服务端原始 `type` 的值，也可能是本结构
+    /// 归一化后的结果；两种形态 `from_json` 都认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_hint: Option<String>,
+}
+
+impl ReasonItem {
+    /// 解析一条判定（`reasonList` 的一项）。
+    ///
+    /// 只读字段，不解释语义：`reason` / `complete` 是展示与「通过与否」的依据，
+    /// 结构键只用来区分「规则项」与「非规则项」。
+    pub fn from_json(r: &Value) -> Self {
+        let text = |k: &str| -> Option<String> {
+            match r.get(k) {
+                Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                Some(Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            }
+        };
+        Self {
+            reason: r
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
+            rule_id: ["ruleId", "rule", "ruleCode", "ruleKey"]
+                .into_iter()
+                .find_map(text),
+            kind_hint: ["kindHint", "type", "kind", "category"]
+                .into_iter()
+                .find_map(text),
+        }
+    }
+
+    /// 解析整个 `reasonList`；缺失/不是数组一律按空列表（调用方不需要再包一层 match）。
+    pub fn from_list(v: Option<&Value>) -> Vec<Self> {
+        v.and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(ReasonItem::from_json).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// 拉取单条详情并解析为结构体。
@@ -119,22 +175,7 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
             return Err("详情返回的记录编号与请求不一致，请刷新重试".into());
         }
     }
-    let reasons: Vec<ReasonItem> = raw
-        .get("reasonList")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|r| ReasonItem {
-                    reason: r
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .into(),
-                    complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let reasons = ReasonItem::from_list(raw.get("reasonList"));
     Ok(RunDetail {
         rrid,
         uuid: raw
@@ -190,6 +231,7 @@ mod tests {
             reason_list: vec![ReasonItem {
                 reason: "里程达标".into(),
                 complete: true,
+                ..Default::default()
             }],
             start_time: 1_700_000_000_000,
             ..Default::default()
@@ -207,5 +249,46 @@ mod tests {
             assert!(v.get(key).is_some(), "缺少键 {key}");
         }
         assert!(v.get("total_dis").is_none());
+    }
+
+    /// 实测形态（只有 reason + complete）：结构字段为 None，交给上层按文案兜底。
+    #[test]
+    fn reason_item_keeps_absent_structure_keys_absent() {
+        let item = ReasonItem::from_json(&serde_json::json!({
+            "reason": "运动数据有问题",
+            "complete": false
+        }));
+        assert_eq!(item.reason, "运动数据有问题");
+        assert!(!item.complete);
+        assert!(item.rule_id.is_none());
+        assert!(item.kind_hint.is_none());
+    }
+
+    /// 结构键原样保留，且序列化后（详情回传 UI 的形态）不丢。
+    #[test]
+    fn reason_item_preserves_rule_id_and_kind_hint() {
+        let item = ReasonItem::from_json(&serde_json::json!({
+            "reason": "step_freq 40-300",
+            "complete": true,
+            "ruleId": "step_freq",
+            "type": "rule"
+        }));
+        assert_eq!(item.rule_id.as_deref(), Some("step_freq"));
+        assert_eq!(item.kind_hint.as_deref(), Some("rule"));
+        let round_trip: ReasonItem =
+            serde_json::from_value(serde_json::to_value(&item).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_trip.rule_id, item.rule_id);
+        assert_eq!(round_trip.kind_hint, item.kind_hint);
+    }
+
+    /// 字段缺失不 panic：reasonList 不是数组 / 项里没有 reason。
+    #[test]
+    fn reason_list_tolerates_missing_fields() {
+        assert!(ReasonItem::from_list(None).is_empty());
+        assert!(ReasonItem::from_list(Some(&serde_json::json!("oops"))).is_empty());
+        let list = ReasonItem::from_list(Some(&serde_json::json!([{"complete": true}])));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].reason, "");
     }
 }

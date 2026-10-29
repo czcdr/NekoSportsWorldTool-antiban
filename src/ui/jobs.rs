@@ -1,8 +1,8 @@
 //! 后台任务与消息处理：IP 获取 / 登录 / 刷新 / 消息协议分发。
 
 use super::{
-    App, AI_DETAIL, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE, RANK, RECORDS, RUN_DETAIL,
-    SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
+    App, AI_DETAIL, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE, RANK, RECORDS, RECORD_BADGES,
+    RUN_DETAIL, SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
 };
 use crate::api::login::CaptchaMode;
 use crate::update::ReleaseInfo;
@@ -720,6 +720,75 @@ impl App {
                     tx.send(format!("{RUN_DETAIL}{payload}")).ok();
                 }
             }
+        });
+    }
+
+    /// 记录列表的徽标回填：只在「列表已在、不忙、没有在飞任务」时起一轮。
+    ///
+    /// 这里只做决定，不做网络；真正发请求的是 [`Self::start_record_badges`] 起的后台线程。
+    /// 上限/间隔/缓存全部在 `record_badges` 里，调用点不许自己另设一套。
+    pub fn ensure_record_badges(&mut self) {
+        if self.records_page.rows.is_empty()
+            || self.session.is_none()
+            || self.records_busy
+            || self.records_page.badges.in_flight()
+        {
+            return;
+        }
+        let now_ms = crate::crypto::envelope::now_ms();
+        // 列表换代后顺手清掉不再展示的缓存条目（还在列表里的条目不重拉）。
+        self.records_page.badges.retain(&self.records_page.rows);
+        let targets =
+            super::record_badges::plan(&self.records_page.rows, &self.records_page.badges, now_ms);
+        if targets.is_empty() {
+            return;
+        }
+        self.start_record_badges(targets);
+    }
+
+    /// 起一轮徽标回填：串行、1 条/秒、可取消（实现在 `record_badges::run_backfill`）。
+    fn start_record_badges(&mut self, targets: Vec<i64>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let identity = self.identity.clone();
+        let control = std::sync::Arc::new(crate::task_control::Control::default());
+        let generation = self.records_page.badges.begin(control.clone());
+        let mut pacer = super::record_badges::BadgePacer::new(targets);
+        #[cfg(test)]
+        let badge_test_host = self.route_fixture.as_ref().map(|(host, _)| host.clone());
+        self.spawn_session_job(move |tx| {
+            let mut client = tx.client(identity, Some(session));
+            #[cfg(test)]
+            if let Some(host) = badge_test_host {
+                client.set_test_host(host);
+            }
+            let mut log = App::logger(tx.clone());
+            let report = {
+                let mut send = |outcome: super::record_badges::BadgeOutcome| {
+                    tx.send(format!("{RECORD_BADGES}{}", outcome.to_json(generation)))
+                        .ok();
+                };
+                super::record_badges::run_backfill(
+                    &mut pacer,
+                    &control,
+                    || crate::crypto::envelope::now_ms(),
+                    |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+                    |rrid| crate::api::records::fetch_detail(&mut client, rrid),
+                    &mut send,
+                )
+            };
+            log(&format!(
+                "[badge] 列表徽标回填：{} 条成功 / {} 条失败{}（只读，串行 1 条/秒）",
+                report.fetched,
+                report.failed,
+                if report.cancelled { "，已取消" } else { "" }
+            ));
+            tx.send(format!(
+                "{RECORD_BADGES}{}",
+                serde_json::json!({ "generation": generation, "done": true })
+            ))
+            .ok();
         });
     }
 

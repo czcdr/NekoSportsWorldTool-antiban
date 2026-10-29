@@ -1,9 +1,14 @@
 //! 运动记录页：跑步 / AI 两个分栏，egui_extras 表格。
 
+use super::record_badges::BadgeState;
+use super::record_status::RecordStatus;
 use super::{mobile, theme, App};
 use chrono::TimeZone;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+
+/// 记录页在标签栏里的位置（`draw_shell` 的 match 与「离开页面即取消回填」共用）。
+pub const RECORDS_TAB: usize = 2;
 
 #[derive(Default)]
 pub struct RecordsPage {
@@ -15,6 +20,8 @@ pub struct RecordsPage {
     pub detail_rrid: Option<i64>,
     pub detail_raw: Option<serde_json::Value>,
     pub detail_loading: bool,
+    /// 列表徽标：最近 5 条的三态判定（限速 + 缓存 + 可取消，见 `record_badges`）。
+    pub badges: BadgeState,
     /// AI 详情页当前记录
     pub ai_detail_id: Option<i64>,
     pub ai_detail_raw: Option<serde_json::Value>,
@@ -58,6 +65,27 @@ impl App {
             }
         });
         ui.separator();
+
+        // 徽标回填的弱提示：只在跑的时候出现，不占位、不闪烁。
+        // 「正在核对」不等于「列表还在加载」：列表数据始终是已经拿到的那份。
+        if self.records_page.sub == 0 {
+            if self.records_page.badges.pending() {
+                ui.label(
+                    egui::RichText::new("正在核对最近 5 条判定（只读，1 条/秒，串行）…")
+                        .small()
+                        .color(theme::text_dim()),
+                );
+            }
+            if let Some(error) = self.records_page.badges.error() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "判定没全部取到（只影响徽标，不影响列表）：{error}"
+                    ))
+                    .small()
+                    .color(theme::warn()),
+                );
+            }
+        }
 
         match self.records_page.sub {
             0 => self.draw_run_view(ui),
@@ -156,6 +184,10 @@ impl App {
             ui.centered_and_justified(|ui| ui.label("暂无跑步记录"));
             return;
         }
+        // 列表已经在了，先按需补徽标（限速 + 缓存都在 record_badges 里）。
+        self.ensure_record_badges();
+        let now_ms = crate::crypto::envelope::now_ms();
+        let badges = &self.records_page.badges;
         let fmt_time = |ms: i64| -> String {
             chrono::Local
                 .timestamp_millis_opt(ms)
@@ -191,12 +223,12 @@ impl App {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             mobile::row(ui, |ui| {
                                 ui.strong(fmt_time(r.start_time));
-                                if r.complete {
-                                    ui.colored_label(theme::ok(), "达标");
-                                } else {
-                                    ui.colored_label(theme::err(), "未达标");
-                                }
+                                draw_run_badge_word(ui, r, badges, now_ms);
                             });
+                            // 「通过但异常」必须能自解释：规则都达标了，凭什么标红。
+                            if let Some(explain) = badge_explanation(r, badges, now_ms) {
+                                ui.label(egui::RichText::new(explain).small().color(theme::err()));
+                            }
                             ui.label(format!(
                                 "{:.2} km · {} · 配速 {pace_min}:{pace_sec:02}/km",
                                 r.total_dis / 1000.0,
@@ -271,11 +303,7 @@ impl App {
                             ui.monospace(format!("{} spm", r.avg_step_freq));
                         });
                         row.col(|ui| {
-                            if r.complete {
-                                ui.colored_label(theme::ok(), "达标");
-                            } else {
-                                ui.colored_label(theme::err(), "未达标");
-                            }
+                            draw_run_badge_word(ui, r, badges, now_ms);
                         });
                         row.col(|ui| {
                             ui.monospace(rrid.to_string());
@@ -580,7 +608,124 @@ fn draw_ai_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
     }
 }
 
+/// 详情页内容：**先给结论**（三态 + 异常项置顶），再给全量字段。
+///
+/// 顺序是有意的：手机上详情页内容比一屏长，字段区永远要先滚。结论与「通过但异常」
+/// 那一行必须落在第一屏 —— 它就是这个页面存在的理由（见 `ui::record_status` 模块注释）。
 fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
+    draw_detail_verdict(ui, raw);
+    ui.add_space(6.0);
+    draw_detail_fields(ui, raw);
+}
+
+/// 三态结论 + 判定明细（非规则项置顶标红，规则项随后）。
+fn draw_detail_verdict(ui: &mut egui::Ui, raw: &serde_json::Value) {
+    use super::record_status::{self, ReasonKind, RecordStatus};
+
+    let reasons = record_status::reasons_of(raw);
+    // 没有判定信息（拉详情失败时只有 statusInfo 的空壳）：不猜状态，字段区会显示原始错误。
+    let Some(status) = record_status::classify_detail(raw) else {
+        return;
+    };
+    let anomalies = record_status::anomaly_reasons(&reasons);
+    let unclassified = record_status::unclassified_count(&reasons);
+
+    // ── 顶部一行结论 ────────────────────────────────────────────
+    // 只有「规则全过仍被标记」才标红；「未达标」是规则层结论，用普通字色，不标红。
+    let color = if status.is_anomalous() {
+        theme::err()
+    } else if status == RecordStatus::Passed {
+        theme::ok()
+    } else {
+        theme::text()
+    };
+    let size = if status.is_anomalous() { 18.0 } else { 15.0 };
+    let (note, note_color) = match status {
+        RecordStatus::Passed => (
+            "规则项全部通过，服务端没有额外标记".to_string(),
+            theme::text_dim(),
+        ),
+        RecordStatus::Failed => {
+            if anomalies.is_empty() {
+                (
+                    "规则没过（下方 × 项）：这是规则层结论，不是风控标记".to_string(),
+                    theme::text_dim(),
+                )
+            } else {
+                (
+                    format!(
+                        "规则没过，但另有 {} 项非规则标记（下方红色条目）：规则层结论不是风控信号，红条目才是",
+                        anomalies.len()
+                    ),
+                    theme::warn(),
+                )
+            }
+        }
+        RecordStatus::PassedButAnomalous => (
+            format!(
+                "规则项全部达标，但服务端另外标记了 {} 项 —— 这是风控信号，不是「未达标」",
+                anomalies.len()
+            ),
+            theme::err(),
+        ),
+    };
+    mobile::row(ui, |ui| {
+        ui.colored_label(
+            color,
+            egui::RichText::new(status.label()).strong().size(size),
+        );
+        ui.label(egui::RichText::new(note).color(note_color));
+    });
+
+    // ── 判定明细 ────────────────────────────────────────────────
+    if reasons.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("判定明细")
+            .strong()
+            .color(theme::text()),
+    );
+    for item in record_status::sorted_for_display(&reasons) {
+        let kind = record_status::item_kind(&item);
+        mobile::row(ui, |ui| {
+            match kind {
+                // 非规则项：规则全过也可能出现的那一行，红色 + 图标 + 「异常」标签。
+                ReasonKind::NonRule => {
+                    ui.colored_label(theme::err(), if item.complete { "√" } else { "×" });
+                    ui.colored_label(theme::err(), egui::RichText::new("异常").small().strong());
+                    ui.colored_label(theme::err(), egui::RichText::new(&item.reason).strong());
+                }
+                ReasonKind::Rule => {
+                    if item.complete {
+                        ui.colored_label(theme::ok(), "√");
+                    } else {
+                        ui.colored_label(theme::err(), "×");
+                    }
+                    ui.label(&item.reason);
+                }
+                // 认不出的条目不冒充规则项，也不冒充异常：如实标出来。
+                ReasonKind::Unclassified => {
+                    ui.colored_label(theme::text_dim(), "？");
+                    ui.label(egui::RichText::new(&item.reason).color(theme::text_dim()));
+                }
+            }
+        });
+    }
+    if unclassified > 0 {
+        ui.label(
+            egui::RichText::new(format!(
+                "其中 {unclassified} 项无法归类，按原样列出（不作为异常）"
+            ))
+            .small()
+            .color(theme::text_dim()),
+        );
+    }
+}
+
+/// 详情字段（距离 / 时长 / … 与服务端原始状态文案）。
+fn draw_detail_fields(ui: &mut egui::Ui, raw: &serde_json::Value) {
     let g = |k: &str| -> String {
         match raw.get(k) {
             Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
@@ -657,26 +802,60 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
                 }
             });
     }
+}
 
-    // 达标判定
-    if let Some(list) = raw.get("reasonList").and_then(|x| x.as_array()) {
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("达标判定")
-                .strong()
-                .color(theme::text()),
-        );
-        for r in list {
-            let ok = r.get("complete").and_then(|x| x.as_bool()).unwrap_or(false);
-            let reason = r.get("reason").and_then(|x| x.as_str()).unwrap_or("");
-            mobile::row(ui, |ui| {
-                if ok {
-                    ui.colored_label(theme::ok(), "√");
-                } else {
-                    ui.colored_label(theme::err(), "×");
-                }
-                ui.label(reason);
-            });
+/// 一行列表的结论：以详情确认过的徽标为准；还没核到时退回列表自带的 `complete`。
+///
+/// 为什么不只看 `row.complete`：真实那条被判可疑的记录在列表里也是「通过」，
+/// 只看这一个字段永远看不见风控标记。
+fn badge_status(
+    row: &crate::api::records::RecordRow,
+    badges: &BadgeState,
+    now_ms: i64,
+) -> RecordStatus {
+    badges.status_of(row.rrid, now_ms).unwrap_or({
+        if row.complete {
+            RecordStatus::Passed
+        } else {
+            RecordStatus::Failed
+        }
+    })
+}
+
+/// 徽标短词：只有「通过但异常」标红。
+///
+/// 「未达标」用中性色 —— 规则没过是用户能看懂、也能改的结论，把红色留给风控信号，
+/// 红色才有含义（与详情页同一口径，见 `record_status`）。
+fn draw_run_badge_word(
+    ui: &mut egui::Ui,
+    row: &crate::api::records::RecordRow,
+    badges: &BadgeState,
+    now_ms: i64,
+) {
+    match badge_status(row, badges, now_ms) {
+        RecordStatus::PassedButAnomalous => {
+            ui.colored_label(theme::err(), egui::RichText::new("异常").strong());
+        }
+        RecordStatus::Passed => {
+            ui.colored_label(theme::ok(), "达标");
+        }
+        RecordStatus::Failed => {
+            ui.label(egui::RichText::new("未达标").color(theme::text_dim()));
         }
     }
+}
+
+/// 「通过但异常」的自解释文案（其它状态返回 `None`）。
+fn badge_explanation(
+    row: &crate::api::records::RecordRow,
+    badges: &BadgeState,
+    now_ms: i64,
+) -> Option<String> {
+    if badge_status(row, badges, now_ms) != RecordStatus::PassedButAnomalous {
+        return None;
+    }
+    let reason = badges
+        .anomaly_of(row.rrid, now_ms)
+        .unwrap_or("运动数据被判有问题");
+    Some(format!("规则已达标，但{reason}（风控标记，不是未达标）"))
 }

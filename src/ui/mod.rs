@@ -21,6 +21,10 @@ pub mod mobile;
 pub mod msgs;
 pub mod osm;
 mod preview_jobs;
+/// 列表徽标回填（最近 5 条 / 1 条每秒 / 5 分钟缓存）。
+pub mod record_badges;
+/// 记录三态判定（达标 / 未达标 / 通过但异常）：详情页与列表徽标共用。
+pub mod record_status;
 pub mod records;
 pub mod recover_panel;
 mod road_tools;
@@ -48,6 +52,8 @@ pub const RANK: &str = "__RANK__";
 pub const USER: &str = "__USER__";
 pub const AI_RECORDS: &str = "__AI_RECORDS__";
 pub const RUN_DETAIL: &str = "__RUN_DETAIL__";
+/// 列表徽标回填的一条结果（`record_badges::BadgeOutcome` 的 JSON）。
+pub const RECORD_BADGES: &str = "__RECORD_BADGE__";
 pub const UPDATE_CHK: &str = "__UPDATE_CHK__";
 pub const UPDATE_PROG: &str = "__UPDATE_PROG__";
 pub const UPDATE_DONE: &str = "__UPDATE_DONE__";
@@ -414,7 +420,7 @@ impl App {
             match self.tab {
                 0 => self.draw_run(ui),
                 1 => self.draw_ai(ui),
-                2 => self.draw_records(ui),
+                records::RECORDS_TAB => self.draw_records(ui),
                 3 => self.draw_data(ui),
                 4 => self.draw_user(ui),
                 5 => self.draw_device(ui),
@@ -426,6 +432,12 @@ impl App {
                 _ => self.draw_about(ui),
             }
         });
+
+        // 离开记录页就把徽标回填停掉：这不是「刷新」，是在读会计数的详情接口。
+        // 放在这一层是因为切页不经过记录页自己的代码，只有 shell 知道用户走没走。
+        if self.tab != records::RECORDS_TAB && self.records_page.badges.in_flight() {
+            self.records_page.badges.cancel();
+        }
     }
 }
 
@@ -628,6 +640,9 @@ impl App {
         self.data_page.cheat = None;
         self.data_page.cheat_error = None;
         self.data_page.cheat_checking = false;
+        // 徽标回填也是「拿着旧 token 的只读任务」：换会话/登出时连缓存一起收掉，
+        // 否则新账号会看到上一个会话留下的徽标。
+        self.records_page.badges.clear();
         self.session_epoch = self.session_epoch.wrapping_add(1);
         self.auth_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
     }

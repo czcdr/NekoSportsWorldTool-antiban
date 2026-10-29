@@ -217,6 +217,47 @@ fn receipt_records_the_actual_distance_not_the_school_threshold() {
     );
 }
 
+/// N1 的**调用点**回归锁。
+///
+/// 复审 R2 指出：上一条只测 `receipt_target_distance()` 这个辅助函数本身，
+/// 如果 `submit.rs` 的调用点被改回 `p.min_distance`，那条测试仍然会绿。
+/// 所以这里直接读**落盘的回执**，断言写进去的是实跑距离而不是学校门槛。
+#[test]
+fn receipt_file_on_disk_records_the_run_distance_not_the_threshold() {
+    let _fixture = Fixture::new();
+    let (host, task) = server(vec![Reply::Record(
+        json!({"error":10000,"data":{"rrid":42}}),
+    )]);
+    let mut p = params();
+    p.min_distance = 2000;
+    let run_m = p.track.totalDistance;
+    assert!(
+        (run_m - p.min_distance as f64).abs() > 100.0,
+        "夹具必须让实跑与门槛明显不同，否则区分不了：run={run_m} min={}",
+        p.min_distance
+    );
+    assert!(submit_record(&mut client(&host), &p, &mut |_| {}).is_ok());
+    task.join().unwrap();
+
+    let dir = crate::platform::data_dir().join("submission_receipts");
+    let entry = std::fs::read_dir(&dir)
+        .expect("回执目录应存在")
+        .next()
+        .expect("应写出回执")
+        .unwrap();
+    let text = std::fs::read_to_string(entry.path()).unwrap();
+    let first = text.lines().next().expect("回执至少一行");
+    let expected = run_m.round() as i64;
+    assert!(
+        first.contains(&format!("\"target_dist\":{expected}")),
+        "回执应记实跑距离 {expected}：{first}"
+    );
+    assert!(
+        !first.contains("\"target_dist\":2000"),
+        "回执不得记学校门槛 2000（N1 回归）：{first}"
+    );
+}
+
 #[test]
 fn ios_identity_is_rejected_before_any_request_or_receipt() {
     let _fixture = Fixture::new();
