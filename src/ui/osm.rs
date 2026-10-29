@@ -6,7 +6,7 @@ use std::sync::Arc;
 use route_planner::{Coord, RoadGraph};
 
 use super::map::{collect_bounds, MapState};
-use super::{theme, App};
+use super::{mobile, theme, App};
 
 #[derive(Clone)]
 pub struct NetworkLoad {
@@ -34,6 +34,10 @@ pub struct OsmPage {
     pub path: String,
     pub busy: bool,
     pub status: String,
+    /// 上一次获取失败/被取消：主按钮改叫「重试获取路网」（纯 UI 状态，A7）。
+    pub retry_available: bool,
+    /// 「强制重新下载」勾选：下一次「自动获取学校路网」忽略缓存（A7）。
+    pub force_reload: bool,
     pub map: MapState,
     /// 瓦片底图（显示层，默认关闭；与 `map` 相互独立）
     pub tiles: super::tiles::TileLayer,
@@ -55,6 +59,8 @@ impl Default for OsmPage {
             path: String::new(),
             busy: false,
             status: String::new(),
+            retry_available: false,
+            force_reload: false,
             map: MapState::default(),
             tiles: super::tiles::TileLayer::default(),
             fitted: false,
@@ -114,26 +120,54 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("请先登录并配置定位锚点");
         ui.label(format!("当前学校：{school}"));
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(!self.osm_page.busy, theme::primary_btn("自动获取学校路网"))
-                .clicked()
-            {
-                self.use_school_roads(false);
-            }
-            if ui
-                .add_enabled(
-                    !self.osm_page.busy && self.config.osm_path.is_empty(),
-                    egui::Button::new("重新下载路网"),
-                )
-                .clicked()
-            {
-                self.use_school_roads(true);
-            }
-            ui.label(if self.config.osm_path.is_empty() {
-                "当前：按学校自动获取"
-            } else {
-                "当前：手动文件"
+        // A7：原来「自动获取 / 重新下载 / 取消 / 重试」是两行四个按钮。现在收成
+        // 一个按状态变名的主按钮 + 一个「强制重新下载」开关（同一行），
+        // 取消、重试、强制三种行为逐一保留（见 review/UI-IMPL.md）。
+        let busy = self.osm_page.busy;
+        let retry = self.osm_page.retry_available && !busy;
+        let can_force = self.config.osm_path.is_empty();
+        let school_label = if busy {
+            "取消获取路网"
+        } else if retry {
+            "重试获取路网"
+        } else {
+            "自动获取学校路网"
+        };
+        mobile::action_row(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // 开关始终渲染（不可用时置灰）：隐藏会让「到底有没有这个开关」变成猜谜。
+                // 用 toggle_value 而不是 checkbox：同样的布尔语义，但可点区域更大、
+                // 文字不会被折成两段（窄屏上仍能按完整文案定位到）。
+                if !busy {
+                    ui.add_enabled_ui(can_force, |ui| {
+                        ui.toggle_value(&mut self.osm_page.force_reload, "强制重新下载");
+                    });
+                }
+                if ui.add(theme::primary_btn(school_label)).clicked() {
+                    if busy {
+                        self.osm_page.cancel.cancel();
+                        self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
+                        self.osm_page.busy = false;
+                        self.osm_page.retry_available = true;
+                        self.osm_page.status =
+                            "已取消接收结果；已发出的网络请求可能仍会运行到结束或超时".into();
+                    } else if retry {
+                        if self.config.osm_path.is_empty() {
+                            self.refresh_school_route(false);
+                        } else {
+                            self.load_osm_async(self.osm_page.path.clone());
+                        }
+                    } else {
+                        // 勾了「强制重新下载」就忽略缓存，否则沿用既有缓存优先策略。
+                        let force = std::mem::take(&mut self.osm_page.force_reload);
+                        self.use_school_roads(force);
+                    }
+                }
+                ui.label(if self.config.osm_path.is_empty() {
+                    "当前：按学校自动获取"
+                } else {
+                    "当前：手动文件"
+                });
             });
         });
         ui.hyperlink_to(
@@ -190,22 +224,7 @@ impl App {
             }
         });
 
-        ui.horizontal_wrapped(|ui| {
-            if self.osm_page.busy && ui.button("取消获取路网").clicked() {
-                self.osm_page.cancel.cancel();
-                self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
-                self.osm_page.busy = false;
-                self.osm_page.status =
-                    "已取消接收结果；已发出的网络请求可能仍会运行到结束或超时".into();
-            }
-            if !self.osm_page.busy && ui.button("重试获取路网").clicked() {
-                if self.config.osm_path.is_empty() {
-                    self.refresh_school_route(false);
-                } else {
-                    self.load_osm_async(self.osm_page.path.clone());
-                }
-            }
-        });
+        // 取消 / 重试已并入上面的主按钮（按状态变名），这里不再单列一行。
         self.draw_road_tools(ui);
 
         // 拖拽导入
@@ -392,6 +411,7 @@ impl App {
         self.run_page.preview_inputs = None;
         self.run_page.preview_stale = true;
         self.osm_page.busy = true;
+        self.osm_page.retry_available = false;
         self.osm_page.offline = false;
         self.run_page.check = None;
         self.osm_page.request_id

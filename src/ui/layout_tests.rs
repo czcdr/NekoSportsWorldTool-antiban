@@ -1,6 +1,8 @@
 use super::*;
 use egui::{Event, PointerButton, Pos2, Rect, Vec2};
 
+#[path = "recover_tests.rs"]
+mod recover_tests;
 #[path = "route_refresh_tests.rs"]
 mod route_refresh_tests;
 #[path = "violation_tests.rs"]
@@ -123,13 +125,50 @@ fn short_phone_data_page_can_scroll_and_operate_controls() {
             .expect("refresh must be visible below the compact top bar");
         click(&mut app, &ctx, w, h, refresh);
         assert_eq!(app.status, "请先登录"); // Reached the real handler without a network request.
+                                            // A6：违规自查默认收起，先点开标题，再操作里面的「查看列表」。
+        let cheat_header = scroll_to_label(&mut app, &ctx, w, h, "违规自查");
+        click(&mut app, &ctx, w, h, cheat_header);
         let toggle = scroll_to_label(&mut app, &ctx, w, h, "查看列表");
         click(&mut app, &ctx, w, h, toggle);
         assert!(app.data_page.show_cheat_list);
+        // A6：排行榜同样默认收起。
+        let rank_header = scroll_to_label(&mut app, &ctx, w, h, "排行榜");
+        click(&mut app, &ctx, w, h, rank_header);
         let query = scroll_to_label(&mut app, &ctx, w, h, "查询");
         app.status = "before-query".into();
         click(&mut app, &ctx, w, h, query);
         assert_eq!(app.status, "请先登录");
+    }
+}
+
+/// A1：进跑步页不滚动就能看到并点到主操作（360×640 下原来在纸面下 583 px）。
+///
+/// 只用「开始跑步」这一个文案（R3：尽量少依赖文案），判定标准是控件矩形中心
+/// 落在中央面板内 —— `label_position` 本身已经要求文字未被裁剪。
+#[test]
+fn run_primary_action_is_visible_without_scrolling_on_a_phone() {
+    for (w, h) in [(360.0, 640.0), (412.0, 600.0)] {
+        let ctx = egui::Context::default();
+        let mut app = App::from_state(
+            &ctx,
+            HeaderIdentity::default(),
+            Session::default(),
+            Config::default(),
+        );
+        app.tab = 0;
+        // 真实道路模式（有地图 + 底图工具条）是最拥挤的形态，用它做判定。
+        app.config.route_mode = "road".into();
+        app.run_page.route_mode = crate::track::generate_road::RouteMode::Road;
+        app.network = Some(std::sync::Arc::new(route_planner::RoadGraph::new()));
+        frame(&mut app, &ctx, w, h, vec![]);
+        let output = frame(&mut app, &ctx, w, h, vec![]);
+        let pos = label_position(&output, "开始跑步")
+            .unwrap_or_else(|| panic!("开始跑步 不滚动就不可见（{w}x{h}）"));
+        let area = ctx.available_rect();
+        assert!(
+            area.contains(pos),
+            "开始跑步 落在首屏外：{pos:?} 不在 {area:?}（{w}x{h}）"
+        );
     }
 }
 
@@ -234,11 +273,14 @@ fn school_download_controls_are_reachable_on_phone_and_desktop() {
             Config::default(),
         );
         app.tab = 7;
+        // A7：「重新下载路网」按钮并入了主按钮旁的「强制重新下载」开关。
+        // 先找开关再点主按钮：主按钮点下去会写上状态文案，页面顶部多一行，
+        // 此时再回头找同一行里的开关，窄屏（320×360 只有 ~100px 视口）会滚过头。
+        scroll_to_label(&mut app, &ctx, w, h, "强制重新下载");
         let at = scroll_to_label(&mut app, &ctx, w, h, "自动获取学校路网");
         click(&mut app, &ctx, w, h, at);
         assert!(app.osm_page.status.contains("请先登录"));
         assert!(!app.osm_page.busy);
-        scroll_to_label(&mut app, &ctx, w, h, "重新下载路网");
     }
 }
 

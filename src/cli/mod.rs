@@ -22,9 +22,10 @@ fn usage() {
                                            登录并保存会话；--pass - 从标准输入读密码（避免留在 shell 历史与进程列表）
                                            --remember 同时保存凭据供自动重登；也可用环境变量 NSWT_PASS
   logout                                   登出并清理本地会话
-  run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road|manual]
+  run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--school-altitude 米] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road|manual]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法；
-                                           manual=只按实时点位串联、不要求策略必经点，无路网时退回按点位连线）
+                                           manual=只按实时点位串联、不要求策略必经点，无路网时退回按点位连线；
+                                           --school-altitude 把校区基准海拔写进 config.json，填一次即可）
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
   ai-list                                  AI 运动项目列表
   ai     --sport <id> [--mode min|count] [--score n]

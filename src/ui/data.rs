@@ -17,6 +17,8 @@ pub struct DataPage {
     /// 0=个人日 1=个人月 2=班级日 3=班级月 4=院系日 5=院系月 6=室内日 7=室内周 8=室内月 9=历史日 10=历史月
     pub rank_sel: usize,
     pub show_cheat_list: bool,
+    /// 异常记录诊断（实验）：默认只读，单条试修要二次确认。
+    pub recover: crate::ui::recover_panel::RecoverPage,
 }
 
 pub const RANK_OPTIONS: [&str; 11] = [
@@ -89,19 +91,24 @@ impl App {
                             ui.label("未拉取");
                         }
                     }
-                    if ui
-                        .add_enabled(!self.data_busy, theme::primary_btn("刷新"))
-                        .clicked()
-                    {
-                        self.refresh_data_page();
-                    }
+                    // 主操作：44pt 触摸高度（A 类：只抬主操作，列表内小按钮不动）。
+                    mobile::action_row(ui, |ui| {
+                        if ui
+                            .add_enabled(!self.data_busy, theme::primary_btn("刷新"))
+                            .clicked()
+                        {
+                            self.refresh_data_page();
+                        }
+                    });
                 });
             });
 
         let mut open_record = None;
         // ── 违规自查 ────────────────────────────────────────────
+        // A6：明细默认收起（标题仍在，一点就开）。首屏从 8 个控件降到 5 个，
+        // 「学期完成度」保持展开——那是进页面第一眼要看的。
         egui::CollapsingHeader::new("违规自查")
-            .default_open(true)
+            .default_open(false)
             .show(ui, |ui| {
                 mobile::row(ui, |ui| {
                     if self.data_page.cheat_checking {
@@ -226,9 +233,16 @@ impl App {
             self.records_page.detail_raw = None;
             self.fetch_run_detail(rrid);
         }
+        // ── 异常记录诊断（实验）────────────────────────────────
+        // 默认折叠、默认只读：这里只画界面，提交与复查都在后台线程（见 recover_panel）。
+        egui::CollapsingHeader::new(crate::ui::recover_panel::RECOVER_TITLE)
+            .default_open(false)
+            .show(ui, |ui| {
+                self.draw_recover_section(ui);
+            });
         // ── 排行榜 ──────────────────────────────────────────────
         egui::CollapsingHeader::new("排行榜")
-            .default_open(true)
+            .default_open(false)
             .show(ui, |ui| {
                 mobile::row(ui, |ui| {
                     egui::ComboBox::from_id_salt("rank_combo")
@@ -238,13 +252,15 @@ impl App {
                                 ui.selectable_value(&mut self.data_page.rank_sel, i, *opt);
                             }
                         });
-                    if ui
-                        .add_enabled(!self.data_busy, theme::primary_btn("查询"))
-                        .clicked()
-                    {
-                        let (kind, subtype) = self.data_page.selection();
-                        self.refresh_rank(kind, subtype);
-                    }
+                    mobile::action_row(ui, |ui| {
+                        if ui
+                            .add_enabled(!self.data_busy, theme::primary_btn("查询"))
+                            .clicked()
+                        {
+                            let (kind, subtype) = self.data_page.selection();
+                            self.refresh_rank(kind, subtype);
+                        }
+                    });
                     if self.data_busy {
                         ui.label("拉取中…");
                     }

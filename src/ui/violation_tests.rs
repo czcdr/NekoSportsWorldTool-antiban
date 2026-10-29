@@ -37,6 +37,9 @@ fn query_failure_missing_fields_and_stale_result_are_visible() {
             Config::default(),
         );
         app.tab = 3;
+        // A6：违规自查默认收起，先点开标题，否则里面的状态文案不会被渲染。
+        let header = scroll_to_label(&mut app, &ctx, width, 480., "违规自查");
+        click(&mut app, &ctx, width, 480., header);
         let now = crate::crypto::envelope::now_ms();
         for (data, at, expected) in [
             (json!({"self":null}), now, Status::NoRecord),
@@ -96,6 +99,9 @@ fn related_record_button_scrolls_and_opens_only_the_explicit_id() {
         app.data_page.cheat = Some(CheatReport::from_data(&json!({"self":{
             "reason":"服务端原始原因".repeat(10), "rrid":"42", "id":999, "time":"2026-10-20 07:30:00"
         }}), crate::crypto::envelope::now_ms()).unwrap());
+        // A6：违规自查默认收起，先点开标题。
+        let header = scroll_to_label(&mut app, &ctx, width, height, "违规自查");
+        click(&mut app, &ctx, width, height, header);
         let at = scroll_to_label(&mut app, &ctx, width, height, "查看关联跑步记录 #42");
         click(&mut app, &ctx, width, height, at);
         assert_eq!(app.tab, 2);

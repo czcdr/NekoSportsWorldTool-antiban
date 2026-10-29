@@ -1079,9 +1079,13 @@ fn worker_loop(jobs: Receiver<Job>, out: Sender<TileMsg>) {
 
 // ── 工具条 ──────────────────────────────────────────────────────────────
 
-/// 地图上方的底图工具条：切换源 + 缓存占用 + 一键清理。
+/// 地图上方的底图工具条：切换源 + （折叠）缓存占用与说明。
 ///
 /// 返回 `true` 表示用户改了选择，**调用方负责落盘**（`ui::save_config`）。
+///
+/// A2：原来「缓存 x MB / 清理缓存 / 两行坐标系说明」全跟切换按钮挤在一行里，
+/// 跑步页与路网页各画一次、每次占 5 行。现在只留一行「底图：关/高德/OSM」+
+/// 一个折叠按钮，缓存与说明收进折叠区（默认收起，在线源时展开）。
 pub fn toolbar(
     ui: &mut egui::Ui,
     basemap: &mut String,
@@ -1106,28 +1110,34 @@ pub fn toolbar(
                 changed = true;
             }
         }
-        let (bytes, files) = layer.cache_stats();
-        ui.label(format!(
-            "缓存 {:.1} MB / {} MB，{} 张",
-            bytes as f64 / (1024.0 * 1024.0),
-            limit_mb,
-            files
-        ));
-        if ui.small_button("清理缓存").clicked() {
-            layer.clear_cache();
-        }
     });
-    if current.is_online() {
-        ui.colored_label(
-            super::theme::text_dim(),
-            "高德=GCJ-02 网格，OSM=WGS84 网格；内部数据 BD-09，贴图前按源换算。缩放超过 z18 用 z18 瓦片放大。",
-        );
-    } else {
-        ui.colored_label(
-            super::theme::text_dim(),
-            "底图关闭：只画矢量路网，不发起任何瓦片请求（默认）。",
-        );
-    }
+    egui::CollapsingHeader::new("底图缓存与坐标系说明")
+        .default_open(false)
+        .show(ui, |ui| {
+            let (bytes, files) = layer.cache_stats();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "缓存 {:.1} MB / {} MB，{} 张",
+                    bytes as f64 / (1024.0 * 1024.0),
+                    limit_mb,
+                    files
+                ));
+                if ui.small_button("清理缓存").clicked() {
+                    layer.clear_cache();
+                }
+            });
+            if current.is_online() {
+                ui.colored_label(
+                    super::theme::text_dim(),
+                    "高德=GCJ-02 网格，OSM=WGS84 网格；内部数据 BD-09，贴图前按源换算。缩放超过 z18 用 z18 瓦片放大。",
+                );
+            } else {
+                ui.colored_label(
+                    super::theme::text_dim(),
+                    "底图关闭：只画矢量路网，不发起任何瓦片请求（默认）。",
+                );
+            }
+        });
     changed
 }
 

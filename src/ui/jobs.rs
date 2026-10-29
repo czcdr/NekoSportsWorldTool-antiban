@@ -18,6 +18,8 @@ impl App {
             || self.user_busy
             || self.osm_page.busy
             || self.run_page.preview_busy
+            // 诊断是只读的，但它和试修共用后台线程语义：更新/重启打断时一并算忙。
+            || self.data_page.recover.busy()
     }
 
     /// 检查更新；manual=true 时切到关于页并显示状态。

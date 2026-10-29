@@ -17,12 +17,14 @@ impl App {
     pub fn draw_user(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         mobile::row(ui, |ui| {
-            if ui
-                .add_enabled(!self.user_busy, theme::primary_btn("刷新"))
-                .clicked()
-            {
-                self.refresh_user_page();
-            }
+            mobile::action_row(ui, |ui| {
+                if ui
+                    .add_enabled(!self.user_busy, theme::primary_btn("刷新"))
+                    .clicked()
+                {
+                    self.refresh_user_page();
+                }
+            });
             if self.user_busy {
                 ui.label("拉取中…");
             }

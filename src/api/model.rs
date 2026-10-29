@@ -148,6 +148,18 @@ pub struct Config {
     /// 换一版（新 seed）才重抽 —— 逐请求漂移会让点位和围栏自相矛盾。
     #[serde(default = "default_anchor_offset_m")]
     pub anchor_offset_m: f64,
+    /// 学校（校区）**基准海拔**（米，绝对高程）。用户填一次，之后每条记录围绕它生成 bdA。
+    ///
+    /// 为什么必须由人给：点位 / 围栏 / 策略三个接口**都不带高程**
+    /// （`points.rs`、`school_roads.rs`、`policy.rs` 里没有任何 altitude/elev/height 字段），
+    /// 工具无法从接口推出校区海拔。旧实现每次在 20–260 m 之间随机抽一个基准，
+    /// 包头校区（实测约 1050 m）于是每条记录都低约 800 m —— 服务端只要知道校区高程，
+    /// 这就是一眼可查的参数异常（管理员复核意见「APP参数数据异常201」）。
+    ///
+    /// 优先级：`manual_altitude` > `manual_altitude_range` > 本字段 > 默认 82 m。
+    /// 只影响轨迹点的 `bdA` 与 `totalAscent`，不改任何请求字段名/顺序，也不进协议。
+    #[serde(default)]
+    pub school_base_altitude: Option<f64>,
     /// 设备身份的**冗余备份**（identity.json 丢失/损坏时回填）。
     ///
     /// 只存恢复必需的最小字段：城市、锚点经纬度、device_id。
@@ -289,6 +301,7 @@ impl Default for Config {
             map_cache_limit_mb: default_cache_limit_mb(),
             gps_spread_m: default_gps_spread_m(),
             anchor_offset_m: default_anchor_offset_m(),
+            school_base_altitude: None,
             identity_backup: None,
         }
     }
@@ -312,6 +325,19 @@ impl Config {
             self.anchor_offset_m,
             ANCHOR_OFFSET_MAX_M,
             default_anchor_offset_m(),
+        )
+    }
+    /// 本次轨迹的海拔基准（米）与它的来源。
+    ///
+    /// 优先级见 [`crate::track::altitude::resolve_base_altitude`]：
+    /// 手动单值 > 手动区间（中值）> 学校基准 > 默认 82 m。
+    /// 日志与界面都必须用 `origin.label()` 把来源写出来 ——
+    /// 用户看不到来源，就不知道自己这条记录报了多少米。
+    pub fn resolved_base_altitude(&self) -> (f64, crate::track::altitude::BaseAltitudeOrigin) {
+        crate::track::altitude::resolve_base_altitude(
+            self.manual_altitude,
+            self.manual_altitude_range,
+            self.school_base_altitude,
         )
     }
     /// 把配置里的瓦片源设置组成 `TileConfig`（默认 OSM）。
@@ -1780,6 +1806,41 @@ mod generation_knob_tests {
         assert_eq!(old.anchor_offset_m, 0.0, "默认锚点偏移必须是「精确锚点」");
         assert_eq!(Config::default().gps_spread_m, 0.0);
         assert_eq!(Config::default().anchor_offset_m, 0.0);
+        assert_eq!(
+            old.school_base_altitude, None,
+            "老配置没有学校基准海拔时必须回落到 None（→ 默认 82 m），不能反序列化失败"
+        );
+    }
+
+    /// C10：学校基准海拔既能存能读，也真的驱动海拔基准解析。
+    ///
+    /// 优先级：manual_altitude > manual_altitude_range > school_base_altitude > 默认 82。
+    #[test]
+    fn school_base_altitude_round_trips_and_drives_the_resolution() {
+        use crate::track::altitude::BaseAltitudeOrigin;
+        let mut config = Config::default();
+        assert_eq!(config.school_base_altitude, None);
+        assert_eq!(
+            config.resolved_base_altitude(),
+            (82.0, BaseAltitudeOrigin::Default),
+            "没配学校基准时必须回退默认 82 m（不是随机区间）"
+        );
+
+        config.school_base_altitude = Some(1050.0);
+        let json = serde_json::to_string(&config).unwrap();
+        let mut back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.resolved_base_altitude(),
+            (1050.0, BaseAltitudeOrigin::School),
+            "学校基准海拔没有随 config.json 往返"
+        );
+
+        // 手动海拔仍然最高优先（用户临时改一次，不该被学校基准覆盖）。
+        back.manual_altitude = Some(36.0);
+        assert_eq!(
+            back.resolved_base_altitude(),
+            (36.0, BaseAltitudeOrigin::Manual)
+        );
     }
 
     /// 默认值必须是**逐位**等于 v0.7.0 的上传坐标，而不是「差不多」。

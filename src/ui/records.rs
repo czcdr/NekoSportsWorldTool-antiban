@@ -30,23 +30,27 @@ impl App {
             ui.add_space(8.0);
             match self.records_page.sub {
                 0 => {
-                    if ui
-                        .add_enabled(!self.records_busy, theme::primary_btn("刷新"))
-                        .clicked()
-                    {
-                        self.refresh_records();
-                    }
+                    mobile::action_row(ui, |ui| {
+                        if ui
+                            .add_enabled(!self.records_busy, theme::primary_btn("刷新"))
+                            .clicked()
+                        {
+                            self.refresh_records();
+                        }
+                    });
                     if self.records_busy {
                         ui.label("拉取中…");
                     }
                 }
                 _ => {
-                    if ui
-                        .add_enabled(!self.records_busy, theme::primary_btn("刷新全部记录"))
-                        .clicked()
-                    {
-                        self.refresh_ai_records();
-                    }
+                    mobile::action_row(ui, |ui| {
+                        if ui
+                            .add_enabled(!self.records_busy, theme::primary_btn("刷新全部记录"))
+                            .clicked()
+                        {
+                            self.refresh_ai_records();
+                        }
+                    });
                     if self.records_busy {
                         ui.label("拉取中…");
                     }
@@ -177,7 +181,7 @@ impl App {
 
         let toggle_target = std::cell::Cell::new(None::<i64>);
 
-        if mobile::compact_ui(ui) {
+        if mobile::narrow_list(ui) {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -311,7 +315,7 @@ impl App {
         ));
         let num = |s: &str| s.parse::<f64>().unwrap_or(0.0);
         let toggle_target = std::cell::Cell::new(None::<i64>);
-        if mobile::compact_ui(ui) {
+        if mobile::narrow_list(ui) {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {

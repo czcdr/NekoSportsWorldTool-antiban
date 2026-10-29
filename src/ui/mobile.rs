@@ -38,6 +38,28 @@ pub fn row<R>(
     }
 }
 
+/// 宽表格/列表页的「窄屏」判定。
+///
+/// 比 [`compact_ui`] 的 620 宽一档：640 宽的横屏手机落在 compact 之外，
+/// 会走进带 `TableBuilder` 的桌面分支，最后一列（如「详情」）被裁掉
+/// （见 `review/UI-AUDIT.md` §4.1）。表格页改用这个判定退回卡片布局。
+pub fn narrow_list(ui: &egui::Ui) -> bool {
+    compact_ui(ui) || ui.available_width() < 760.0
+}
+
+/// 页面主操作行：只把这一行内控件的默认高度抬到触摸最小尺寸。
+///
+/// 为什么不改全局 `interact_size`：矮屏（640×360 只有 172 px 可视高）上把
+/// 所有按钮都撑到 44 px 会把页面再撑高一倍，与「主操作进首屏」相反。
+/// 所以每页只让 1–2 个主操作走这里，列表内小按钮/勾选/单选保持原尺寸。
+pub fn action_row<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = TOUCH_HEIGHT;
+        add_contents(ui)
+    })
+    .inner
+}
+
 #[cfg(any(target_os = "android", test))]
 pub fn parse_i64_in_range(input: &str, range: RangeInclusive<i64>) -> Result<i64, String> {
     let value = input

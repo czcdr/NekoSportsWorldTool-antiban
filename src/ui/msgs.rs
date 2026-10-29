@@ -2,9 +2,9 @@
 
 use super::about::FinishAction;
 use super::{
-    captcha, App, PopupInfo, AI_DETAIL, AI_DONE, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE,
-    POINTS_DONE, RANK, RECORDS, RUN_DETAIL, RUN_DONE, SEMESTER, UPDATE_CHK, UPDATE_DONE,
-    UPDATE_PROG, USER,
+    captcha, recover_panel, App, PopupInfo, AI_DETAIL, AI_DONE, AI_LIST, AI_RECORDS, CHEAT, IP,
+    LOGIN_DONE, POINTS_DONE, RANK, RECORDS, RECOVER, RECOVER_FIX, RUN_DETAIL, RUN_DONE, SEMESTER,
+    UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
 };
 use crate::api::model;
 use chrono::TimeZone;
@@ -23,6 +23,7 @@ impl App {
         self.data_page.cheat = None;
         self.data_page.cheat_checking = false;
         self.data_page.cheat_error = Some("登录已失效，请重新登录后检查".into());
+        self.data_page.recover.session_lost();
         self.data_page.semester = None;
         self.user_page.info = None;
         self.session = None;
@@ -94,6 +95,8 @@ impl App {
         let mut ai_records_json = None;
         let mut ai_detail_raw = None;
         let mut detail_raw = None;
+        let mut recover_json = None;
+        let mut recover_fix_json = None;
         let mut update_chk = None;
         let mut update_prog = None;
         let mut update_done = None;
@@ -150,6 +153,10 @@ impl App {
                 }
             } else if let Some(v) = msg.strip_prefix(AI_RECORDS) {
                 ai_records_json = Some(v.to_string());
+            } else if let Some(v) = msg.strip_prefix(RECOVER_FIX) {
+                recover_fix_json = Some(v.to_string());
+            } else if let Some(v) = msg.strip_prefix(RECOVER) {
+                recover_json = Some(v.to_string());
             } else if let Some(v) = msg.strip_prefix(RUN_DETAIL) {
                 if let Ok(raw) = serde_json::from_str::<serde_json::Value>(v) {
                     // Filter before coalescing messages: a late reply must not
@@ -265,6 +272,7 @@ impl App {
                         .push(&format!("[osm] 路网加载成功：{nodes} 节点 / {bld} 建筑"));
                     self.network = Some(net);
                     self.run_page.preview_stale = true;
+                    self.osm_page.retry_available = false;
                     self.osm_page.cache_entries = crate::api::school_roads::entries();
                     self.analyze_gpx();
                 }
@@ -272,6 +280,8 @@ impl App {
                     self.network = None;
                     self.run_page.preview = None;
                     self.run_page.preview_stale = true;
+                    // A7：失败后主按钮改叫「重试获取路网」（纯 UI 提示位）。
+                    self.osm_page.retry_available = true;
                     self.osm_page.status = crate::road_status::explain(&e);
                     self.log.push(&format!("[osm] 路网加载失败：{e}"));
                 }
@@ -440,6 +450,102 @@ impl App {
                 Err(_) => {
                     self.data_page.cheat = None;
                     self.data_page.cheat_error = Some("违规数据解析失败，无法判断".into());
+                }
+            }
+        }
+        if let Some(v) = recover_json {
+            match serde_json::from_str::<serde_json::Value>(&v) {
+                Ok(value) if value.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => {
+                    let snapshot = value.get("diag").cloned().unwrap_or_default();
+                    match serde_json::from_value::<recover_panel::DiagSnapshot>(snapshot) {
+                        Ok(diag) => {
+                            let abnormal = diag.rows.len();
+                            self.data_page.recover.apply_diag(diag);
+                            self.status =
+                                format!("诊断完成：{abnormal} 条未达标（只读，未提交任何记录）");
+                        }
+                        Err(_) => {
+                            self.data_page
+                                .recover
+                                .apply_diag_error("诊断数据解析失败".into());
+                            self.status = "诊断数据解析失败".into();
+                        }
+                    }
+                }
+                Ok(value) => {
+                    let error = value
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("未知错误")
+                        .to_string();
+                    self.status = format!("诊断失败：{error}");
+                    self.data_page.recover.apply_diag_error(error);
+                }
+                Err(_) => {
+                    self.data_page
+                        .recover
+                        .apply_diag_error("诊断数据解析失败".into());
+                    self.status = "诊断数据解析失败".into();
+                }
+            }
+        }
+        if let Some(v) = recover_fix_json {
+            match serde_json::from_str::<serde_json::Value>(&v) {
+                Ok(value) => {
+                    let rrid = value.get("rrid").and_then(|x| x.as_i64()).unwrap_or(0);
+                    // 只有「正在等的那一条」的回执才落状态：迟到的旧回执不许改写当前结论。
+                    if self.data_page.recover.fix_rrid != Some(rrid) {
+                        self.log
+                            .push(&format!("[recover] 忽略过期回执 rrid={rrid}"));
+                    } else if value.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        let report = recover_panel::FixReport {
+                            rrid,
+                            new_rrid: value.get("new_rrid").and_then(|x| x.as_i64()).unwrap_or(0),
+                            verdict: value
+                                .get("verdict")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("未知")
+                                .to_string(),
+                            complete: value.get("complete").and_then(|x| x.as_bool()),
+                            failure_reasons: value
+                                .get("failure_reasons")
+                                .and_then(|x| x.as_array())
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter_map(|r| r.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            recheck: serde_json::from_value(
+                                value.get("recheck").cloned().unwrap_or_default(),
+                            )
+                            .ok(),
+                            error: None,
+                        };
+                        self.status = report.conclusion();
+                        self.data_page.recover.apply_fix(report);
+                    } else {
+                        let error = value
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("未知错误")
+                            .to_string();
+                        let report = recover_panel::FixReport {
+                            rrid,
+                            error: Some(error.clone()),
+                            ..Default::default()
+                        };
+                        self.status = format!("单条试修失败：{error}");
+                        self.data_page.recover.apply_fix(report);
+                    }
+                }
+                Err(_) => {
+                    let report = recover_panel::FixReport {
+                        error: Some("试修回执解析失败".into()),
+                        ..Default::default()
+                    };
+                    self.status = "试修回执解析失败".into();
+                    self.data_page.recover.apply_fix(report);
                 }
             }
         }
@@ -643,6 +749,18 @@ fn run_popup(v: &serde_json::Value) -> PopupInfo {
     ];
     if let Some(summary) = v["summary"].as_str().filter(|s| !s.is_empty()) {
         lines.push(format!("结论：{summary}"));
+    }
+    // 海拔警告的 UI 出口：flow.rs 的结论文案只说「跑步页手动海拔 / CLI run --school-altitude」，
+    // 而 App 内真正的学校基准输入在「高级生成参数」折叠区里。这里补一句指向它，
+    // 让弹窗里的出口与界面上的输入框对得上（flow.rs 属 t8/t9 改动范围，本轮不动）。
+    if lines.iter().any(|line| line.contains("未配置学校基准海拔"))
+        && !lines.iter().any(|line| line.contains("学校基准海拔（米）"))
+    {
+        lines.push(
+            "海拔出口（App 内）：跑步页 →「高级生成参数」→「学校基准海拔（米）」；\
+             留空=未配置，填一次后所有记录按它生成（优先级低于手动海拔）。"
+                .into(),
+        );
     }
     if let Ok(verification) =
         serde_json::from_value::<crate::api::flow::Verification>(v["verification"].clone())

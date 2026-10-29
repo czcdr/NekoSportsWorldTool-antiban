@@ -163,6 +163,37 @@ fn cmd_run(rest: &[&str]) -> i32 {
         get(&flags, "route").unwrap_or(&cfg.route_mode),
     );
 
+    // C10：`--school-altitude` 把校区基准海拔**持久化**到 config.json（填一次即可），
+    // 之后 GUI 与 CLI 都用它生成 bdA。合法范围与手动海拔一致（-500–9000 m）。
+    if let Some(text) = get(&flags, "school-altitude") {
+        let parsed = text.trim().parse::<f64>().ok().filter(|v| {
+            v.is_finite()
+                && (crate::track::altitude::ALTITUDE_MIN_M..=crate::track::altitude::ALTITUDE_MAX_M)
+                    .contains(v)
+        });
+        match parsed {
+            Some(value) => {
+                let mut updated = cfg.clone();
+                updated.school_base_altitude = Some(value);
+                match model::save_config(&updated) {
+                    Ok(()) => println!("已把学校基准海拔写入 config.json：{value:.1} m"),
+                    Err(e) => {
+                        eprintln!("保存学校基准海拔失败：{e}");
+                        return 1;
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "--school-altitude 需要 {} 到 {} 之间的数字（米）",
+                    crate::track::altitude::ALTITUDE_MIN_M,
+                    crate::track::altitude::ALTITUDE_MAX_M
+                );
+                return 1;
+            }
+        }
+    }
+
     let dist = if dist_km > 0.0 {
         dist_km as f64 * 1000.0
     } else {
@@ -193,6 +224,10 @@ fn cmd_run(rest: &[&str]) -> i32 {
     } else {
         now_ms() - 30 * 60_000 - (rand::random::<f64>() * 270.0 * 60_000.0) as i64
     };
+    // C1：`--time` 可能落在「现在 - 用时」之后（例如现在 12:05 却填 12:00、用时 30 分钟），
+    // 那样 stopTime 就落在未来 —— 真机不可能提交还没跑完的记录。
+    // flow 里还有一道最终校验（用 effective_duration 之后的时长），这里先按输入时长收紧。
+    let start_ms = start_ms.min(now_ms() - dur * 1000 - 5_000);
 
     println!(
         "参数：{:.0}m / {}s / 配速 {}:{:02}/km / 开始 {}",
@@ -346,9 +381,10 @@ fn cmd_ai_list() -> i32 {
 
 /// 手动释放卡住的提交回执。
 ///
-/// 提交响应解不开（WAF 拦截页、gzip、超时）时会被记为「结果未知」，此后每次提交
-/// 都被挡住，只能等记录页核对到那条记录。核对不到就永久卡死 —— 这里给一个
-/// 显式的、需要人确认的出口。
+/// 提交响应解不开（WAF 拦截页、gzip、超时）时会被记为「结果未知」：下一次提交前会先
+/// 只读对账记录列表，查到就不许再提，查不到才放行 —— 但**对账本身也可能失败**
+/// （断网、列表接口被拦），那就一直卡着。这里给一个显式的、需要人确认的出口。
+/// 注意：释放只是补一条「本次没有入账」的回执，不会删历史。
 fn cmd_unlock(rest: &[&str]) -> i32 {
     let flags = parse_flags(rest);
     let sess = model::load_session();
@@ -376,6 +412,10 @@ fn cmd_unlock(rest: &[&str]) -> i32 {
             println!("没有卡住的提交回执");
         } else {
             println!("有 {pending} 条未确认的提交回执（上次提交结果未知）。");
+            // 列出每一条：起跑时间 / 目标距离 / 计划指纹，方便对着官方记录逐条核。
+            for line in guard.describe_unresolved(crate::crypto::envelope::now_ms()) {
+                println!("  · {line}");
+            }
             println!("请先到官方运动记录页核对：确认确实没有入账，再执行 `unlock --yes` 释放。");
             println!("未查到不代表未入账 —— 释放后重复提交可能产生两条记录。");
         }

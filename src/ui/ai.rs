@@ -123,18 +123,20 @@ impl App {
         let logged = self.session.is_some();
         let one_enabled = !self.ai_busy && logged && !self.ai_page.list.is_empty();
         mobile::row(ui, |ui| {
-            if ui
-                .add_enabled(one_enabled, theme::primary_btn("提交成绩"))
-                .clicked()
-            {
-                let sport_id = self
-                    .ai_page
-                    .list
-                    .get(self.ai_page.selected)
-                    .map(|s| s.id)
-                    .unwrap_or(0);
-                self.submit_ai_once(sport_id);
-            }
+            mobile::action_row(ui, |ui| {
+                if ui
+                    .add_enabled(one_enabled, theme::primary_btn("提交成绩"))
+                    .clicked()
+                {
+                    let sport_id = self
+                        .ai_page
+                        .list
+                        .get(self.ai_page.selected)
+                        .map(|s| s.id)
+                        .unwrap_or(0);
+                    self.submit_ai_once(sport_id);
+                }
+            });
             if self.ai_busy {
                 ui.label("提交中…");
             }

@@ -7,6 +7,10 @@ pub mod generate_road;
 pub mod generator;
 pub mod geom;
 pub mod model;
+/// 本地生成专用的真实性分布（停走窗口 / 野点 / radius 右偏 / 逐圈车道偏移）。
+///
+/// 0.9.0 新增：全部抽样走派生 RNG，主序列与 0.8.0 逐点一致。
+pub mod noise;
 pub mod postfix;
 pub mod route_view;
 mod school_track;
@@ -454,7 +458,13 @@ mod tests {
                     .enumerate()
                     .filter(|(_, p)| p.ptype == -1)
                 {
-                    assert!(p.radius <= 10.0);
+                    // 0.9.0：异常点的 radius/accuracy 换成 10–30 m 的右偏分布
+                    // （真机在弱信号处的上报精度就是这个量级；旧契约 ≤10 m 太紧）。
+                    assert!(
+                        (10.0..=30.0).contains(&p.radius),
+                        "exception radius {}",
+                        p.radius
+                    );
                     assert!(p.speed <= super::generator::MAX_EXCEPTION_GPS_SPEED_KMH);
                     if i > 0 {
                         let previous = &track.locations[i - 1];

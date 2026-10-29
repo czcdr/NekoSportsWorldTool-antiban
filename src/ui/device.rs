@@ -168,6 +168,19 @@ impl App {
                 randomize(&mut self.device_buf, &platform);
                 self.status = "已生成随机设备（未保存——手动保存后才生效）".into();
             }
+            // A4：「保存 / 撤销修改」原来排在 8 个输入框之后（360×640 下在纸面下 174 px），
+            // 提到平台选择这一行，进页面就能落盘。表单字段一行没删。
+            mobile::action_row(ui, |ui| {
+                if ui.add(theme::primary_btn("保存")).clicked() {
+                    self.save_device_identity(page);
+                }
+            });
+            if ui.button("撤销修改").clicked() {
+                self.device_buf = self.identity.clone();
+            }
+            if page.saved_flash > 0.0 {
+                ui.colored_label(theme::ok(), "已保存");
+            }
         });
         if self.device_buf.platform != "android" {
             // A1：iOS 身份不能提交（提交报文固定 Android）。与其让用户填完表单、
@@ -369,54 +382,8 @@ impl App {
         }
 
         ui.add_space(8.0);
-        mobile::row(ui, |ui| {
-            if ui.add(theme::primary_btn("保存")).clicked() {
-                // 机型变了就重置派生指纹：否则会得到"新机型 + 旧分辨率/androidId"
-                // 这种自相矛盾的组合，比不做随机更糟。
-                // 手改机型后来源不再是真机读取，标记回 false，让自检恢复按机型库核对。
-                if self.device_buf.platform != "android" {
-                    self.device_buf.android_id.clear();
-                    self.device_buf.pixel.clear();
-                    self.device_buf.fingerprint_from_device = false;
-                } else {
-                    if self.device_buf.device_name != self.identity.device_name {
-                        self.device_buf.android_id.clear();
-                        self.device_buf.pixel.clear();
-                        self.device_buf.fingerprint_from_device = false;
-                    }
-                    // 只补空字段，不覆盖真机读数 / 用户手填值。
-                    self.device_buf.ensure_fingerprint();
-                }
-                match crate::api::model::save_identity(&self.device_buf) {
-                    Ok(()) => {
-                        self.identity = self.device_buf.clone();
-                        self.device_dirty_since = None;
-                        self.status = "√ 设备身份已保存并生效".into();
-                        self.log.push("√  已更新（新设备 ID 从下个请求开始生效）");
-                        page.saved_flash = 2.0;
-                    }
-                    Err(e) => {
-                        // 保存失败必须显眼：只写状态栏时用户以为存上了，下次启动才发现没了。
-                        self.status = format!("× 保存失败：{e}");
-                        self.popup = Some(crate::ui::PopupInfo {
-                            title: "保存设备身份失败".into(),
-                            lines: vec![
-                                e.clone(),
-                                "身份文件没写进去，下次启动会回到旧值。请检查数据目录权限后重试；\
-                                 城市/锚点可以先用「保存」再试一次"
-                                    .into(),
-                            ],
-                        });
-                    }
-                }
-            }
-            if ui.button("撤销修改").clicked() {
-                self.device_buf = self.identity.clone();
-            }
-            if page.saved_flash > 0.0 {
-                ui.colored_label(theme::ok(), "已保存");
-            }
-        });
+        // 「保存 / 撤销修改」已提到页面顶部（draw_device_inner 开头），这里不再重复画。
+        // 未保存提示仍保留：它解释的是「当前跑步用的是哪一份身份」。
 
         ui.add_space(12.0);
         ui.separator();
@@ -541,6 +508,51 @@ impl App {
         }
         if !self.config.safety.enabled {
             ui.colored_label(theme::warn(), "⚠ 护栏已关闭：提交时段与次数完全由你控制");
+        }
+    }
+
+    /// 显式「保存」：把 `device_buf` 写进 identity.json 并让新身份立刻生效。
+    ///
+    /// 从 `draw_device_inner` 里抽出来，是因为按钮已移到页面顶部（A4）；
+    /// 行为与原来逐字一致：机型变化时重置派生指纹，保存失败弹窗说明原因。
+    fn save_device_identity(&mut self, page: &mut DevicePage) {
+        // 机型变了就重置派生指纹：否则会得到"新机型 + 旧分辨率/androidId"
+        // 这种自相矛盾的组合，比不做随机更糟。
+        // 手改机型后来源不再是真机读取，标记回 false，让自检恢复按机型库核对。
+        if self.device_buf.platform != "android" {
+            self.device_buf.android_id.clear();
+            self.device_buf.pixel.clear();
+            self.device_buf.fingerprint_from_device = false;
+        } else {
+            if self.device_buf.device_name != self.identity.device_name {
+                self.device_buf.android_id.clear();
+                self.device_buf.pixel.clear();
+                self.device_buf.fingerprint_from_device = false;
+            }
+            // 只补空字段，不覆盖真机读数 / 用户手填值。
+            self.device_buf.ensure_fingerprint();
+        }
+        match crate::api::model::save_identity(&self.device_buf) {
+            Ok(()) => {
+                self.identity = self.device_buf.clone();
+                self.device_dirty_since = None;
+                self.status = "√ 设备身份已保存并生效".into();
+                self.log.push("√  已更新（新设备 ID 从下个请求开始生效）");
+                page.saved_flash = 2.0;
+            }
+            Err(e) => {
+                // 保存失败必须显眼：只写状态栏时用户以为存上了，下次启动才发现没了。
+                self.status = format!("× 保存失败：{e}");
+                self.popup = Some(crate::ui::PopupInfo {
+                    title: "保存设备身份失败".into(),
+                    lines: vec![
+                        e.clone(),
+                        "身份文件没写进去，下次启动会回到旧值。请检查数据目录权限后重试；\
+                         城市/锚点可以先用「保存」再试一次"
+                            .into(),
+                    ],
+                });
+            }
         }
     }
 }

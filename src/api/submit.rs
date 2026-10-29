@@ -14,6 +14,28 @@ use serde_json::{Map, Value};
 
 pub const RECORD_PATH: &str = "/api/v70260/runnings/save/record";
 
+/// `unCompleteReason` 的「里程未达标」。
+///
+/// 真机样本里只见过 `complete=true, unCompleteReason=0` 这一种组合，
+/// 具体枚举值没有可观测依据；这里取一个非 0 值只为与 `complete=false` 自洽
+/// （0 = 无原因，和 false 放在一起才是矛盾）。真要精确对齐官方客户端，
+/// 需要一份「未达标记录」的抓包。
+const UNCOMPLETE_REASON_DISTANCE: i64 = 1;
+
+/// C3：`complete` / `unCompleteReason` 由**实跑距离**与**学校门槛**共同决定。
+///
+/// 返回 `(complete, unCompleteReason)`：
+/// - 达到门槛 → `(true, 0)`；
+/// - 未达到 → `(false, UNCOMPLETE_REASON_DISTANCE)`（false 配 0 才是自相矛盾）；
+/// - 门槛未知（≤0）→ 按完成处理，不虚构一个「未达标」。
+pub fn completion_flag(total_dis_m: i64, min_distance_m: i64) -> (bool, i64) {
+    if min_distance_m <= 0 || total_dis_m >= min_distance_m {
+        (true, 0)
+    } else {
+        (false, UNCOMPLETE_REASON_DISTANCE)
+    }
+}
+
 /// Record pace uses thousandths of a minute/km; OBS laps use seconds/km.
 fn pace_speed_value(seconds: i64, meters: f64) -> i64 {
     let distance = (meters * 100.0).ceil() / 100.0;
@@ -113,18 +135,28 @@ pub fn submit_record(
         .and_then(|n| p.track.startTime.checked_add(n))
         .ok_or("时间范围溢出")?;
     let mut guard = super::submission_guard::Guard::open(p.uid, p.selected_unid)?;
-    if guard.has_pending() {
-        match super::records::fetch_records(client) {
-            Ok(rows) => {
-                for id in guard.reconcile(&rows)? {
-                    log(&format!("[record] 已核对先前记录 #{id}"));
-                }
-            }
-            Err(e) => log(&format!("[record] 只读核对失败：{e}")),
-        }
-    }
+    // 先只读对账、再进闸门：Unknown 的回执只有「记录列表里确实没有」才允许重提，
+    // 拉不到列表就保持未决（fail-closed），绝不靠猜。
+    let now = crate::crypto::envelope::now_ms();
+    super::submission_guard::reconcile_if_needed(&mut guard, client, now, log)?;
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
-    guard.begin(&run_uuid, p.track.startTime, stop_ms)?;
+    let plan_fp = super::submission_guard::plan_fingerprint(
+        p.track.startTime,
+        p.track.totalTime,
+        p.track.totalDistance,
+        p.track.totalSteps,
+        p.min_distance,
+    );
+    // 回执在**发请求之前**落盘：从这里往下，服务端可能已经收到这条记录。
+    let at = crate::crypto::envelope::now_ms();
+    guard.begin(
+        &run_uuid,
+        p.track.startTime,
+        stop_ms,
+        at,
+        &plan_fp,
+        p.min_distance,
+    )?;
     match send_record(client, p, run_uuid.clone(), log) {
         Ok(result) => {
             if let Err(e) = guard.accepted(&run_uuid, result.rrid) {
@@ -136,21 +168,33 @@ pub fn submit_record(
             Ok(result)
         }
         Err(SubmitFailure::Rejected(error)) => {
-            guard.rejected(&run_uuid)?;
+            guard.rejected(&run_uuid, "服务端明确拒绝")?;
             Err(format!("服务端明确拒绝本次提交：{error}"))
         }
         Err(SubmitFailure::Unknown(error)) => {
-            log("[record] 提交响应不确定，正在只读核对记录；不会再次发送提交请求");
-            match super::records::fetch_records(client) {
-                Ok(rows) => {
-                    let found = guard.reconcile(&rows)?;
-                    if let Some(id) = found.first() {
-                        return Err(format!("响应不确定，但已找到本次记录 #{id}。未重复提交，未补传 OBS；请到运动记录查看详情"));
-                    }
-                }
-                Err(e) => log(&format!("[record] 只读核对失败：{e}")),
+            // 先把「请求已经发出去了」这件事写进回执，再做只读对账 —— 顺序反了的话，
+            // 对账前崩溃就只剩一个 Pending，谁也不知道请求到底有没有到服务端。
+            let after = crate::crypto::envelope::now_ms();
+            if let Err(e) = guard.unknown(&run_uuid, after) {
+                log(&format!("[record] 本地回执保存失败：{e}"));
             }
-            Err(format!("提交结果未知：{error}。已保留本地请求回执并阻止再次提交；请到运动记录刷新核对，未查到不代表未入账"))
+            log("[record] 提交响应不确定，正在只读核对记录；本次不会再次发送提交请求");
+            super::submission_guard::reconcile_if_needed(&mut guard, client, after, log)?;
+            if let Some(id) = guard.committed_rrid(&run_uuid) {
+                return Err(format!(
+                    "响应不确定，但已找到本次记录 #{id}。未重复提交，未补传 OBS；请到运动记录查看详情"
+                ));
+            }
+            if guard.is_unresolved(&run_uuid) {
+                return Err(format!(
+                    "提交结果未知：{error}。记录列表对账没跑完（网络或接口失败），\
+                     已继续阻止再次提交；请到运动记录页确认后重试，确认未入账可 unlock 释放"
+                ));
+            }
+            Err(format!(
+                "提交结果未知：{error}。已对账记录列表：没有找到本次提交（计划指纹 {plan_fp}），\
+                 允许重新提交；未查到不代表未入账，重提前请先到运动记录页确认"
+            ))
         }
     }
 }
@@ -201,6 +245,24 @@ fn send_record(
     let avg_step_freq = round_to(total_steps as f64 / total_time as f64 * 60.0, 0)
         .clamp(1.0, crate::track::wire::MAX_STEP_FREQ_PER_MIN) as i64;
 
+    // C3：`complete` 不能恒为 true。
+    //
+    // `selDistance` 是**校方门槛**（策略 minDistance），`totalDis` 是实跑距离 —— 两件事。
+    // 恒报 complete=true 时，服务端只要把两者比一下就是自相矛盾：
+    // 「选了 2000 m、实际 1200 m、客户端却说已完成」。这里如实反映：
+    // 达标才 true，不达标就 false + 非 0 原因码（0 = 无原因，与 false 搭配才是矛盾）。
+    //
+    // 注意：真正的拦截在 `flow::run_full_flow`（计划距离低于门槛直接不发请求），
+    // 所以走到这里的短距离只来自绕过 UI 的调用方（CLI `--dist` / 测试）。
+    let total_dis_i = round_to(total_dis, 0) as i64;
+    let (complete, un_complete_reason) = completion_flag(total_dis_i, p.min_distance);
+    if !complete {
+        log(&format!(
+            "[record] ⚠ 实跑 {total_dis_i} m 低于学校门槛 {} m：本条按「未完成」提交（complete=false），不会计入有效次数",
+            p.min_distance
+        ));
+    }
+
     let mut body = Map::new();
     body.insert("allLocJson".into(), Value::String(String::new()));
     body.insert("sportType".into(), Value::from(1));
@@ -215,18 +277,15 @@ fn send_record(
     body.insert("selectedUnid".into(), Value::from(unid));
     body.insert("selRunTime".into(), Value::from(total_time));
     body.insert("selDistance".into(), Value::from(p.min_distance));
-    body.insert(
-        "totalDis".into(),
-        Value::from(round_to(total_dis, 0) as i64),
-    );
+    body.insert("totalDis".into(), Value::from(total_dis_i));
     body.insert("speed".into(), Value::from(speed));
     body.insert(
         "validDis".into(),
         Value::from(round_to(track.validDistance, 0) as i64),
     );
     body.insert("validTime".into(), Value::from(track.validTime));
-    body.insert("complete".into(), Value::Bool(true));
-    body.insert("unCompleteReason".into(), Value::from(0));
+    body.insert("complete".into(), Value::Bool(complete));
+    body.insert("unCompleteReason".into(), Value::from(un_complete_reason));
     body.insert("calorie".into(), Value::from(kcal));
     body.insert("totalSteps".into(), Value::from(total_steps));
     body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
@@ -412,5 +471,20 @@ mod metric_tests {
     fn record_pace_has_decimal_protocol_scale() {
         assert_eq!(pace_speed_value(600, 1000.0), 10000);
         assert_eq!(pace_speed_value(720, 2000.0), 6000);
+    }
+
+    /// C3：`complete` 不再是常量 true —— 低于学校门槛必须报未完成 + 非 0 原因码。
+    #[test]
+    fn completion_flag_tracks_the_school_threshold() {
+        // 达标 / 恰好达标：完成，无原因。
+        assert_eq!(completion_flag(2000, 2000), (true, 0));
+        assert_eq!(completion_flag(2001, 2000), (true, 0));
+        // 未达标：未完成，且原因码非 0（false + 0 才是自相矛盾）。
+        let (complete, reason) = completion_flag(1200, 2000);
+        assert!(!complete, "1200 m 跑不满 2000 m 门槛却报了完成");
+        assert_ne!(reason, 0, "未完成却没有原因码");
+        // 门槛未知：按完成处理，不虚构未达标。
+        assert_eq!(completion_flag(1200, 0), (true, 0));
+        assert_eq!(completion_flag(1200, -1), (true, 0));
     }
 }

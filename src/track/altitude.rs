@@ -15,6 +15,85 @@ pub struct AltitudeRange {
     pub max_m: f64,
 }
 
+/// 海拔（绝对高程）允许范围：从地下场地到高原，覆盖所有真实校区。
+pub const ALTITUDE_MIN_M: f64 = -500.0;
+pub const ALTITUDE_MAX_M: f64 = 9000.0;
+
+/// 既没有手动海拔、也没有学校基准时使用的默认海拔基准（米）。
+///
+/// 这是 0.5.0 之前的老行为。0.6.x 为了消掉「所有账号都是 82 m」的聚类特征改成了
+/// `rng.uniform(20.0, 260.0)`，结果错得更离谱：包头校区实测约 1050 m，
+/// 每条记录低约 800 m —— 服务端只要知道校区高程，这就是一眼可查的参数异常
+/// （管理员复核意见「APP参数数据异常201」）。现在改回**已知的固定值**：
+/// 报一个说得清的默认值，比编造一个谁也解释不了的随机高程强。
+pub const DEFAULT_BASE_ALTITUDE_M: f64 = 82.0;
+
+/// 海拔基准来自哪里 —— 必须能被日志与界面说清楚。
+///
+/// 用户看到的 bdA 是 82 m 还是 1050 m，取决于这一项；不写出来，
+/// 用户根本不知道自己报了多少米（审计 C10 的另一半）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseAltitudeOrigin {
+    /// config.manual_altitude（单值）
+    Manual,
+    /// config.manual_altitude_range（取中值作为 OU 回归基准，生成后再映射到区间）
+    ManualRange,
+    /// config.school_base_altitude（学校预设）
+    School,
+    /// 都没配：默认 82 m
+    Default,
+}
+
+impl BaseAltitudeOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "手动海拔",
+            Self::ManualRange => "手动海拔区间（中值）",
+            Self::School => "学校基准海拔",
+            Self::Default => "默认基准（未设置学校基准）",
+        }
+    }
+}
+
+/// 把基准值与来源拼成一句人能读懂的话，供日志与 UI 共用。
+pub fn describe_base_altitude(value_m: f64, origin: BaseAltitudeOrigin) -> String {
+    format!("{value_m:.1} m（{}）", origin.label())
+}
+
+/// 解析本次轨迹的海拔基准。
+///
+/// 优先级（审计 C10 的要求）：
+/// 1. `manual_altitude`（用户显式填的绝对海拔）；
+/// 2. `manual_altitude_range`（区间模式，取中值当回归基准，生成后再整体映射到区间）；
+/// 3. `school_base_altitude`（学校预设，填一次）；
+/// 4. 都没有 → [`DEFAULT_BASE_ALTITUDE_M`]（82 m），**不是随机区间**。
+///
+/// 非法值（NaN / 超出 -500–9000）一律跳过并继续往下找，不生成不可序列化的 bdA。
+pub fn resolve_base_altitude(
+    manual: Option<f64>,
+    range: Option<AltitudeRange>,
+    school: Option<f64>,
+) -> (f64, BaseAltitudeOrigin) {
+    if let Some(value) = manual.filter(|v| is_valid_altitude(*v)) {
+        return (value, BaseAltitudeOrigin::Manual);
+    }
+    if let Some(range) = range.filter(|r| is_valid_altitude(r.min_m) && is_valid_altitude(r.max_m))
+    {
+        return (
+            (range.min_m + range.max_m) / 2.0,
+            BaseAltitudeOrigin::ManualRange,
+        );
+    }
+    if let Some(value) = school.filter(|v| is_valid_altitude(*v)) {
+        return (value, BaseAltitudeOrigin::School);
+    }
+    (DEFAULT_BASE_ALTITUDE_M, BaseAltitudeOrigin::Default)
+}
+
+fn is_valid_altitude(value: f64) -> bool {
+    value.is_finite() && (ALTITUDE_MIN_M..=ALTITUDE_MAX_M).contains(&value)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AltitudeSpec {
     Single(f64),
@@ -45,8 +124,10 @@ pub fn parse_spec(text: &str) -> Result<Option<AltitudeSpec>, String> {
 }
 
 fn validate_altitude(altitude_m: f64) -> Result<(), String> {
-    if !altitude_m.is_finite() || !(-500.0..=9000.0).contains(&altitude_m) {
-        return Err("手动海拔必须是 -500 到 9000 米之间的数字".into());
+    if !is_valid_altitude(altitude_m) {
+        return Err(format!(
+            "手动海拔必须是 {ALTITUDE_MIN_M:.0} 到 {ALTITUDE_MAX_M:.0} 米之间的数字"
+        ));
     }
     Ok(())
 }
@@ -71,6 +152,31 @@ pub fn override_bd_a(track: &mut Track, altitude_m: f64) -> Result<(), String> {
         point.hasAltitude = true;
     }
     Ok(())
+}
+
+/// 把整条轨迹的海拔**平移到**指定基准（保形，不改爬升）。
+///
+/// 生成器内部的基准是随机的（`rng.uniform(20.0, 260.0)`，C10 的老问题）；
+/// 生成之后把整条曲线整体平移 `base − mean(bdA)` 米：
+/// - 报出的绝对高程落在学校基准 / 手动值 / 默认 82 m 上；
+/// - 曲线原有的起伏与 `totalAscent` **原样保留** —— 直接 `override_bd_a` 会把
+///   每个点压成同一个值，于是每条记录的 ascent 都是 0，那本身就是另一种机器特征。
+///
+/// 非法基准或空轨迹时原样返回（调用方已用 [`resolve_base_altitude`] 归一过）。
+pub fn shift_to_base_altitude(track: &mut Track, base_m: f64) {
+    if !is_valid_altitude(base_m) || track.locations.is_empty() {
+        return;
+    }
+    let count = track.locations.len() as f64;
+    let mean = track.locations.iter().map(|p| p.bdA).sum::<f64>() / count;
+    if !mean.is_finite() {
+        return;
+    }
+    let delta = base_m - mean;
+    for point in &mut track.locations {
+        point.bdA = round_to(point.bdA + delta, 2);
+        point.hasAltitude = true;
+    }
 }
 
 /// 将生成器的海拔曲线平滑映射到用户指定的绝对海拔区间。
@@ -151,5 +257,112 @@ mod tests {
             .locations
             .iter()
             .all(|p| (11.6..=22.8).contains(&p.bdA)));
+    }
+
+    /// C10：基准海拔的优先级与「没有就回退 82、不抽样」的契约。
+    ///
+    /// 优先级：手动单值 > 手动区间（中值）> 学校基准 > 默认 82。
+    #[test]
+    fn base_altitude_priority_and_fallback() {
+        let range = AltitudeRange {
+            min_m: 100.0,
+            max_m: 140.0,
+        };
+        assert_eq!(
+            resolve_base_altitude(Some(1050.0), Some(range), Some(200.0)),
+            (1050.0, BaseAltitudeOrigin::Manual),
+            "手动单值必须最高优先"
+        );
+        assert_eq!(
+            resolve_base_altitude(None, Some(range), Some(200.0)),
+            (120.0, BaseAltitudeOrigin::ManualRange),
+            "手动区间排第二（基准取中值）"
+        );
+        assert_eq!(
+            resolve_base_altitude(None, None, Some(1050.0)),
+            (1050.0, BaseAltitudeOrigin::School),
+            "学校基准排第三（包头校区 1050 m）"
+        );
+        assert_eq!(
+            resolve_base_altitude(None, None, None),
+            (DEFAULT_BASE_ALTITUDE_M, BaseAltitudeOrigin::Default),
+            "三者都没有时必须回退 82 m"
+        );
+        assert_eq!(DEFAULT_BASE_ALTITUDE_M, 82.0, "默认基准被改动过");
+        // 非法值跳过往下找，而不是生成不可序列化的高程。
+        assert_eq!(
+            resolve_base_altitude(Some(f64::NAN), None, Some(1050.0)),
+            (1050.0, BaseAltitudeOrigin::School)
+        );
+        assert_eq!(
+            resolve_base_altitude(None, None, Some(9001.0)),
+            (DEFAULT_BASE_ALTITUDE_M, BaseAltitudeOrigin::Default)
+        );
+        // 说明文案必须带来源，否则用户不知道自己报了什么。
+        let text = describe_base_altitude(1050.0, BaseAltitudeOrigin::School);
+        assert!(text.contains("1050.0"), "{text}");
+        assert!(text.contains("学校基准"), "{text}");
+    }
+
+    /// C10 的输出侧验证：包装函数之后**报出去的海拔**才是关键。
+    ///
+    /// ① 整条轨迹的均值落在给定基准上（包头 1050 m），不是 20–260 随机；
+    /// ② 同一 seed 两次运行逐点一致（随机基准已被覆盖）；
+    /// ③ 起伏与 totalAscent 不被压平 —— 这是与 `override_bd_a`（每点同值、
+    ///    于是每条记录 ascent=0）的区别，也是选「平移」而不是「覆盖」的理由。
+    #[test]
+    fn base_altitude_shifting_keeps_the_curve_and_is_deterministic() {
+        use crate::track::generator::build_tuned_with_altitude;
+        let pts = points();
+        let run = |base: f64| {
+            build_tuned_with_altitude(
+                1200.0,
+                600,
+                7,
+                (38.9, 121.54),
+                1_700_000_000_000,
+                &pts,
+                0.0,
+                base,
+            )
+        };
+        let a = run(1050.0);
+        let b = run(1050.0);
+        let mean = a.locations.iter().map(|p| p.bdA).sum::<f64>() / a.locations.len() as f64;
+        assert!(
+            (mean - 1050.0).abs() < 0.01,
+            "均值 {mean:.3} m 没有落在学校基准 1050 m 上"
+        );
+        let hi = a.locations.iter().map(|p| p.bdA).fold(f64::MIN, f64::max);
+        let lo = a.locations.iter().map(|p| p.bdA).fold(f64::MAX, f64::min);
+        assert!(hi - lo > 0.05, "海拔曲线被压平了（起伏 {:.3} m）", hi - lo);
+        assert_eq!(
+            a.locations
+                .iter()
+                .map(|p| p.bdA.to_bits())
+                .collect::<Vec<_>>(),
+            b.locations
+                .iter()
+                .map(|p| p.bdA.to_bits())
+                .collect::<Vec<_>>(),
+            "同一 seed 两次运行的海拔不一致 —— 说明基准仍是随机的"
+        );
+        assert_eq!(
+            total_ascent(&a.locations),
+            total_ascent(&b.locations),
+            "平移后爬升必须逐位一致"
+        );
+        // 默认路径：82 m（不是随机区间）。
+        let default = run(DEFAULT_BASE_ALTITUDE_M);
+        let mean_default =
+            default.locations.iter().map(|p| p.bdA).sum::<f64>() / default.locations.len() as f64;
+        assert!(
+            (mean_default - 82.0).abs() < 0.01,
+            "默认基准 {mean_default:.3} m 不是 82 m"
+        );
+        // 轨迹形态不受海拔平移影响。
+        assert_eq!(a.locations.len(), default.locations.len());
+        assert_eq!(a.totalDistance, default.totalDistance);
+        assert_eq!(a.totalTime, default.totalTime);
     }
 }

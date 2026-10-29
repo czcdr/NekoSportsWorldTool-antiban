@@ -222,23 +222,45 @@ fn lost_response_reconciles_uuid_without_reposting() {
         vec![RECORD_PATH, crate::api::records::RECORDS_PATH]
     );
 }
+/// 超时 + 列表确认没有 → 允许**一次**重提（0.9.0 的 Unknown 契约）。
+///
+/// 顺序必须是「先落 Unknown、再只读对账、确认缺失才放行」：断言请求序列里
+/// RECORDS_PATH 只出现一次、且它排在第二次 RECORD_PATH 之前 —— 重提不是盲目的，
+/// 而是拿着记录列表核对过之后才发生。
 #[test]
-fn missing_list_after_timeout_and_restart_never_reposts() {
+fn timeout_without_a_matching_record_allows_one_retry() {
     let _fixture = Fixture::new();
-    let (host, task) = server(vec![Reply::Lost, Reply::List(false), Reply::List(false)]);
+    let (host, task) = server(vec![
+        Reply::Lost,
+        Reply::List(false),
+        Reply::Record(json!({"error":10000,"data":{"rrid":43}})),
+    ]);
     let p = params();
-    assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("提交结果未知"));
-    assert!(
-        error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("上次提交结果仍未知")
+    let message = error(submit_record(&mut client(&host), &p, &mut |_| {}));
+    assert!(message.contains("提交结果未知"), "{message}");
+    assert!(message.contains("允许重新提交"), "{message}");
+    assert_eq!(
+        submit_record(&mut client(&host), &p, &mut |_| {})
+            .expect("对账确认没有入账后就该允许重提")
+            .rrid,
+        43
     );
     assert_eq!(
-        task.join()
-            .unwrap()
-            .iter()
-            .filter(|p| *p == RECORD_PATH)
-            .count(),
-        1
+        task.join().unwrap(),
+        vec![RECORD_PATH, crate::api::records::RECORDS_PATH, RECORD_PATH]
     );
+}
+/// 对账这一步本身失败（列表拉不到）时必须继续挡住：没有证据就不许重发。
+#[test]
+fn failed_reconciliation_keeps_blocking_the_retry() {
+    let _fixture = Fixture::new();
+    // 只给一个 Lost：第二次提交的 preflight 拿不到列表，必须被挡住且不发提交请求。
+    let (host, task) = server(vec![Reply::Lost]);
+    let p = params();
+    assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("提交结果未知"));
+    let message = error(submit_record(&mut client(&host), &p, &mut |_| {}));
+    assert!(message.contains("上次提交结果未知"), "{message}");
+    assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
 }
 #[test]
 fn explicit_rejection_can_be_retried_by_user_but_not_automatically() {
@@ -257,8 +279,9 @@ fn explicit_rejection_can_be_retried_by_user_but_not_automatically() {
     );
     assert_eq!(task.join().unwrap().len(), 2);
 }
+/// 「响应看着像成功但没有 rrid」= 结果未知：不能当成功，也不能当失败。
 #[test]
-fn malformed_success_stays_pending() {
+fn malformed_success_is_recorded_as_unknown() {
     for response in [
         json!({}),
         json!({"error":10000,"data":{}}),

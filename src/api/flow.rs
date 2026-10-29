@@ -8,8 +8,9 @@ use super::policy::fetch_policy;
 use super::records::fetch_one_record;
 use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::location::Coordinate;
+use crate::track::generate_road::build_road_tuned_with_altitude as build_road_with_altitude;
 use crate::track::generate_road::RouteMode;
-use crate::track::generator::build_tuned as gen_track_tuned;
+use crate::track::generator::build_tuned_with_altitude as gen_track_tuned_with_altitude;
 use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
 use serde_json::Value;
 
@@ -247,6 +248,71 @@ fn second_precision_start(base_ms: i64, draw: u32, now_ms: i64) -> i64 {
     (base_ms + (draw % 60_000) as i64).min(now_ms)
 }
 
+/// C1：开始时间 + 用时不得越过现在。
+///
+/// 指定时刻模式下 `specified_time()` / CLI 的 `--time` 只把**开始时间**钳到今天或现在，
+/// 于是「现在 12:05、指定 12:00、用时 30 分钟」会得到 `stopTime = 12:30`（未来）。
+/// 真机不可能提交一段还没跑完的记录，服务端看到 stopTime 晚于创建时间就是硬矛盾。
+///
+/// `dur` 必须是**最终**时长（`effective_duration` 之后的值）：它会二次改变时长，
+/// 先校验再改等于白校验。
+fn reject_future_stop(start_ms: i64, dur: i64, now_ms: i64) -> Result<(), String> {
+    let stop = dur
+        .checked_mul(1000)
+        .and_then(|ms| start_ms.checked_add(ms));
+    match stop {
+        Some(stop) if stop <= now_ms => Ok(()),
+        Some(stop) => Err(format!(
+            "开始时间 {} + 用时 {dur}s = 结束 {} 落在未来（现在 {}）：\
+             指定时刻太靠近现在，请把开始时间提前到至少 {dur} 秒之前，或改用随机时刻",
+            crate::track::geom::fmt_cst(start_ms, "%m-%d %H:%M:%S"),
+            crate::track::geom::fmt_cst(stop, "%m-%d %H:%M:%S"),
+            crate::track::geom::fmt_cst(now_ms, "%m-%d %H:%M:%S"),
+        )),
+        None => Err("时间范围溢出".into()),
+    }
+}
+
+/// F3（t3 验收 low）：没配置学校基准时的海拔警告。
+///
+/// C10 把「随机 20–260 m」改回了固定 82 m —— 这只是把「随机错」换成「固定错」：
+/// 校区在包头（约 1050 m）时整条记录仍低几百米，而服务端只要知道校区高程就能看出来。
+/// 更重要的是**用户看不见**：它此前只是一条普通日志，UI 结论里没有。
+///
+/// 所以这条走 `warnings`（`RunOutcome::summary()` 会带进 UI 弹窗与 CLI 结论），
+/// 并明确写出两个出口：跑步页的「手动海拔」，或 `run --school-altitude`（落盘一次）。
+///
+/// 不改默认值：82 m 是 v0.8.0 的既有语义，换成任何别的常量只是换一种错。
+fn default_altitude_warning(origin: crate::track::altitude::BaseAltitudeOrigin) -> Option<String> {
+    use crate::track::altitude::BaseAltitudeOrigin;
+    if origin != BaseAltitudeOrigin::Default {
+        return None;
+    }
+    Some(
+        "未配置学校基准海拔：本次记录按默认 82 m 生成。校区不在地势平坦的平原时\
+         （例如包头约 1050 m），这条记录的海拔会与真实高程差出几百米，\
+         是服务端一眼可查的参数异常。出口：跑步页「手动海拔」填本次校区的绝对海拔，\
+         或执行 `run --school-altitude <米>`（写入 config.json 的 school_base_altitude，\
+         填一次之后所有记录都按它生成）"
+            .to_string(),
+    )
+}
+
+/// C3：本次计划距离不得低于学校门槛。
+///
+/// 门槛由校方下发（策略 `minDistance`），工具**不**下调它来凑达标；
+/// 计划比门槛短就直接不发请求 —— 那条记录无论如何都不会计入有效次数，
+/// 白跑一次还多一次风控计数。
+fn reject_below_min_distance(dist_m: f64, min_distance_m: i64) -> Result<(), String> {
+    if min_distance_m > 0 && dist_m < min_distance_m as f64 {
+        return Err(format!(
+            "本次计划 {dist_m:.0} m 低于学校要求的最低距离 {min_distance_m} m（策略 minDistance）：\
+             请把跑步距离下限调到 ≥ {min_distance_m} m 后再提交；工具不会下调学校门槛"
+        ));
+    }
+    Ok(())
+}
+
 /// A4：只读的围栏校验 —— 数一遍有多少采样点落在学校围栏外。
 ///
 /// Legacy（默认模式）只保证「经过打卡点」，生成的环还会向外鼓；Manual 拿不到路网时
@@ -366,6 +432,12 @@ pub fn run_full_flow_cancellable(
         "√ [policy] ts={} policy={} minDistance={} validTime={}",
         pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
     ));
+    // C3：计划距离低于学校门槛 → 就地拦下，不生成、不提交。
+    //
+    // 不改这一条，报文里就是「selDistance = 学校门槛 / totalDis = 更短 / complete = true」
+    // 三件互相矛盾的事实（默认距离区间 1.0–1.5 km 撞上 2000 m 门槛，每跑一次矛盾一次）。
+    // 学校门槛是校方规则，工具不下调它来凑达标；提前拦住也省得白跑一次还吃一次风控计数。
+    reject_below_min_distance(params.dist, pol.min_distance)?;
     // 人脸核验：服务端要不要，本工具都**不执行**核验。这里只把事实摆出来 ——
     // 让「这条记录可能被判无效」在跑之前就可见，而不是等详情页异常才发现。
     //
@@ -475,7 +547,11 @@ pub fn run_full_flow_cancellable(
     ));
     // Keep the user's location stable so preview and submission refer to the same campus.
     let mut params = *params;
+    // C1：`effective_duration` 会**二次改变**时长（配速越界时把 dur 拉回有效窗口），
+    // 所以任何「开始时间 + 时长是否越过现在」的判断都必须放在它之后 ——
+    // 放在前面就会漏掉「用户填 12:00、现在 12:05、dist/dur 又让 dur 变大」这一档。
     params.dur = crate::track::generate_road::effective_duration(params.dist, params.dur);
+    reject_future_stop(start_ms, params.dur, crate::crypto::envelope::now_ms())?;
     control.check()?;
     log(&format!(
         "[track] 生成轨迹 {:.0}m / {}s（{} 点位）…",
@@ -487,6 +563,20 @@ pub fn run_full_flow_cancellable(
     // 已在占位之前算好（`start_ms`），这里不再二次抽样。
     // GPS 抖动幅度（配置 gps_spread_m，0 = 旧行为）；只读一次，供下面各模式共用。
     let gps_spread_m = super::model::load_config().resolved_gps_spread_m();
+    // C10：海拔基准（手动 > 学校基准 > 默认 82 m）。接口不带高程，只能由配置给；
+    // 来源必须写进日志，否则用户不知道自己这条记录报了多少米。
+    let (base_alt_m, alt_origin) = super::model::load_config().resolved_base_altitude();
+    log(&format!(
+        "[alt] 海拔基准 {}",
+        crate::track::altitude::describe_base_altitude(base_alt_m, alt_origin)
+    ));
+    // F3（t3 验收 low）：没配置学校基准时，C10 只是把「随机 20–260 m」换成了
+    // 「固定 82 m」—— 包头校区（约 1050 m）照样差几百米，而且用户看不见。
+    // 这里升级成 warnings：进 UI 结论弹窗与 CLI 结论，并给出可操作的出口。
+    if let Some(warning) = default_altitude_warning(alt_origin) {
+        log(&format!("⚠ [alt] {warning}"));
+        warnings.push(warning);
+    }
     let mut track = match params.route_mode {
         RouteMode::Road => {
             if !fences.polygons.is_empty() {
@@ -509,7 +599,7 @@ pub fn run_full_flow_cancellable(
             } else {
                 "[road] 在学校围栏内沿点位闭环重复补足距离"
             });
-            crate::track::generate_road::build_road_tuned(
+            build_road_with_altitude(
                 params.dist,
                 params.dur,
                 params.seed,
@@ -518,6 +608,7 @@ pub fn run_full_flow_cancellable(
                 &route_pts,
                 &filtered,
                 gps_spread_m,
+                base_alt_m,
             )
             .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
         }
@@ -546,7 +637,7 @@ pub fn run_full_flow_cancellable(
                     let filtered =
                         crate::track::generate_road::apply_fences(&net, &fences.polygons);
                     log("[manual] 沿道路按点位顺序串联；不要求经过策略必经点");
-                    crate::track::generate_road::build_road_tuned(
+                    build_road_with_altitude(
                         params.dist,
                         params.dur,
                         params.seed,
@@ -555,12 +646,13 @@ pub fn run_full_flow_cancellable(
                         &[],
                         &filtered,
                         gps_spread_m,
+                        base_alt_m,
                     )
                     .map_err(|e| format!("自定义点位路由失败：{e}；可留空路网退回按点位连线"))?
                 }
                 Err(e) => {
                     log(&format!("[manual] 无可用路网（{e}），退回按点位连线"));
-                    gen_track_tuned(
+                    gen_track_tuned_with_altitude(
                         params.dist,
                         params.dur,
                         params.seed,
@@ -568,11 +660,12 @@ pub fn run_full_flow_cancellable(
                         start_ms,
                         &manual_pts,
                         gps_spread_m,
+                        base_alt_m,
                     )
                 }
             }
         }
-        RouteMode::Legacy => gen_track_tuned(
+        RouteMode::Legacy => gen_track_tuned_with_altitude(
             params.dist,
             params.dur,
             params.seed,
@@ -580,6 +673,7 @@ pub fn run_full_flow_cancellable(
             start_ms,
             &route_pts,
             gps_spread_m,
+            base_alt_m,
         ),
         // 第 4 种模式：瓦片矢量化路网。与 Road 的唯一差别是「路网从哪来」——
         // 这里读本地瓦片缓存（`tile_road::load`），之后的裁剪/路由完全复用同一套。
@@ -610,7 +704,7 @@ pub fn run_full_flow_cancellable(
             } else {
                 "[tiles] 在瓦片路网里沿点位闭环重复补足距离"
             });
-            crate::track::generate_road::build_road_tuned(
+            build_road_with_altitude(
                 params.dist,
                 params.dur,
                 params.seed,
@@ -619,6 +713,7 @@ pub fn run_full_flow_cancellable(
                 &route_pts,
                 &filtered,
                 gps_spread_m,
+                base_alt_m,
             )
             .map_err(|e| {
                 format!("瓦片路网路由失败：{e}；可在跑步页重新生成瓦片路网，或切回经典模式")
@@ -798,12 +893,13 @@ pub fn run_records(
                 session.uid,
                 session.unid.parse().map_err(|_| "学校编号无效")?,
             )?;
-            let found = guard.reconcile(&rows)?;
-            for id in found {
+            // 记录页刷新就是任务里说的「人去看一眼」：能靠列表定论的回执在这里落终态。
+            let now = crate::crypto::envelope::now_ms();
+            for id in guard.resolve(&rows, now)? {
                 log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交"));
             }
-            if guard.has_pending() {
-                log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效");
+            if guard.pending_count() > 0 {
+                log("[record] 仍有未决的提交回执（对账窗口内、或对账没有结论）；重复提交保护继续生效");
             }
             Ok::<_, String>(())
         })();
@@ -1066,3 +1162,104 @@ mod verification_tests {
 #[cfg(test)]
 #[path = "fake_run_tests.rs"]
 mod fake_run_tests;
+
+#[cfg(test)]
+mod audit_param_tests {
+    use super::*;
+
+    /// C1：指定时刻 + 时长越过现在 → 必须拒绝（stopTime 落在未来的复现）。
+    ///
+    /// 复现路径：`specified_time` 只把**开始时间**钳到 now，于是
+    /// 「现在 12:05、填 12:00、用时 30 分钟」得到 stopTime = 12:30。
+    /// 这里直接拿那一对值喂给校验函数。
+    #[test]
+    fn future_stop_time_is_rejected() {
+        let now = 1_700_000_000_000;
+        let start = now - 5 * 60_000; // 5 分钟前开始
+        let dur = 30 * 60; // 但要跑 30 分钟
+        let err = reject_future_stop(start, dur, now).unwrap_err();
+        assert!(err.contains("落在未来"), "{err}");
+        assert!(err.contains("12:30") || err.contains("未来"), "{err}");
+        // 刚好跑完（stop == now）允许；早一秒也允许。
+        assert!(reject_future_stop(now - dur * 1000, dur, now).is_ok());
+        assert!(reject_future_stop(now - dur * 1000 - 1, dur, now).is_ok());
+        // 溢出不能 panic。
+        assert!(reject_future_stop(i64::MAX - 5, 3_600, now).is_err());
+    }
+
+    /// C1：`effective_duration` 之后时长会变，校验必须用**最终**时长。
+    ///
+    /// 反例（改前就会漏判）：dist/dur 的配速越出有效窗口时，`effective_duration`
+    /// 会把 dur 拉大；按旧 dur 校验过的开始时间，在新 dur 下 stopTime 就落到未来。
+    #[test]
+    fn check_uses_the_effective_duration() {
+        let now = 1_700_000_000_000;
+        let dist = 3000.0;
+        let requested = 300; // 10 m/s，远超 SPEED_CEIL
+        let effective = crate::track::generate_road::effective_duration(dist, requested);
+        assert!(effective > requested, "本用例需要一个变长的时长");
+        let start = now - requested * 1000 - 1_000; // 按旧 dur 刚好放行
+        assert!(
+            reject_future_stop(start, requested, now).is_ok(),
+            "旧时长下本应放行（说明用例前提变了）"
+        );
+        assert!(
+            reject_future_stop(start, effective, now).is_err(),
+            "用最终时长校验时必须拒绝"
+        );
+    }
+
+    /// C3：计划距离低于学校门槛 → 本地拦截，且门槛原样保留（不下调凑达标）。
+    #[test]
+    fn plan_below_school_threshold_is_refused() {
+        let err = reject_below_min_distance(1200.0, 2000).unwrap_err();
+        assert!(err.contains("2000"), "要写明学校门槛：{err}");
+        assert!(err.contains("1200"), "要写明本次计划距离：{err}");
+        assert!(err.contains("不会下调学校门槛"), "要说明不改门槛：{err}");
+        // 达标 / 恰好达标 / 门槛未知 → 放行。
+        assert!(reject_below_min_distance(2000.0, 2000).is_ok());
+        assert!(reject_below_min_distance(2000.5, 2000).is_ok());
+        assert!(reject_below_min_distance(800.0, 0).is_ok());
+    }
+
+    /// F3：没配置学校基准时必须进 warnings（不是普通日志），且文案给出出口。
+    ///
+    /// 背景：C10 把「随机 20–260 m」改回固定 82 m，问题只是从「随机错」变成「固定错」。
+    /// 校区在包头（约 1050 m）时这条记录仍低几百米，用户如果不被告知就永远不会去填。
+    #[test]
+    fn unset_school_base_altitude_is_warned_with_an_exit() {
+        use crate::track::altitude::BaseAltitudeOrigin;
+        let warning =
+            default_altitude_warning(BaseAltitudeOrigin::Default).expect("默认基准必须给出警告");
+        // 文案要同时点出「按 82 m 生成」和两个可操作的出口。
+        assert!(warning.contains("82"), "要写明当前用的默认值：{warning}");
+        assert!(
+            warning.contains("--school-altitude"),
+            "要给出 CLI 出口：{warning}"
+        );
+        assert!(
+            warning.contains("school_base_altitude"),
+            "要给出配置文件键名：{warning}"
+        );
+        assert!(
+            warning.contains("手动海拔"),
+            "要给出 UI 出口（跑步页手动海拔）：{warning}"
+        );
+        assert!(
+            warning.contains("未配置学校基准海拔"),
+            "要说明原因：{warning}"
+        );
+
+        // 配了基准就不该再唠叨：学校基准 / 手动单值 / 手动区间都算「已配置」。
+        for origin in [
+            BaseAltitudeOrigin::School,
+            BaseAltitudeOrigin::Manual,
+            BaseAltitudeOrigin::ManualRange,
+        ] {
+            assert!(
+                default_altitude_warning(origin).is_none(),
+                "{origin:?} 已配置基准，不该再警告"
+            );
+        }
+    }
+}

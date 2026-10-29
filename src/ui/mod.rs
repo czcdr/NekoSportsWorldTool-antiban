@@ -22,6 +22,7 @@ pub mod msgs;
 pub mod osm;
 mod preview_jobs;
 pub mod records;
+pub mod recover_panel;
 mod road_tools;
 pub mod run;
 pub mod theme;
@@ -51,6 +52,10 @@ pub const UPDATE_CHK: &str = "__UPDATE_CHK__";
 pub const UPDATE_PROG: &str = "__UPDATE_PROG__";
 pub const UPDATE_DONE: &str = "__UPDATE_DONE__";
 pub const POINTS_DONE: &str = "__POINTS_DONE__";
+/// 只读诊断结果（`recover_panel::DiagSnapshot` 的 JSON）。
+pub const RECOVER: &str = "__RECOVER__";
+/// 单条试修 + 复查结果。
+pub const RECOVER_FIX: &str = "__RECOVER_FIX__";
 
 /// 保存配置并把失败原因交回调用方显示。
 ///
@@ -199,6 +204,8 @@ impl eframe::App for App {
                 self.popup = None;
             }
         }
+        // 单条试修的二次确认：与普通弹窗同级，切页也不会丢，且不依赖右键/长按。
+        self.draw_recover_confirm(ctx);
         // 过码弹窗最后画：它压在标签页与普通弹窗之上，且不管当前停在哪个页面
         // 都要出现（登录线程可能是在任意页面上被点下去的）。
         self.draw_update_windows(ctx);
@@ -388,19 +395,8 @@ impl App {
                     );
                     ui.label(egui::RichText::new("Powered by").color(theme::text_dim()));
                     ui.separator();
-                    if ui
-                        .add_enabled(
-                            !(self.update.checking || self.update.downloading),
-                            egui::Button::new(
-                                egui::RichText::new("检查更新")
-                                    .small()
-                                    .color(theme::text_dim()),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.check_update(true);
-                    }
+                    // A3：底栏不再放「检查更新」：关于页有同名同功能按钮，而紧凑模式
+                    // 底栏（上一条 return 分支）本来就不画它。底栏只报版本号。
                     ui.label(
                         egui::RichText::new(format!("v{}", crate::platform::version_name()))
                             .small()
@@ -498,6 +494,11 @@ impl App {
                     .manual_altitude_range
                     .map(|r| format!("{}-{}", r.min_m, r.max_m))
                     .or_else(|| config.manual_altitude.map(|v| v.to_string()))
+                    .unwrap_or_default(),
+                // 学校基准海拔：从 config 回填，空白 = 未配置（None）。
+                school_base_altitude: config
+                    .school_base_altitude
+                    .map(|v| v.to_string())
                     .unwrap_or_default(),
                 start_mode: 0,
                 days_ago: 0,

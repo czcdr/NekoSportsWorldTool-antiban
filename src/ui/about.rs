@@ -60,12 +60,15 @@ impl App {
         // ── 检查 / 版本信息 ────────────────────────────────────
         ui.horizontal(|ui| {
             let busy = self.update.checking || self.update.downloading;
-            if ui
-                .add_enabled(!busy, theme::primary_btn("检查更新"))
-                .clicked()
-            {
-                self.check_update(true);
-            }
+            // 主操作 44pt（A 类：仅主操作，列表/链接不动）。
+            super::mobile::action_row(ui, |ui| {
+                if ui
+                    .add_enabled(!busy, theme::primary_btn("检查更新"))
+                    .clicked()
+                {
+                    self.check_update(true);
+                }
+            });
             if self.update.checking {
                 ui.colored_label(theme::text_dim(), "检查中…");
             } else if self.update.up_to_date {
@@ -158,19 +161,36 @@ impl App {
         ui.separator();
 
         // ── 启动检查模式 ───────────────────────────────────────
+        // A8：原来三个 18pt 单选横排（手机上难点准、且占一行），改成一个下拉。
+        // 写的是同一个 config.update_check，落盘分支不变。
         ui.label("启动时检查更新：");
+        let current_label = match self.config.update_check.as_str() {
+            "ask" => "每次询问",
+            "off" => "关闭",
+            _ => "静默检查（发现新版才提示）",
+        };
         ui.horizontal(|ui| {
-            for (m, label) in [
-                ("silent", "静默检查（发现新版才提示）"),
-                ("ask", "每次询问"),
-                ("off", "关闭"),
-            ] {
-                let selected = self.config.update_check == m;
-                if ui.radio(selected, label).clicked() {
-                    self.config.update_check = m.to_string();
-                    if crate::api::model::save_config(&self.config).is_ok() {
-                        self.status = "已保存启动检查设置".into();
+            let mut picked: Option<&str> = None;
+            egui::ComboBox::from_id_salt("update_check_mode")
+                .selected_text(current_label)
+                .show_ui(ui, |ui| {
+                    for (m, label) in [
+                        ("silent", "静默检查（发现新版才提示）"),
+                        ("ask", "每次询问"),
+                        ("off", "关闭"),
+                    ] {
+                        if ui
+                            .selectable_label(self.config.update_check == m, label)
+                            .clicked()
+                        {
+                            picked = Some(m);
+                        }
                     }
+                });
+            if let Some(m) = picked {
+                self.config.update_check = m.to_string();
+                if crate::api::model::save_config(&self.config).is_ok() {
+                    self.status = "已保存启动检查设置".into();
                 }
             }
         });

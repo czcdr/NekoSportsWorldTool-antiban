@@ -79,6 +79,11 @@ pub struct RunPage {
     pub pace_max: f32,
     /// 手动绝对海拔（米）；空白表示使用生成器默认海拔。
     pub manual_altitude: String,
+    /// 学校基准海拔（米）的输入缓冲；空白 = 未配置（`config.school_base_altitude == None`）。
+    ///
+    /// 这是 flow.rs「未配置学校基准海拔」警告在 App 内的出口：手机上不用连命令行
+    /// 也能填一次，之后所有记录都按它生成（优先级低于手动海拔）。
+    pub school_base_altitude: String,
     /// GPS 抖动幅度（单点稳态标准差，米）；0 = 旧的自动区间 2.8–4.2 m。
     pub gps_spread_m: f64,
     /// 上传锚点的计划级随机偏移（米）；0 = 精确锚点。
@@ -142,6 +147,8 @@ pub struct RunSettings {
     pub face_check: bool,
     pub route_mode: RouteMode,
     pub manual_altitude: String,
+    /// 学校基准海拔（米）；空白 = 未配置。与 `manual_altitude` 并存时后者优先。
+    pub school_base_altitude: String,
     pub gps_spread_m: f64,
     pub anchor_offset_m: f64,
 }
@@ -156,6 +163,7 @@ impl RunSettings {
             face_check: page.face_check,
             route_mode: page.route_mode,
             manual_altitude: page.manual_altitude.clone(),
+            school_base_altitude: page.school_base_altitude.clone(),
             gps_spread_m: page.gps_spread_m,
             anchor_offset_m: page.anchor_offset_m,
         }
@@ -187,21 +195,52 @@ impl RunSettings {
             Ok(None) => {
                 config.manual_altitude = None;
                 config.manual_altitude_range = None;
-                Ok(())
             }
             Ok(Some(crate::track::altitude::AltitudeSpec::Single(value))) => {
                 config.manual_altitude = Some(value);
                 config.manual_altitude_range = None;
-                Ok(())
             }
             Ok(Some(crate::track::altitude::AltitudeSpec::Range(range))) => {
                 config.manual_altitude = None;
                 config.manual_altitude_range = Some(range);
-                Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
         }
+        // 学校基准海拔：空 = 未配置；非法值保留配置里的原值并回传错误，
+        // 不静默丢弃（否则用户填了 10500 却以为已经存上）。
+        match parse_school_altitude(&self.school_base_altitude) {
+            Ok(None) => config.school_base_altitude = None,
+            Ok(Some(value)) => config.school_base_altitude = Some(value),
+            Err(error) => return Err(error),
+        }
+        Ok(())
     }
+}
+
+/// 解析「学校基准海拔（米）」输入框。
+///
+/// 空 = 未配置（`None`，回落到默认 82 m）；范围与
+/// `track::altitude` 的校验完全一致（`ALTITUDE_MIN_M..=ALTITUDE_MAX_M`），
+/// 非法时返回错误文本——调用方保留旧值，并把这句话显示在行内与状态栏。
+pub(crate) fn parse_school_altitude(text: &str) -> Result<Option<f64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("学校基准海拔「{text}」不是数字，未保存"))?;
+    if !value.is_finite()
+        || !(crate::track::altitude::ALTITUDE_MIN_M..=crate::track::altitude::ALTITUDE_MAX_M)
+            .contains(&value)
+    {
+        return Err(format!(
+            "学校基准海拔 {value} 超出 {}–{} 米，未保存（原值保留）",
+            crate::track::altitude::ALTITUDE_MIN_M as i64,
+            crate::track::altitude::ALTITUDE_MAX_M as i64
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// 一次提交的确定方案（进入页面/参数变更时抽样生成）。
@@ -267,11 +306,19 @@ impl RunPage {
     }
 
     /// 按当前模式与日期取一个开始时刻（随机模式抽样，指定模式采纳输入框）。
+    ///
+    /// C1：**两种模式都要按「现在 − 用时 − 抖动余量」封顶**。
+    /// 原来只有随机模式走 `latest_start_ms`，指定模式直接采纳输入框
+    /// （`specified_time` 只 `.min(now)`），于是「现在 12:05、填 12:00、用时 30 分钟」
+    /// 会得到 stopTime = 12:30 —— 一段落在未来的记录。真机不可能提交还没跑完的记录。
+    ///
+    /// 用户填的那一刻仍然优先：只有它会越过上限时才回退到上限（同一天内、不跨日）。
     fn pick_time(&self) -> i64 {
+        let latest = Self::latest_start_ms(self.dur_hint());
         if self.start_mode == 0 {
-            random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint()))
+            random_time_ago(self.days_ago, latest)
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            specified_time(self.days_ago, self.hour, self.minute).min(latest)
         }
     }
 
@@ -502,10 +549,29 @@ impl App {
 
     fn draw_run_content(&mut self, ui: &mut egui::Ui) {
         let prev_route = self.run_page.route_mode;
+        // 矮屏上把行距收到 2px：本页有 8~10 行参数，默认行距白吃 ~10px，
+        // 而 A1 要求主操作进首屏——这是最便宜的一档。
+        ui.spacing_mut().item_spacing.y = 2.0;
         // 进入本帧前的参数快照：画完比对，变了就标脏（见 draw_run_content 末尾）。
         let settings_before = RunSettings::from_page(&self.run_page);
         let gps_spread_before = self.run_page.gps_spread_m;
         let anchor_offset_before = self.run_page.anchor_offset_m;
+        // C10：先把「这条记录会报多少米、依据是什么」算好再进渲染块
+        // （块内 `page` 是 &mut self.run_page，不能再借 self.config）。
+        // 界面不写来源，用户就不知道自己报的是 82 m 还是校区高程。
+        let (base_alt_m, base_alt_origin) = self.config.resolved_base_altitude();
+        let altitude_hint = format!(
+            "留空自动；可填 17.2 或 11.6-22.8 · 当前生效：{}",
+            crate::track::altitude::describe_base_altitude(base_alt_m, base_alt_origin)
+        );
+        // 学校基准海拔：flow.rs「未配置学校基准海拔」警告在 App 内的出口。
+        // 优先级与 `track::altitude::resolve_base_altitude` 逐条一致；
+        // 同时把当前 origin 摆出来，避免「填了学校基准、手动海拔却在生效」看不出来。
+        let school_altitude_hint = format!(
+            "留空 = 未配置。优先级：手动海拔（单值/区间）> 学校基准 > 默认 {:.0} m。当前生效：{}",
+            crate::track::altitude::DEFAULT_BASE_ALTITUDE_M,
+            crate::track::altitude::describe_base_altitude(base_alt_m, base_alt_origin)
+        );
         {
             let page = &mut self.run_page;
             let compact = mobile::compact_ui(ui);
@@ -569,60 +635,124 @@ impl App {
                     draw_pace_inputs(ui);
                 });
             }
-            mobile::row(ui, |ui| {
-                ui.label("手动海拔（米/区间）：");
-                mobile::text_edit(
-                    ui,
-                    "run_manual_altitude",
-                    &mut page.manual_altitude,
-                    crate::platform::InputKind::Text,
-                    120.0,
-                );
-                ui.label("留空自动；可填 17.2 或 11.6-22.8");
-            });
-            // 本地生成参数（不进协议字段）：抖动幅度 + 上传锚点偏移。
-            mobile::row(ui, |ui| {
-                ui.label("GPS 抖动（米）：");
-                mobile::drag_f64(
-                    ui,
-                    "run_gps_spread",
-                    &mut page.gps_spread_m,
-                    0.0..=crate::api::model::GPS_SPREAD_MAX_M,
-                    0.1,
-                    1,
-                );
-                ui.label("0 = 旧行为（道路/瓦片：每 seed 2.8–4.2 m；经典：固定 1.08 m）");
-                ui.separator();
-                ui.label("锚点偏移（米）：");
-                mobile::drag_f64(
-                    ui,
-                    "run_anchor_offset",
-                    &mut page.anchor_offset_m,
-                    0.0..=crate::api::model::ANCHOR_OFFSET_MAX_M,
-                    1.0,
-                    0,
-                );
-                ui.label("默认 0（关闭）；开启后每份计划偏移约 40–60 m，可能让点位更贴近围栏边缘");
-            });
-            // 固定种子（复现用，不落盘）：默认不钉，每次重新抽。
-            mobile::row(ui, |ui| {
-                let mut pinned = page.fixed_seed.is_some();
-                if ui.checkbox(&mut pinned, "固定种子").changed() {
-                    page.fixed_seed = pinned.then_some(page.fixed_seed.unwrap_or(7));
-                    // 抽取规则变了：旧方案是按旧规则算的，重来一份。
-                    page.clear_plan_cache();
-                }
-                if let Some(seed) = page.fixed_seed.as_mut() {
-                    let mut value = (*seed).min(i64::MAX as u64) as i64;
-                    mobile::drag_i64(ui, "run_fixed_seed", &mut value, 0..=i64::MAX, 1.0, "", "");
-                    *seed = value.max(0) as u64;
-                }
-                ui.label("不勾 = 每次重新抽取（提交后也会重抽）");
-            });
+            // 高级生成参数：都不进协议字段、且都有「0/空 = 旧行为」的默认值，
+            // 默认收起，把首屏让给主操作（A5，见 review/UI-IMPL.md）。
+            egui::CollapsingHeader::new("高级生成参数（不填即用默认值）")
+                .default_open(false)
+                .show(ui, |ui| {
+                    mobile::row(ui, |ui| {
+                        ui.label("手动海拔（米/区间）：");
+                        mobile::text_edit(
+                            ui,
+                            "run_manual_altitude",
+                            &mut page.manual_altitude,
+                            crate::platform::InputKind::Text,
+                            120.0,
+                        );
+                    });
+                    ui.colored_label(theme::text_dim(), &altitude_hint);
+                    // ── 学校基准海拔（t10）──────────────────────────────
+                    // flow.rs 的「未配置学校基准海拔」警告需要一个 App 内出口：
+                    // 手机上没法跑 `run --school-altitude`，也不能靠「手动海拔」顶替
+                    // （手动海拔是本次覆盖，学校基准是填一次长期生效）。
+                    mobile::row(ui, |ui| {
+                        ui.label("学校基准海拔（米）：");
+                        let response = mobile::text_edit(
+                            ui,
+                            "run_school_base_altitude",
+                            &mut page.school_base_altitude,
+                            crate::platform::InputKind::Decimal,
+                            120.0,
+                        );
+                        // 行内状态：填了才算「已配置」，空着就是 None（回落到默认）。
+                        let state = match parse_school_altitude(&page.school_base_altitude) {
+                            Ok(None) => ("未配置", theme::text_dim()),
+                            Ok(Some(_)) => ("已配置", theme::ok()),
+                            Err(_) => ("未生效", theme::err()),
+                        };
+                        response.on_hover_text(
+                            "留空 = 未配置（回落到默认 82 m）。填一次后所有记录都按它生成。",
+                        );
+                        ui.colored_label(state.1, state.0);
+                    });
+                    ui.colored_label(theme::text_dim(), &school_altitude_hint);
+                    if let Err(error) = parse_school_altitude(&page.school_base_altitude) {
+                        ui.colored_label(theme::err(), format!("学校基准海拔未生效：{error}"));
+                    }
+                    ui.colored_label(
+                        theme::text_dim(),
+                        "提交结论里的「未配置学校基准海拔」警告，就是让你在这里填。",
+                    );
+                    // 每行只放一个数值框 + 说明另起一行：原来「抖动 / 分隔符 / 锚点偏移」
+                    // 挤在同一个不换行的 horizontal 里，640 宽下溢出 76 px（A4 横向裁切）。
+                    mobile::row(ui, |ui| {
+                        ui.label("GPS 抖动（米）：");
+                        mobile::drag_f64(
+                            ui,
+                            "run_gps_spread",
+                            &mut page.gps_spread_m,
+                            0.0..=crate::api::model::GPS_SPREAD_MAX_M,
+                            0.1,
+                            1,
+                        );
+                    });
+                    ui.colored_label(
+                        theme::text_dim(),
+                        "0 = 旧行为（道路/瓦片：每 seed 2.8–4.2 m；经典：固定 1.08 m）",
+                    );
+                    mobile::row(ui, |ui| {
+                        ui.label("锚点偏移（米）：");
+                        mobile::drag_f64(
+                            ui,
+                            "run_anchor_offset",
+                            &mut page.anchor_offset_m,
+                            0.0..=crate::api::model::ANCHOR_OFFSET_MAX_M,
+                            1.0,
+                            0,
+                        );
+                    });
+                    ui.colored_label(
+                        theme::text_dim(),
+                        "默认 0（关闭）；开启后每份计划偏移约 40–60 m，可能让点位更贴近围栏边缘",
+                    );
+                    // 固定种子（复现用，不落盘）：默认不钉，每次重新抽。
+                    mobile::row(ui, |ui| {
+                        let mut pinned = page.fixed_seed.is_some();
+                        if ui.checkbox(&mut pinned, "固定种子").changed() {
+                            page.fixed_seed = pinned.then_some(page.fixed_seed.unwrap_or(7));
+                            // 抽取规则变了：旧方案是按旧规则算的，重来一份。
+                            page.clear_plan_cache();
+                        }
+                        if let Some(seed) = page.fixed_seed.as_mut() {
+                            let mut value = (*seed).min(i64::MAX as u64) as i64;
+                            mobile::drag_i64(
+                                ui,
+                                "run_fixed_seed",
+                                &mut value,
+                                0..=i64::MAX,
+                                1.0,
+                                "",
+                                "",
+                            );
+                            *seed = value.max(0) as u64;
+                        }
+                    });
+                    ui.colored_label(theme::text_dim(), "不勾 = 每次重新抽取（提交后也会重抽）");
+                    // 协议开关也归到「高级」：它有 config 默认值，收起不影响提交内容。
+                    mobile::row(ui, |ui| {
+                        ui.label("人脸校验标记：");
+                        ui.checkbox(&mut page.face_check, "faceCheck=1");
+                    });
+                });
             mobile::row(ui, |ui| {
                 ui.label("开始时间：");
                 ui.radio_value(&mut page.start_mode, 0, "随机时刻");
                 ui.radio_value(&mut page.start_mode, 1, "指定时刻");
+            });
+            // 日期下拉单独一行：它跟单选按钮挤在同一行时，egui 的
+            // `horizontal_wrapped` 拿不到 ComboBox 的期望宽度，360 宽下会溢出 20 px
+            // 并被页面右边界裁掉（A4 横向裁切）。
+            mobile::row(ui, |ui| {
                 ui.label("日期：");
                 egui::ComboBox::from_id_salt("run_days_ago")
                     .width(96.0)
@@ -663,19 +793,17 @@ impl App {
                     }
                 }
             }
-            mobile::row(ui, |ui| {
-                ui.label("人脸校验标记：");
-                ui.checkbox(&mut page.face_check, "faceCheck=1");
-            });
             ui.horizontal_wrapped(|ui| {
                 ui.label("路线算法：");
-                ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
-                ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
-                ui.selectable_value(&mut page.route_mode, RouteMode::Manual, "自定义点位")
+                // 四个模式名收短（原「经典打卡点环/真实道路路由/自定义点位/瓦片矢量化（实验）」
+                // 在 360 宽下要占两行）：含义由紧随其后的说明句承担，键位不变、默认值不变。
+                ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典");
+                ui.selectable_value(&mut page.route_mode, RouteMode::Road, "道路");
+                ui.selectable_value(&mut page.route_mode, RouteMode::Manual, "自定义")
                     .on_hover_text(
                         "只用实时点位顺序串联，不要求经过策略必经点；没有路网时按点位连线",
                     );
-                ui.selectable_value(&mut page.route_mode, RouteMode::Tiles, "瓦片矢量化（实验）")
+                ui.selectable_value(&mut page.route_mode, RouteMode::Tiles, "瓦片")
                     .on_hover_text(
                         "用百度栅格瓦片自己识别校内道路并建图：不依赖 OSM 导入，\
                          但结果取决于底图清晰度（文字遮挡/隧道/高架会断线）",
@@ -751,7 +879,7 @@ impl App {
             self.refresh_points();
         }
 
-        ui.add_space(8.0);
+        ui.add_space(2.0);
         let fmt_pace = |s: f32| format!("{}:{:02}", (s / 60.0) as i64, (s as i64) % 60);
         let fmt_dur = |s: i64| {
             if s >= 3600 {
@@ -781,14 +909,13 @@ impl App {
         };
         mobile::row(ui, |ui| {
             ui.colored_label(theme::plain(), plan_label);
-            if ui.small_button("换一版").clicked() {
-                self.run_page.regen_plan();
-            }
         });
 
-        self.draw_run_map(ui);
-
-        ui.add_space(8.0);
+        // A1：主操作提到地图之前 —— 手机上原来「开始跑步」在纸面下 1.5 屏。
+        // 心智顺序仍是「确认方案摘要（距离/配速/用时/开始时刻）→ 开始跑步 → 下方地图复核」；
+        // 预览没出来时在旁边明说，而不是把按钮藏掉（藏掉会让人不知道能不能点）。
+        // 「换一版」也并进这一行：矮屏上少一整行 ≈ 20 px。
+        ui.add_space(2.0);
         if self.run_busy
             && ui
                 .add_enabled(
@@ -807,14 +934,25 @@ impl App {
         } else {
             theme::primary_btn("开始跑步")
         };
-        mobile::row(ui, |ui| {
-            if ui.add_enabled(enabled, btn).clicked() {
-                self.start_run();
-            }
-            if self.session.is_none() {
-                ui.label("（请先登录）");
-            }
+        mobile::action_row(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(enabled, btn).clicked() {
+                    self.start_run();
+                }
+                if ui.small_button("换一版").clicked() {
+                    self.run_page.regen_plan();
+                }
+                if self.session.is_none() {
+                    ui.label("（请先登录）");
+                }
+                if self.run_page.route_mode != RouteMode::Legacy && self.run_page.preview.is_none()
+                {
+                    ui.colored_label(theme::text_dim(), "（下方地图暂无路线预览）");
+                }
+            });
         });
+
+        self.draw_run_map(ui);
 
         // 改动即落盘：拖拽期间指针仍按着，先标脏；松手/输入提交后写一次。
         // 不再依赖「开始跑步」——那正是 faceCheck 勾了却丢失的原因。
@@ -1528,17 +1666,171 @@ mod tests {
         assert!(config.face_check, "海拔写错连带其它字段没保存");
     }
 
+    /// 学校基准海拔：填了写进 config、留空回落到 None。
+    ///
+    /// 这是 flow.rs「未配置学校基准海拔」警告在 App 内的出口，所以
+    /// 「留空 = 未配置」必须真的清掉旧值，不能留着上一所学校的高度。
+    #[test]
+    fn school_base_altitude_writes_config_and_blank_clears_it() {
+        let mut config = crate::api::model::Config::default();
+        let mut p = page(0, 0);
+        assert_eq!(
+            config.resolved_base_altitude(),
+            (82.0, crate::track::altitude::BaseAltitudeOrigin::Default),
+            "默认配置必须是 82 m"
+        );
+
+        p.school_base_altitude = " 1050 ".into();
+        RunSettings::from_page(&p).apply_to(&mut config).unwrap();
+        assert_eq!(config.school_base_altitude, Some(1050.0));
+        assert_eq!(
+            config.resolved_base_altitude(),
+            (1050.0, crate::track::altitude::BaseAltitudeOrigin::School),
+            "填了学校基准后 origin 必须是 School"
+        );
+
+        p.school_base_altitude = "   ".into();
+        RunSettings::from_page(&p).apply_to(&mut config).unwrap();
+        assert_eq!(config.school_base_altitude, None, "空白必须清成未配置");
+        assert_eq!(
+            config.resolved_base_altitude(),
+            (82.0, crate::track::altitude::BaseAltitudeOrigin::Default)
+        );
+    }
+
+    /// 非法值：保留已存值（不是静默丢弃，也不是写进去），并把原因交回界面。
+    #[test]
+    fn invalid_school_base_altitude_keeps_previous_value_and_reports() {
+        let mut config = crate::api::model::Config::default();
+        config.school_base_altitude = Some(1050.0);
+        for bad in ["abc", "-600", "9001", "NaN", "1 050"] {
+            let mut p = page(0, 0);
+            p.school_base_altitude = bad.into();
+            let error = RunSettings::from_page(&p)
+                .apply_to(&mut config)
+                .expect_err("非法学校基准海拔必须回传错误");
+            assert!(
+                error.contains("未保存"),
+                "提示要说明「没保存」而不是沉默：{error}"
+            );
+            assert_eq!(
+                config.school_base_altitude,
+                Some(1050.0),
+                "{bad} 覆盖了已存的学校基准海拔"
+            );
+        }
+    }
+
+    /// 与手动海拔并存时，界面显示的「当前生效」必须跟着 origin 走：
+    /// 学校基准还在配置里，但生效的是手动海拔——这正是学生容易误解的地方。
+    #[test]
+    fn manual_altitude_wins_over_school_base_but_school_stays_configured() {
+        use crate::track::altitude::{describe_base_altitude, BaseAltitudeOrigin};
+        let mut config = crate::api::model::Config::default();
+        config.school_base_altitude = Some(1050.0);
+        config.manual_altitude = Some(1200.0);
+
+        let (value, origin) = config.resolved_base_altitude();
+        assert_eq!((value, origin), (1200.0, BaseAltitudeOrigin::Manual));
+        let shown = describe_base_altitude(value, origin);
+        assert!(
+            shown.contains("手动海拔"),
+            "界面显示的是 origin 标签：{shown}"
+        );
+        assert_eq!(
+            config.school_base_altitude,
+            Some(1050.0),
+            "学校基准不该被手动海拔抹掉"
+        );
+
+        // 手动海拔清空后，学校基准重新接管。
+        config.manual_altitude = None;
+        assert_eq!(
+            config.resolved_base_altitude(),
+            (1050.0, BaseAltitudeOrigin::School)
+        );
+    }
+
+    /// 无头：折叠区点开后，输入框标签、优先级说明、当前 origin 三者都要真的画出来。
+    #[test]
+    fn school_base_altitude_row_shows_priority_and_current_origin() {
+        let ctx = egui::Context::default();
+        let mut app = mode_app(&ctx);
+        app.tab = 0;
+        app.config.school_base_altitude = Some(1050.0);
+        app.run_page.school_base_altitude = "1050".into();
+        let (w, h) = (900.0, 700.0);
+        click_label(&mut app, &ctx, w, h, "高级生成参数（不填即用默认值）");
+        let output = run_frame(&mut app, &ctx, w, h, vec![]);
+        let texts = visible_texts(&output);
+        assert!(
+            texts.iter().any(|t| t.contains("学校基准海拔（米）")),
+            "输入框标签没画出来：{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("优先级：手动海拔（单值/区间）> 学校基准 > 默认 82 m")),
+            "优先级说明没画出来：{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("当前生效：1050.0 m（学校基准海拔）")),
+            "当前 origin 没画出来：{texts:?}"
+        );
+    }
+
     /// 随机模式：整段跑步（含 flow.rs 的 0-4s 抖动）都不得越过当前时刻。
     ///
-    /// 指定模式不适用：用户指定今天 12:00 而此刻已 12:05 时，原行为就是照常提交。
+    /// 指定模式同样适用（C1）：用户填的时刻只决定「想什么时候跑」，
+    /// 一旦 start + 用时越过现在，就必须回退到 latest_start_ms，
+    /// 否则 stopTime 落在未来（真机不可能提交还没跑完的记录）。
     fn assert_random_not_future(p: &RunPlan) {
         let now = crate::crypto::envelope::now_ms();
         assert!(
             p.start_ms + p.dur * 1000 + JITTER_MARGIN_MS <= now,
-            "随机时刻 {} + 用时 {}s 越过当前时刻",
+            "时刻 {} + 用时 {}s 越过当前时刻",
             p.start_ms,
             p.dur
         );
+    }
+
+    /// C1：指定时刻靠近「现在」时，方案时刻必须被钳到「现在 − 用时 − 余量」。
+    #[test]
+    fn specified_time_near_now_is_clamped_to_a_finished_run() {
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        let mut p = page(1, 0);
+        p.start_mode = 1;
+        p.days_ago = 0;
+        p.hour = now.hour() as i64;
+        p.minute = now.minute() as i64;
+        // 10 km / 350–370 s/km → 用时约 1 小时，「现在」这一分钟必然跑不完。
+        p.dist_min = 10.0;
+        p.dist_max = 10.0;
+        p.ensure_plan();
+        let plan = p.plan.clone().unwrap();
+        assert_random_not_future(&plan);
+        assert_eq!(
+            (plan.hour, plan.minute),
+            (p.hour, p.minute),
+            "用户填的时刻被改写了"
+        );
+    }
+
+    /// C1 的反面：用户填一个足够早的时刻时，必须**原样**采纳，不能无脑钳到现在。
+    #[test]
+    fn specified_time_in_the_past_is_kept() {
+        let mut p = page(1, 0);
+        p.start_mode = 1;
+        p.days_ago = 1;
+        p.hour = 9;
+        p.minute = 15;
+        p.ensure_plan();
+        let plan = p.plan.clone().unwrap();
+        assert_eq!(plan.start_ms, specified_time(1, 9, 15));
+        assert_eq!(plan.start_ms % 60_000, 0, "整分输入不该被二次平移");
     }
 
     /// 指定模式下「换一版」只换运动量，用户填的时刻必须原样保留。
@@ -1822,12 +2114,12 @@ mod tests {
         assert_start_not_future(&plan);
     }
 
-    /// 明天（未来）的指定时刻必然被钳制，且界面可据此提示。
+    /// 今天最后一刻（23:59）作为指定时刻：必然被钳到今天之内；C1 之后还要保证
+    /// **整段跑步已经跑完**（start + 用时 ≤ 现在），这是本用例新增的判据。
     ///
-    /// 用「未来某天」构造，避免依赖当前钟点（23:xx 跑也不会失效）。
+    /// 用「今天 23:59」构造，避免依赖当前钟点（23:xx 跑也不会失效）。
     #[test]
     fn future_specified_time_is_clamped_and_detectable() {
-        // days_ago 取负即未来，但会被 clamp 到 0；这里直接构造今天最后一刻
         let mut p = page(1, 0);
         p.hour = 23;
         p.minute = 59;
@@ -1842,16 +2134,15 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let now_ms = crate::crypto::envelope::now_ms();
-        // ensure_plan() 读时钟的时刻早于这里的 now_ms；要求两者毫秒相等会在
-        // 跨毫秒边界时偶发失败（实测约 1%）。与 specified_time_is_clamped_to_now
-        // 同一写法：允许 2ms 的时钟误差。
+        // ensure_plan() 读时钟的时刻早于这里的 now_ms；允许 2ms 的时钟误差。
         assert!(
-            (plan.start_ms as i64 - typed.min(now_ms) as i64).abs() <= 2,
-            "start_ms={} 与 min(typed, now)={} 偏差过大",
+            plan.start_ms <= typed.min(now_ms) + 2,
+            "start_ms={} 晚于 min(typed, now)={}",
             plan.start_ms,
             typed.min(now_ms)
         );
-        assert_start_not_future(&plan);
+        // C1：不只是「不晚于现在」，还要留够整个用时 —— 否则 stopTime 落在未来。
+        assert_random_not_future(&plan);
         // 界面提示条件：填入时刻晚于现在（23:59 总成立，除非正好在那一分钟）
         if typed > now_ms {
             assert!(plan.start_ms < typed, "未来时刻未被钳制");
@@ -2124,7 +2415,7 @@ mod tests {
         app.run_page.preview_stale = false;
         let _ = run_frame(&mut app, &ctx, 900.0, 700.0, vec![]);
 
-        click_label(&mut app, &ctx, 900.0, 700.0, "自定义点位");
+        click_label(&mut app, &ctx, 900.0, 700.0, "自定义");
 
         assert_eq!(app.run_page.route_mode, RouteMode::Manual, "点击没切换模式");
         assert!(app.run_page.preview_stale, "切模式后预览必须标脏");
