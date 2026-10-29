@@ -25,6 +25,10 @@ enum Reply {
     Record(Value),
     Unauthorized,
     List(bool),
+    /// 列表里直接给一条记录（预置回执的 uuid/时刻由用例自己决定）。
+    ListRows(Value),
+    /// 列表接口不回包、直接断开：复现「对账这一步失败」。
+    DropList,
 }
 fn server(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -96,6 +100,17 @@ fn server(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>)
                         vec![json!({"rrid":"77","uuid":request_uuid})]
                     } else { vec![] }}}),
                     )
+                }
+                // 列表里返回一条**指定**的记录（测试预置回执时需要自己给 uuid/时刻）。
+                Reply::ListRows(row) => {
+                    assert_eq!(path, crate::api::records::RECORDS_PATH);
+                    (200, json!({"error":10000,"data":{"list":[row]}}))
+                }
+                // 列表接口连接被掐断：模拟对账这一步本身失败（fail-closed 路径）。
+                Reply::DropList => {
+                    assert_eq!(path, crate::api::records::RECORDS_PATH);
+                    paths.push(path);
+                    continue;
                 }
                 other => {
                     assert_eq!(path, RECORD_PATH);
@@ -176,6 +191,32 @@ fn error(result: Result<SubmitResult, String>) -> String {
 ///
 /// 判据用「同一台 server 上，iOS 那次不产生任何请求，随后 Android 身份能一次成功」，
 /// 顺带证明拒绝没有留下 pending 回执（否则后续提交会被锁死）。
+/// N1（0.9.0 复审）：回执里的目标距离必须是**实跑距离**，不能是学校门槛。
+///
+/// 判据靠"两者明显不同"来区分：夹具实跑约 1000 m，这里把门槛设成 2000 m。
+/// 一旦调用点回退成传 `p.min_distance`，这条立刻红。
+#[test]
+fn receipt_records_the_actual_distance_not_the_school_threshold() {
+    let mut p = params();
+    p.min_distance = 2000;
+    let run_m = p.track.totalDistance;
+    assert!(
+        (run_m - p.min_distance as f64).abs() > 100.0,
+        "夹具必须让实跑与门槛明显不同，否则区分不了两者：run={run_m} min={}",
+        p.min_distance
+    );
+    assert_eq!(
+        receipt_target_distance(run_m),
+        run_m.round() as i64,
+        "回执应记实跑距离"
+    );
+    assert_ne!(
+        receipt_target_distance(run_m),
+        p.min_distance,
+        "回执不得记学校门槛（N1）"
+    );
+}
+
 #[test]
 fn ios_identity_is_rejected_before_any_request_or_receipt() {
     let _fixture = Fixture::new();
@@ -208,59 +249,86 @@ fn successful_post_then_same_plan_only_sends_once() {
     assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("重复提交"));
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
 }
-#[test]
-fn lost_response_reconciles_uuid_without_reposting() {
-    let _fixture = Fixture::new();
-    let (host, task) = server(vec![Reply::Lost, Reply::List(true)]);
-    let p = params();
-    assert!(
-        error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("已找到本次记录 #77")
-    );
-    assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("重复提交"));
-    assert_eq!(
-        task.join().unwrap(),
-        vec![RECORD_PATH, crate::api::records::RECORDS_PATH]
-    );
-}
-/// 超时 + 列表确认没有 → 允许**一次**重提（0.9.0 的 Unknown 契约）。
+/// 预置一条**早已过了静置窗口**的未决回执。
 ///
-/// 顺序必须是「先落 Unknown、再只读对账、确认缺失才放行」：断言请求序列里
-/// RECORDS_PATH 只出现一次、且它排在第二次 RECORD_PATH 之前 —— 重提不是盲目的，
-/// 而是拿着记录列表核对过之后才发生。
-#[test]
-fn timeout_without_a_matching_record_allows_one_retry() {
-    let _fixture = Fixture::new();
-    let (host, task) = server(vec![
-        Reply::Lost,
-        Reply::List(false),
-        Reply::Record(json!({"error":10000,"data":{"rrid":43}})),
-    ]);
+/// N2 之后 Unknown 要静置 90 s 才自动对账，真等 90 秒不现实；
+/// 这里直接把一条 `at_ms = now − 100 s` 的 Unknown 写进回执日志，
+/// 于是下一次提交走的就是「窗口过后 → 拉列表 → 命中就放弃重提」这条真实分支。
+fn seed_stale_unknown(uuid: &str, target_dist: i64) -> i64 {
     let p = params();
+    let start_ms = p.track.startTime;
+    let stop_ms = start_ms + p.track.totalTime * 1000;
+    let stale_at = crate::crypto::envelope::now_ms() - 100_000;
+    let mut guard = crate::api::submission_guard::Guard::open(42, 77).unwrap();
+    guard
+        .begin(uuid, start_ms, stop_ms, stale_at, "fp", target_dist)
+        .unwrap();
+    guard.unknown(uuid, stale_at).unwrap();
+    (start_ms, stop_ms);
+    start_ms
+}
+
+/// 过窗口的 Unknown 对账命中 → 标 Committed、放弃重提（N2 之后走预置回执这条径）。
+#[test]
+fn stale_unknown_receipt_is_reconciled_without_reposting() {
+    let _fixture = Fixture::new();
+    let uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let start_ms = seed_stale_unknown(&uuid, 1000);
+    let p = params();
+    let stop_ms = start_ms + p.track.totalTime * 1000;
+    let (host, task) = server(vec![Reply::ListRows(
+        json!({"rrid":"77","uuid":uuid,"total_dis":1000.0,"total_time":p.track.totalTime,
+               "start_time":start_ms,"complete":false,"avg_step_freq":120}),
+    )]);
     let message = error(submit_record(&mut client(&host), &p, &mut |_| {}));
-    assert!(message.contains("提交结果未知"), "{message}");
-    assert!(message.contains("允许重新提交"), "{message}");
-    assert_eq!(
-        submit_record(&mut client(&host), &p, &mut |_| {})
-            .expect("对账确认没有入账后就该允许重提")
-            .rrid,
-        43
-    );
+    assert!(message.contains("#77"), "要说明已核对到哪条记录：{message}");
+    assert!(message.contains("重复提交"), "{message}");
+    // 只有一次列表请求，一条提交请求都没有。
     assert_eq!(
         task.join().unwrap(),
-        vec![RECORD_PATH, crate::api::records::RECORDS_PATH, RECORD_PATH]
+        vec![crate::api::records::RECORDS_PATH]
     );
+    let _ = stop_ms;
 }
+
+/// N2：超时之后**静置窗口内**既不拉列表、也不允许重提。
+///
+/// 改前的反例：超时 → 立刻拉列表 → 服务端还没写完库 → 读到旧快照 → 判「没有入账」
+/// → 放行重提 → 服务端两条记录。现在窗口内直接挡住，且不产生任何多余请求。
+#[test]
+fn timeout_holds_the_retry_inside_the_settle_window() {
+    let _fixture = Fixture::new();
+    let (host, task) = server(vec![Reply::Lost]);
+    let p = params();
+    let first = error(submit_record(&mut client(&host), &p, &mut |_| {}));
+    assert!(first.contains("提交结果未知"), "{first}");
+    let second = error(submit_record(&mut client(&host), &p, &mut |_| {}));
+    assert!(second.contains("上次提交结果未知"), "{second}");
+    assert!(
+        second.contains("自动对账"),
+        "要告诉用户过了窗口会自动核对：{second}"
+    );
+    // 一次提交请求、零次列表请求：窗口内不去猜。
+    assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
+}
+
 /// 对账这一步本身失败（列表拉不到）时必须继续挡住：没有证据就不许重发。
+///
+/// N2 之后这条只在「窗口已过的 Unknown」上才可能发生，所以先预置回执，
+/// 再让列表接口直接断连。
 #[test]
 fn failed_reconciliation_keeps_blocking_the_retry() {
     let _fixture = Fixture::new();
-    // 只给一个 Lost：第二次提交的 preflight 拿不到列表，必须被挡住且不发提交请求。
-    let (host, task) = server(vec![Reply::Lost]);
-    let p = params();
-    assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("提交结果未知"));
-    let message = error(submit_record(&mut client(&host), &p, &mut |_| {}));
+    let uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    seed_stale_unknown(&uuid, 1000);
+    let (host, task) = server(vec![Reply::DropList]);
+    let message = error(submit_record(&mut client(&host), &params(), &mut |_| {}));
     assert!(message.contains("上次提交结果未知"), "{message}");
-    assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
+    // 只尝试了对账，没有发提交请求。
+    assert_eq!(
+        task.join().unwrap(),
+        vec![crate::api::records::RECORDS_PATH]
+    );
 }
 #[test]
 fn explicit_rejection_can_be_retried_by_user_but_not_automatically() {
@@ -280,6 +348,8 @@ fn explicit_rejection_can_be_retried_by_user_but_not_automatically() {
     assert_eq!(task.join().unwrap().len(), 2);
 }
 /// 「响应看着像成功但没有 rrid」= 结果未知：不能当成功，也不能当失败。
+///
+/// N2：落成 Unknown 之后**不当场对账**（静置 90 s），所以这里只有一次提交请求。
 #[test]
 fn malformed_success_is_recorded_as_unknown() {
     for response in [
@@ -288,12 +358,12 @@ fn malformed_success_is_recorded_as_unknown() {
         json!({"error":10000,"data":"{broken"}),
     ] {
         let _fixture = Fixture::new();
-        let (host, task) = server(vec![Reply::Record(response), Reply::List(false)]);
+        let (host, task) = server(vec![Reply::Record(response)]);
         assert!(
             error(submit_record(&mut client(&host), &params(), &mut |_| {}))
                 .contains("提交结果未知")
         );
-        assert_eq!(task.join().unwrap().len(), 2);
+        assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
     }
 }
 #[test]

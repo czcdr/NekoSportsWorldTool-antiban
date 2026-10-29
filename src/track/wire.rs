@@ -290,6 +290,13 @@ fn step_diff_stats(diffs: &[f64], win_steps: i64, window_s: f64) -> (f64, f64, f
         let min = diffs.iter().copied().fold(f64::INFINITY, f64::min);
         return (round_to(sum / count, 2), round_to(max, 2), round_to(min, 2));
     }
+    // 空窗且**本窗没记步**：三个字段必须一起归零。旧实现用 `max(0.01)` 兜底，于是
+    // 0 步窗拿到 `(0.01, 0.02, 0.01)`：`stepsNum=0` 却 `avgDiff=0.01`，还带着
+    // `min==avg`、`max==2·avg` 的固定比例 —— 服务端若校验 `stepsNum==0 → avgDiff==0`
+    // 就是一条直接可判的矛盾。停走窗口会让这类窗变多，所以必须修（0.9.0 复审 N9）。
+    if win_steps <= 0 {
+        return (0.0, 0.0, 0.0);
+    }
     let typical = round_to(win_steps as f64 / window_s.max(1.0), 2).max(0.01);
     (
         typical,

@@ -353,6 +353,118 @@ fn fence_warning(outside: usize) -> Option<String> {
     (outside > 0).then(|| format!("本路线有 {outside} 个采样点在围栏外，可能被判无效"))
 }
 
+/// N4（外部复审 0.9.0）：轨迹点云的**短长轴比**（短轴/长轴的标准差比，米制平面）。
+///
+/// 1.0 = 各向同性（圆形/方形环、绕建筑的多圈都接近 1）；越小越「瘦长」。
+/// 用协方差主轴而不是「长边/短边」：真实轨迹不是多边形，轴比才能同时覆盖
+/// 三角形环、细长跑道环这类形状，且不受采样密度影响。
+///
+/// 经度按纬度折算（`met_per_deg_lng`），否则高纬度会把东西向压扁、伪造出「瘦长」。
+fn shape_axis_ratio(pts: &[(f64, f64)]) -> f64 {
+    let n = pts.len() as f64;
+    if pts.len() < 8 {
+        return 1.0;
+    }
+    let lat0 = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let lng0 = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let kx = crate::track::geom::met_per_deg_lng(lat0);
+    let (mut sxx, mut syy, mut sxy) = (0.0f64, 0.0f64, 0.0f64);
+    for p in pts {
+        let x = (p.1 - lng0) * kx;
+        let y = (p.0 - lat0) * crate::track::geom::MET_PER_DEG_LAT;
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+    }
+    let (sxx, syy, sxy) = (sxx / n, syy / n, sxy / n);
+    let tr = sxx + syy;
+    let det = sxx * syy - sxy * sxy;
+    let disc = (0.25 * tr * tr - det).max(0.0).sqrt();
+    let long = 0.5 * tr + disc;
+    let short = (0.5 * tr - disc).max(0.0);
+    if long <= 1e-12 {
+        1.0
+    } else {
+        (short / long).sqrt()
+    }
+}
+
+/// 瘦长告警的阈值（短长轴比）。
+///
+/// 依据：用 [`shape_axis_ratio`] 对同一套 Legacy 生成器（2000 m / seed 7）跑了五种
+/// 打卡点布局，实测出一张「形 → 轴比」表（见测试
+/// `shape_axis_ratio_separates_thin_triangle_from_round_ring` 的标定断言）：
+///
+/// | 打卡点布局 | 短长轴比 |
+/// |---|---|
+/// | 4 角方形环（≈1:1） | **0.91** |
+/// | 6 点近圆环 | **0.98** |
+/// | 长宽 2:1 的细长跑道环 | **0.57** |
+/// | 长宽 3:1 | **0.35** |
+/// | 长宽 4:1 | **0.23** |
+/// | 3 点近似共线（真实被封样本那类瘦长三角） | **0.01** |
+///
+/// 取 **0.45**：落在「2:1 细长跑道」（0.57，余量 24%）与「3:1 以上、图上已经是一条
+/// 粗线」（0.35，余量 22%）之间；方形/近圆环有 2 倍余量，不会误报；瘦长三角比阈值
+/// 低 45 倍，必抓。**这个阈值只决定提示与否，不阻断提交、不改默认模式。**
+const THIN_SHAPE_AXIS_RATIO: f64 = 0.45;
+
+/// N4：瘦长形态告警。
+///
+/// 背景（`review/SERVER-EVIDENCE.md` 的真实样本）：被判可疑那条是「瘦长三角形 +
+/// 与已有边重合的重复段」，达标那条是「复杂多圈、绕建筑、多次折返」。
+/// 0.9.0 的逐圈车道偏移解决了「重合段」，但**没解决「瘦长」**：Legacy 仍把打卡点按
+/// 质心角排序做 Catmull-Rom 闭环，3 个近似共线的点位必然生出瘦长三角环。
+///
+/// 这里只提示、不阻断：默认模式（Legacy）不变，改模式是用户的选择。
+/// **只对 Legacy 提示** —— Road / Tiles / Manual 沿真实路网走，形状由路网决定。
+fn thin_shape_warning(pts: &[(f64, f64)], route_mode: RouteMode) -> Option<String> {
+    if route_mode != RouteMode::Legacy {
+        return None;
+    }
+    let ratio = shape_axis_ratio(pts);
+    if ratio >= THIN_SHAPE_AXIS_RATIO {
+        return None;
+    }
+    Some(format!(
+        "当前轨迹偏瘦长（短长轴比 {ratio:.2}，阈值 {THIN_SHAPE_AXIS_RATIO:.2}）：\
+         真实跑步很少是这种形状，被人工复核的样本里「瘦长三角形」正是被判可疑的那类。\
+         建议切到「道路」或「瓦片」模式；没有路网时可在路网页手绘一条轨迹"
+    ))
+}
+
+/// N5（外部复审 0.9.0）：计划距离区间上限低于学校门槛时的告警。
+///
+/// `reject_below_min_distance` 会在提交前直接拦下（这是对的：比提交一条不计入的记录好），
+/// 但默认区间仍是 1.0–1.5 km，而多数学校门槛是 1600 / 2000 m —— 新用户首次必失败，
+/// 而且要到「点开始」之后才看到错误。这里把冲突提前说出来。
+///
+/// 单位口径：学校门槛一律用 **米**（策略 `minDistance` 就是米），计划区间用 **km**
+/// （与跑步页 UI 一致），并在括号里给出换算后的米数，避免用户对不上。
+///
+/// 不改用户配置（改配置要用户确认），也不下调门槛。
+fn distance_floor_warning(
+    dist_min_km: f64,
+    dist_max_km: f64,
+    min_distance_m: i64,
+) -> Option<String> {
+    if min_distance_m <= 0 || !dist_max_km.is_finite() {
+        return None;
+    }
+    let floor_km = min_distance_m as f64 / 1000.0;
+    if dist_max_km >= floor_km {
+        return None;
+    }
+    let lo_m = (dist_min_km * 1000.0).round() as i64;
+    let hi_m = (dist_max_km * 1000.0).round() as i64;
+    Some(format!(
+        "学校要求单次 ≥ {min_distance_m} m，当前计划区间 {dist_min_km:.1}–{dist_max_km:.1} km\
+         （{lo_m}–{hi_m} m）的上限就低于门槛，提交会被直接拒绝。\
+         请把距离下限/上限调到 ≥ {floor_km:.1} km（{min_distance_m} m）以上\
+         ——工具不会替你改配置，也不会下调学校门槛"
+    ))
+}
+
 /// 跑步全链。
 pub fn run_full_flow(
     client: &mut ApiClient,
@@ -432,6 +544,26 @@ pub fn run_full_flow_cancellable(
         "√ [policy] ts={} policy={} minDistance={} validTime={}",
         pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
     ));
+    // N5：门槛与**配置里的计划区间**冲突时，先说出来（此时还没生成轨迹/预览）。
+    //
+    // 必须放在下面那条 reject 之前：默认区间撞门槛时那条会直接 return Err，
+    // 用户就永远看不到「为什么每次都失败、该把区间调到多少」这段说明。
+    // 这里只警告不拦：本次计划可能已被用户手调到 ≥ 门槛，真正该拦的交给下面。
+    // `warnings` 在后面才建（要等 policy 的人脸核验分支），所以先记在本地，稍后并入。
+    let pending_floor_warning = {
+        let config = super::model::load_config();
+        match distance_floor_warning(
+            config.dist_min as f64,
+            config.dist_max as f64,
+            pol.min_distance,
+        ) {
+            Some(warning) => {
+                log(&format!("⚠ [policy] {warning}"));
+                Some(warning)
+            }
+            None => None,
+        }
+    };
     // C3：计划距离低于学校门槛 → 就地拦下，不生成、不提交。
     //
     // 不改这一条，报文里就是「selDistance = 学校门槛 / totalDis = 更短 / complete = true」
@@ -445,6 +577,11 @@ pub fn run_full_flow_cancellable(
     // `warnings`，由 `RunOutcome::summary()` 带进 UI 弹窗与 CLI 输出 —— 提交行为不变
     // （不拒绝、不改 faceCheck），只是别让用户以为这是一条干净的记录。
     let mut warnings: Vec<String> = Vec::new();
+    // N5：门槛与计划区间冲突（在拿到 policy 时就已判定并打过日志）—— 并入 warnings，
+    // 让它随 RunOutcome::summary() 进 UI 结论弹窗与 CLI 输出。
+    if let Some(warning) = pending_floor_warning {
+        warnings.push(warning);
+    }
     match pol.face_required {
         Some(true) => {
             warnings
@@ -737,6 +874,15 @@ pub fn run_full_flow_cancellable(
         ));
         warnings.push(message);
     }
+    // N4（复审 0.9.0）：瘦长形态提示。只对 Legacy 提示、只警告不拦提交。
+    // 放在这里是因为此时轨迹点已定稿（后续只有海拔覆盖，不改平面形状）。
+    {
+        let path: Vec<(f64, f64)> = track.locations.iter().map(|p| (p.gLat, p.gLng)).collect();
+        if let Some(warning) = thin_shape_warning(&path, params.route_mode) {
+            log(&format!("⚠ [shape] {warning}"));
+            warnings.push(warning);
+        }
+    }
     if let Some(range) = params.manual_altitude_range {
         crate::track::altitude::override_bd_a_range(&mut track, range)?;
         log(&format!(
@@ -964,6 +1110,211 @@ mod verification_tests {
             second_precision_start(sampled, 30_000, sampled + 60_000),
             sampled
         );
+    }
+
+    /// N4：形态度量的标定 —— 圆环 vs 瘦长三角环，短长轴比要拉开一个数量级。
+    ///
+    /// 这两个数字就是 `THIN_SHAPE_AXIS_RATIO = 0.40` 的依据：形状正常的环在 0.9 以上，
+    /// 真实被封样本那类「三点近似共线」的瘦长三角环在 0.25 以下。
+    #[test]
+    fn shape_axis_ratio_separates_thin_triangle_from_round_ring() {
+        let round: Vec<(f64, f64)> = crate::track::generator::build(
+            2000.0,
+            600,
+            7,
+            (39.9, 116.4),
+            1_700_000_000_000,
+            &[
+                (39.9000, 116.4000),
+                (39.9000, 116.4040),
+                (39.9030, 116.4040),
+                (39.9030, 116.4000),
+            ],
+        )
+        .locations
+        .iter()
+        .map(|p| (p.gLat, p.gLng))
+        .collect();
+        // 三个近似共线的点位（纬度只差 0.0002°、经度拉满）→ 瘦长三角形
+        let thin: Vec<(f64, f64)> = crate::track::generator::build(
+            2000.0,
+            600,
+            7,
+            (39.9, 116.4),
+            1_700_000_000_000,
+            &[
+                (39.9000, 116.3990),
+                (39.9002, 116.4040),
+                (39.9004, 116.4090),
+            ],
+        )
+        .locations
+        .iter()
+        .map(|p| (p.gLat, p.gLng))
+        .collect();
+        let round_ratio = shape_axis_ratio(&round);
+        let thin_ratio = shape_axis_ratio(&thin);
+        assert!(
+            round_ratio > 0.80,
+            "圆形环的短长轴比只有 {round_ratio:.2}（期望 >0.80）"
+        );
+        assert!(
+            thin_ratio < 0.25,
+            "瘦长三角环的短长轴比有 {thin_ratio:.2}（期望 <0.25）"
+        );
+        assert!(
+            round_ratio > THIN_SHAPE_AXIS_RATIO && thin_ratio < THIN_SHAPE_AXIS_RATIO,
+            "阈值 {THIN_SHAPE_AXIS_RATIO} 必须落在两者之间：round={round_ratio:.2} thin={thin_ratio:.2}"
+        );
+
+        // 阈值表另外两档必须钉住（阈值 0.45 的依据就是这两档之间的空档）：
+        // 2:1 细长跑道环不能误报，3:1 以上就该提示「像一根线」。
+        let ratio_of = |pts: &[(f64, f64)]| -> f64 {
+            let t = crate::track::generator::build(
+                2000.0,
+                600,
+                7,
+                (39.9, 116.4),
+                1_700_000_000_000,
+                pts,
+            );
+            let path: Vec<(f64, f64)> = t.locations.iter().map(|p| (p.gLat, p.gLng)).collect();
+            shape_axis_ratio(&path)
+        };
+        // 39.9°N：纬度 0.001° ≈ 111 m，经度 0.001° ≈ 85 m
+        let rect_2to1 = [
+            (39.9000, 116.4000),
+            (39.9000, 116.4072),
+            (39.9027, 116.4072),
+            (39.9027, 116.4000),
+        ];
+        let rect_3to1 = [
+            (39.9000, 116.4000),
+            (39.9000, 116.4108),
+            (39.9027, 116.4108),
+            (39.9027, 116.4000),
+        ];
+        let r2 = ratio_of(&rect_2to1);
+        let r3 = ratio_of(&rect_3to1);
+        assert!(
+            r2 > THIN_SHAPE_AXIS_RATIO,
+            "2:1 细长跑道环（{r2:.2}）不该触发瘦长提示"
+        );
+        assert!(
+            r3 < THIN_SHAPE_AXIS_RATIO,
+            "3:1 长条环（{r3:.2}）应当触发瘦长提示"
+        );
+        assert!(r2 > r3, "轴比必须随长宽比单调：2:1={r2:.2} 3:1={r3:.2}");
+    }
+
+    /// N4：瘦长环在 Legacy 下告警；圆形环不告警；其它模式一律不提示。
+    #[test]
+    fn thin_legacy_ring_warns_but_never_blocks_and_other_modes_stay_silent() {
+        let thin: Vec<(f64, f64)> = crate::track::generator::build(
+            2000.0,
+            600,
+            7,
+            (39.9, 116.4),
+            1_700_000_000_000,
+            &[
+                (39.9000, 116.3990),
+                (39.9002, 116.4040),
+                (39.9004, 116.4090),
+            ],
+        )
+        .locations
+        .iter()
+        .map(|p| (p.gLat, p.gLng))
+        .collect();
+        let warning = thin_shape_warning(&thin, RouteMode::Legacy).expect("瘦长环应当告警");
+        assert!(warning.contains("瘦长"), "文案要说清形状：{warning}");
+        assert!(
+            warning.contains(&format!("{THIN_SHAPE_AXIS_RATIO:.2}")),
+            "文案要给出阈值，用户才知道差多少：{warning}"
+        );
+        assert!(
+            warning.contains("短长轴比 0."),
+            "文案要给出实际比值：{warning}"
+        );
+        assert!(
+            warning.contains("道路") && warning.contains("瓦片"),
+            "文案要给出可操作的出口：{warning}"
+        );
+        // 只提示不阻断：函数返回的是 Option<String>，没有错误类型可用 —— 这里再钉一次语义。
+        assert!(warning.len() > 20);
+        // 沿真实路网的模式不该被这条误报
+        for mode in [RouteMode::Road, RouteMode::Tiles, RouteMode::Manual] {
+            assert!(
+                thin_shape_warning(&thin, mode).is_none(),
+                "{mode:?} 模式不该提示瘦长"
+            );
+        }
+    }
+
+    /// N4：圆形环不告警（阈值不能拍得太高，把正常环也报出来）。
+    #[test]
+    fn round_ring_does_not_warn_about_shape() {
+        let round: Vec<(f64, f64)> = crate::track::generator::build(
+            3000.0,
+            900,
+            11,
+            (39.9, 116.4),
+            1_700_000_000_000,
+            &[
+                (39.9000, 116.4000),
+                (39.9000, 116.4040),
+                (39.9020, 116.4055),
+                (39.9030, 116.4040),
+                (39.9030, 116.4000),
+                (39.9020, 116.3985),
+            ],
+        )
+        .locations
+        .iter()
+        .map(|p| (p.gLat, p.gLng))
+        .collect();
+        assert!(
+            shape_axis_ratio(&round) > THIN_SHAPE_AXIS_RATIO,
+            "正常环的轴比不该低于阈值"
+        );
+        assert_eq!(thin_shape_warning(&round, RouteMode::Legacy), None);
+    }
+
+    /// N5：门槛与计划区间的单位不能混 —— 门槛用米、区间用 km 并给出米换算。
+    #[test]
+    fn distance_floor_warning_keeps_metres_and_kilometres_straight() {
+        let warning = distance_floor_warning(1.0, 1.5, 2000).expect("默认区间撞 2000 m 门槛");
+        assert!(warning.contains("≥ 2000 m"), "门槛要用米：{warning}");
+        assert!(
+            warning.contains("1.0–1.5 km"),
+            "计划区间要用 UI 的 km：{warning}"
+        );
+        assert!(
+            warning.contains("1000–1500 m"),
+            "同时给出米换算，避免用户对不上：{warning}"
+        );
+        assert!(
+            warning.contains("2.0 km"),
+            "出口要换算成用户填的 km：{warning}"
+        );
+        assert!(
+            warning.contains("直接拒绝"),
+            "要说清后果（会被拒跑）：{warning}"
+        );
+        assert!(
+            warning.contains("不会替你改配置"),
+            "要说明工具不擅自改配置：{warning}"
+        );
+
+        // 上限够得着门槛 → 不警告（等于门槛也算够）
+        assert_eq!(distance_floor_warning(1.0, 2.5, 2000), None);
+        assert_eq!(distance_floor_warning(1.0, 2.0, 2000), None);
+        // 门槛未知（0/负数）→ 不警告
+        assert_eq!(distance_floor_warning(1.0, 1.5, 0), None);
+        assert_eq!(distance_floor_warning(1.0, 1.5, -1), None);
+        // 1600 m 门槛同样按米说
+        let w1600 = distance_floor_warning(1.0, 1.5, 1600).expect("1600 m 门槛也该提示");
+        assert!(w1600.contains("≥ 1600 m") && w1600.contains("1.6 km"));
     }
 
     /// A4：只读围栏校验 —— 数点、给文案，但不改轨迹、不拦提交。

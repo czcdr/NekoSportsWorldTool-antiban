@@ -42,6 +42,15 @@ fn pace_speed_value(seconds: i64, meters: f64) -> i64 {
     (seconds as f64 / 60.0 / (distance / 1000.0) * 1000.0).round() as i64
 }
 
+/// 回执里记的「本次提交距离」：必须是**实跑距离**，不能是学校门槛。
+///
+/// `Attempt::matches()` 拿它跟记录列表里的 `total_dis` 比，容差只有 5 m。
+/// 传门槛会让「实跑 2300 / 门槛 2000」的对账**必然**判「未找到」→ 标 Abandoned
+/// → 提示允许重提 —— 恰好制造出 WAL 本来要防的「同一天两条记录」（0.9.0 复审 N1）。
+pub(crate) fn receipt_target_distance(track_total_m: f64) -> i64 {
+    track_total_m.round() as i64
+}
+
 /// 提交体的 10s 窗口**必须与 OBS 对象同一套 id/queueNum**。
 ///
 /// 以前这里把 `id` 改写成 `60000 + i`，而 OBS 的 `speed_json` 用的是
@@ -149,13 +158,19 @@ pub fn submit_record(
     );
     // 回执在**发请求之前**落盘：从这里往下，服务端可能已经收到这条记录。
     let at = crate::crypto::envelope::now_ms();
+    // N1（0.9.0 复审）：这里必须传**本次实跑距离**，不能传 `p.min_distance`。
+    // `min_distance` 是校方门槛（如 2000 m），而 `totalDistance` 是实跑（如 2300 m）；
+    // `Attempt::matches()` 用它跟记录列表里的 `total_dis` 比，容差只有 5 m ——
+    // 传门槛会让对账**必然**判「未找到」，于是 Unknown 被标 Abandoned、提示允许重提，
+    // 恰好制造出 WAL 本来要防的「同一天两条记录」。
+    let target_dist = receipt_target_distance(p.track.totalDistance);
     guard.begin(
         &run_uuid,
         p.track.startTime,
         stop_ms,
         at,
         &plan_fp,
-        p.min_distance,
+        target_dist,
     )?;
     match send_record(client, p, run_uuid.clone(), log) {
         Ok(result) => {
@@ -186,9 +201,13 @@ pub fn submit_record(
                 ));
             }
             if guard.is_unresolved(&run_uuid) {
+                // N2 之后，Unknown 在沉降窗口内**根本不去拉列表**（避免读到旧快照
+                // 把「其实已入账」判成缺失）。所以这句不能再说「对账没跑完（网络或
+                // 接口失败）」——那是另一回事，用户会去查网络。
                 return Err(format!(
-                    "提交结果未知：{error}。记录列表对账没跑完（网络或接口失败），\
-                     已继续阻止再次提交；请到运动记录页确认后重试，确认未入账可 unlock 释放"
+                    "提交结果未知：{error}。还没到自动对账时间（约 {} 秒后自动核对记录列表），\
+                     期间已继续阻止再次提交；也可以先到运动记录页确认，确认未入账可 unlock 释放",
+                    crate::api::submission_guard::UNKNOWN_SETTLE_MS / 1000
                 ));
             }
             Err(format!(

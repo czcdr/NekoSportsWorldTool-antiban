@@ -154,13 +154,55 @@ pub fn override_bd_a(track: &mut Track, altitude_m: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// 每条记录的基准偏移幅度（米）：真实 GPS 高程每天都在这量级上漂。
+///
+/// N8（复审 low）：平移之后每条记录的 `mean(bdA)` 都**精确等于** `base_m`，
+/// 「均值恒定」本身就是一条新的常量特征（同一校区所有记录报同一个高程）。
+/// 所以给基准加一个 ±3–8 m 的确定性偏移。
+pub const BASE_ALTITUDE_DRIFT_MIN_M: f64 = 3.0;
+pub const BASE_ALTITUDE_DRIFT_MAX_M: f64 = 8.0;
+
+/// 由轨迹自身派生的基准偏移（米，带符号，幅度落在 3–8 m）。
+///
+/// 为什么从 `Track` 的既有字段派生、而不是接一个 seed 参数：
+/// - `shift_to_base_altitude` 的调用方在 `generator.rs` / `generate_road.rs`（本任务边界外），
+///   改签名会牵动两个正在被并行改动的文件；
+/// - `Track` 上没有 seed 字段，但它有 `startTime`（每份计划随机）和 `totalSteps`
+///   （随生成器 seed 变）—— 两个都对「同一份计划」稳定、对「不同记录」不同，
+///   正好是需要的确定性来源；
+/// - 不引入任何随机源，也不消耗生成器的主随机流（坐标/步数/时长全不受影响）。
+fn base_drift_m(track: &Track) -> f64 {
+    // FNV-1a over 几个稳定字段；只用来产生「每条记录不一样」的偏移，不参与协议。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in [
+        track.startTime,
+        track.totalTime,
+        track.totalSteps,
+        (track.totalDistance * 100.0).round() as i64,
+    ] {
+        hash ^= value as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let unit = (hash % 1_000_003) as f64 / 1_000_003.0; // [0, 1)
+    let magnitude =
+        BASE_ALTITUDE_DRIFT_MIN_M + unit * (BASE_ALTITUDE_DRIFT_MAX_M - BASE_ALTITUDE_DRIFT_MIN_M);
+    // 符号也用哈希的一位定，避免「永远偏高/永远偏低」。
+    if (hash >> 33) & 1 == 1 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
 /// 把整条轨迹的海拔**平移到**指定基准（保形，不改爬升）。
 ///
 /// 生成器内部的基准是随机的（`rng.uniform(20.0, 260.0)`，C10 的老问题）；
-/// 生成之后把整条曲线整体平移 `base − mean(bdA)` 米：
-/// - 报出的绝对高程落在学校基准 / 手动值 / 默认 82 m 上；
+/// 生成之后把整条曲线整体平移，使 `mean(bdA)` 落到 `base_m + drift`（drift 见
+/// [`base_drift_m`]，±3–8 m）：
+/// - 报出的绝对高程落在学校基准 / 手动值 / 默认 82 m 附近（偏移 ≤ 8 m）；
 /// - 曲线原有的起伏与 `totalAscent` **原样保留** —— 直接 `override_bd_a` 会把
-///   每个点压成同一个值，于是每条记录的 ascent 都是 0，那本身就是另一种机器特征。
+///   每个点压成同一个值，于是每条记录的 ascent 都是 0，那本身就是另一种机器特征；
+/// - 均值不再是恒定的基准值（N8），同一校区的记录之间有个位数米的自然差。
 ///
 /// 非法基准或空轨迹时原样返回（调用方已用 [`resolve_base_altitude`] 归一过）。
 pub fn shift_to_base_altitude(track: &mut Track, base_m: f64) {
@@ -172,7 +214,8 @@ pub fn shift_to_base_altitude(track: &mut Track, base_m: f64) {
     if !mean.is_finite() {
         return;
     }
-    let delta = base_m - mean;
+    let target = base_m + base_drift_m(track);
+    let delta = target - mean;
     for point in &mut track.locations {
         point.bdA = round_to(point.bdA + delta, 2);
         point.hasAltitude = true;
@@ -329,9 +372,13 @@ mod tests {
         let a = run(1050.0);
         let b = run(1050.0);
         let mean = a.locations.iter().map(|p| p.bdA).sum::<f64>() / a.locations.len() as f64;
+        // N8：均值不再「精确等于基准」，而是基准 + 一个 ±3–8 m 的确定性偏移
+        // （真实 GPS 高程每天都在这量级上漂；常数均值本身就是一种机器特征）。
+        let drift = mean - 1050.0;
         assert!(
-            (mean - 1050.0).abs() < 0.01,
-            "均值 {mean:.3} m 没有落在学校基准 1050 m 上"
+            drift.abs() >= BASE_ALTITUDE_DRIFT_MIN_M - 0.05
+                && drift.abs() <= BASE_ALTITUDE_DRIFT_MAX_M + 0.05,
+            "均值偏移 {drift:.3} m 不在 ±(3–8) m 内"
         );
         let hi = a.locations.iter().map(|p| p.bdA).fold(f64::MIN, f64::max);
         let lo = a.locations.iter().map(|p| p.bdA).fold(f64::MAX, f64::min);
@@ -352,17 +399,78 @@ mod tests {
             total_ascent(&b.locations),
             "平移后爬升必须逐位一致"
         );
-        // 默认路径：82 m（不是随机区间）。
+        // 默认路径：82 m 附近（同样带 ±3–8 m 的确定性偏移，不是随机区间）。
         let default = run(DEFAULT_BASE_ALTITUDE_M);
         let mean_default =
             default.locations.iter().map(|p| p.bdA).sum::<f64>() / default.locations.len() as f64;
         assert!(
-            (mean_default - 82.0).abs() < 0.01,
-            "默认基准 {mean_default:.3} m 不是 82 m"
+            (mean_default - 82.0).abs() <= BASE_ALTITUDE_DRIFT_MAX_M + 0.05,
+            "默认基准 {mean_default:.3} m 离 82 m 太远"
         );
         // 轨迹形态不受海拔平移影响。
         assert_eq!(a.locations.len(), default.locations.len());
         assert_eq!(a.totalDistance, default.totalDistance);
         assert_eq!(a.totalTime, default.totalTime);
+    }
+
+    /// N8：基准偏移**确定性**（同一份轨迹恒等），但**不同记录之间**不同。
+    ///
+    /// 直接对同一份轨迹改 `totalSteps` / `startTime`（正是不同生成器 seed 与不同计划
+    /// 的可观测差异）再平移，观察均值：必须各不相同，且都落在 ±(3–8) m。
+    #[test]
+    fn base_drift_is_deterministic_but_not_constant() {
+        use crate::track::generator::build_tuned;
+
+        let pts = points();
+        let mut seen: Vec<f64> = Vec::new();
+        for (seed, start_ms) in [
+            (7u64, 1_700_000_000_000i64),
+            (8, 1_700_000_000_000),
+            (7, 1_700_003_600_000),
+        ] {
+            let mut track = build_tuned(1200.0, 600, seed, (38.9, 121.54), start_ms, &pts, 0.0);
+            let before_ascent = total_ascent(&track.locations);
+            shift_to_base_altitude(&mut track, 1050.0);
+            let mean =
+                track.locations.iter().map(|p| p.bdA).sum::<f64>() / track.locations.len() as f64;
+            let drift = mean - 1050.0;
+            assert!(
+                drift.abs() >= BASE_ALTITUDE_DRIFT_MIN_M - 0.05
+                    && drift.abs() <= BASE_ALTITUDE_DRIFT_MAX_M + 0.05,
+                "seed={seed} start={start_ms} 的偏移 {drift:.3} m 越界"
+            );
+            // 保形：平移只加一个常数，爬升不受影响（四舍五入误差 < 0.5 m）。
+            let after_ascent = total_ascent(&track.locations);
+            assert!(
+                (after_ascent - before_ascent).abs() < 0.5,
+                "平移改动了爬升：{before_ascent:.2} → {after_ascent:.2}"
+            );
+            // 同一份输入再来一次：逐位一致（确定性）。
+            let mut again = build_tuned(1200.0, 600, seed, (38.9, 121.54), start_ms, &pts, 0.0);
+            shift_to_base_altitude(&mut again, 1050.0);
+            assert_eq!(
+                track
+                    .locations
+                    .iter()
+                    .map(|p| p.bdA.to_bits())
+                    .collect::<Vec<_>>(),
+                again
+                    .locations
+                    .iter()
+                    .map(|p| p.bdA.to_bits())
+                    .collect::<Vec<_>>(),
+                "同一份轨迹两次平移结果不一致（偏移不是确定性的）"
+            );
+            seen.push(drift);
+        }
+        // 三条记录的均值互不相同 —— 「均值恒定」这个特征被消掉了。
+        for (i, a) in seen.iter().enumerate() {
+            for b in seen.iter().skip(i + 1) {
+                assert!(
+                    (a - b).abs() > 0.05,
+                    "不同轨迹的均值偏移几乎相同（{a:.3} vs {b:.3}）"
+                );
+            }
+        }
     }
 }

@@ -537,7 +537,11 @@ impl App {
                 self.identity = self.device_buf.clone();
                 self.device_dirty_since = None;
                 self.status = "√ 设备身份已保存并生效".into();
-                self.log.push("√  已更新（新设备 ID 从下个请求开始生效）");
+                // 文案必须准确：`save_identity` **不改** `device_id`（换了就是服务端眼里
+                // 的新设备，直接 10121）。旧文案「新设备 ID 从下个请求开始生效」会让用户
+                // 以为设备 ID 漂移了，把"被封"归因到错误的地方（0.9.0 复审 N7）。
+                self.log
+                    .push("√  已保存（DeviceId 不变，只更新机型/分辨率等派生字段）");
                 page.saved_flash = 2.0;
             }
             Err(e) => {
