@@ -641,14 +641,22 @@ fn draw_detail_verdict(ui: &mut egui::Ui, raw: &serde_json::Value) {
     };
     let size = if status.is_anomalous() { 18.0 } else { 15.0 };
     let (note, note_color) = match status {
+        // M2（盲审）：不能断言「服务端没有额外标记」——`reasonList` 为空只说明**没给明细**，
+        // 不等于「确认无标记」。没明细就说没明细。
         RecordStatus::Passed => (
-            "规则项全部通过，服务端没有额外标记".to_string(),
+            if reasons.is_empty() {
+                "规则项通过，但服务端没有提供判定明细（下方无条目）".to_string()
+            } else {
+                "规则项全部通过，明细里没有风控标记".to_string()
+            },
             theme::text_dim(),
         ),
         RecordStatus::Failed => {
             if anomalies.is_empty() {
+                // 不承诺「下方有 × 项」：只有顶层 complete=false、明细里又没有失败规则项时，
+                // 下方根本没有 × ——那也是真实情况，别编一个不存在的锚点。
                 (
-                    "规则没过（下方 × 项）：这是规则层结论，不是风控标记".to_string(),
+                    "规则没过：这是规则层结论，不是风控标记".to_string(),
                     theme::text_dim(),
                 )
             } else {
@@ -667,6 +675,13 @@ fn draw_detail_verdict(ui: &mut egui::Ui, raw: &serde_json::Value) {
                 anomalies.len()
             ),
             theme::err(),
+        ),
+        // HIGH（盲审）：有条目认不出来源时，**不能输出「达标」这个肯定结论**。
+        RecordStatus::PassedUnverified => (
+            format!(
+                "规则项通过，但有 {unclassified} 项认不出来源（下方 ? 条目）：不能据此断言达标，也不代表被判可疑"
+            ),
+            theme::warn(),
         ),
     };
     mobile::row(ui, |ui| {
@@ -693,15 +708,28 @@ fn draw_detail_verdict(ui: &mut egui::Ui, raw: &serde_json::Value) {
             match kind {
                 // 非规则项：规则全过也可能出现的那一行，红色 + 图标 + 「异常」标签。
                 ReasonKind::NonRule => {
-                    ui.colored_label(theme::err(), if item.complete { "√" } else { "×" });
+                    // `None` = 服务端没写这一项的结果，不是「判负」——用「?」而不是「×」。
+                    let (mark, color) = match item.complete {
+                        Some(true) => ("√", theme::err()),
+                        Some(false) => ("×", theme::err()),
+                        None => ("?", theme::text_dim()),
+                    };
+                    ui.colored_label(color, mark);
                     ui.colored_label(theme::err(), egui::RichText::new("异常").small().strong());
                     ui.colored_label(theme::err(), egui::RichText::new(&item.reason).strong());
                 }
                 ReasonKind::Rule => {
-                    if item.complete {
-                        ui.colored_label(theme::ok(), "√");
-                    } else {
-                        ui.colored_label(theme::err(), "×");
+                    match item.complete {
+                        Some(true) => {
+                            ui.colored_label(theme::ok(), "√");
+                        }
+                        Some(false) => {
+                            ui.colored_label(theme::err(), "×");
+                        }
+                        // 没写结果 ≠ 没过：中性色问号，不能画成失败。
+                        None => {
+                            ui.label(egui::RichText::new("?").color(theme::text_dim()));
+                        }
                     }
                     ui.label(&item.reason);
                 }
@@ -808,18 +836,14 @@ fn draw_detail_fields(ui: &mut egui::Ui, raw: &serde_json::Value) {
 ///
 /// 为什么不只看 `row.complete`：真实那条被判可疑的记录在列表里也是「通过」，
 /// 只看这一个字段永远看不见风控标记。
-fn badge_status(
-    row: &crate::api::records::RecordRow,
-    badges: &BadgeState,
-    now_ms: i64,
-) -> RecordStatus {
-    badges.status_of(row.rrid, now_ms).unwrap_or({
-        if row.complete {
-            RecordStatus::Passed
-        } else {
-            RecordStatus::Failed
-        }
-    })
+/// 列表徽标的结论：**只有缓存命中（即真的核对过）才有值**。
+///
+/// BLOCKER-2（盲审）：早先这里用 `row.complete` 兜底 —— 拉取失败、或该行根本不在
+/// 最近 5 条的计划内时，只要列表说 `complete=true` 就画成绿色「达标」。
+/// 那等于把「没核对」显示成「已确认合格」，比不显示徽标危险得多：
+/// 一条其实「通过但异常」的记录，会因为它排在第 6 条而看起来完美。
+fn badge_status(rrid: i64, badges: &BadgeState, now_ms: i64) -> Option<RecordStatus> {
+    badges.status_of(rrid, now_ms)
 }
 
 /// 徽标短词：只有「通过但异常」标红。
@@ -832,15 +856,20 @@ fn draw_run_badge_word(
     badges: &BadgeState,
     now_ms: i64,
 ) {
-    match badge_status(row, badges, now_ms) {
-        RecordStatus::PassedButAnomalous => {
+    match badge_status(row.rrid, badges, now_ms) {
+        Some(RecordStatus::PassedButAnomalous) => {
             ui.colored_label(theme::err(), egui::RichText::new("异常").strong());
         }
-        RecordStatus::Passed => {
+        Some(RecordStatus::Passed) => {
             ui.colored_label(theme::ok(), "达标");
         }
-        RecordStatus::Failed => {
+        Some(RecordStatus::Failed) => {
             ui.label(egui::RichText::new("未达标").color(theme::text_dim()));
+        }
+        // 规则全过但有条目认不出来源：不能写「达标」（那是替服务端下结论），
+        // 也不标红（认不出 ≠ 被判可疑）。
+        Some(RecordStatus::PassedUnverified) | None => {
+            ui.label(egui::RichText::new("待核").color(theme::text_dim()));
         }
     }
 }
@@ -851,7 +880,7 @@ fn badge_explanation(
     badges: &BadgeState,
     now_ms: i64,
 ) -> Option<String> {
-    if badge_status(row, badges, now_ms) != RecordStatus::PassedButAnomalous {
+    if badge_status(row.rrid, badges, now_ms) != Some(RecordStatus::PassedButAnomalous) {
         return None;
     }
     let reason = badges

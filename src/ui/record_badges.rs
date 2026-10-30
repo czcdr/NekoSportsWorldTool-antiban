@@ -165,7 +165,20 @@ where
         };
         match fetch(rrid) {
             Ok(detail) => {
-                let status = record_status::classify(detail.complete, &detail.reason_list);
+                // M1（盲审）：详情页与徽标必须走**同一个入口**。`classify_detail_parts`
+                // 在「既没有 complete、也没有 reasonList」的 Ok 空壳上返回 None ——
+                // 那种 payload 不能替服务端下结论，更不能写成「达标」；
+                // 当作本轮未取到，走失败路径（B1 的退避会兜住重复重试）。
+                let Some(status) =
+                    record_status::classify_detail_parts(detail.complete, &detail.reason_list)
+                else {
+                    report.failed += 1;
+                    emit(BadgeOutcome::Failed {
+                        rrid,
+                        error: "详情没有可用的判定信息（complete 与 reasonList 都缺失）".into(),
+                    });
+                    continue;
+                };
                 let anomaly = record_status::anomaly_reasons(&detail.reason_list)
                     .first()
                     .map(|item| item.reason.clone())
@@ -193,10 +206,32 @@ struct BadgeEntry {
     at_ms: i64,
 }
 
-/// 列表页的徽标状态：缓存 + 在飞任务 + 取消把手。全部是内存状态，不碰网络。
+/// 单条记录的失败记录（退避用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Failure {
+    at_ms: i64,
+    count: u32,
+}
+
+/// 失败退避：30s / 2min / 10min。
+///
+/// BLOCKER-1（盲审）：早先失败不写缓存、也不记失败，于是「失败 → 不写缓存 →
+/// 下一帧 plan 又把它排进去 → 新建 pacer（首条立发）」，应用每 200 ms 重绘一次，
+/// 就等于**每 200 ms 重启一轮**：单条失败约 5 请求/秒，且永不停止。
+/// 指数退避把重试间隔拉开，让"1 条/秒"在跨轮时也成立。
+pub const BADGE_BACKOFF_MS: [i64; 3] = [30_000, 120_000, 600_000];
+
+/// 同一 rrid 连续失败到这个次数就**停手**（保留 error，不再自动重试）。
+pub const BADGE_FAIL_LIMIT: u32 = 3;
+
+/// 列表页的徽标状态：缓存 + 在飞任务 + 取消把手 + 失败退避。全部是内存状态，不碰网络。
 #[derive(Default)]
 pub struct BadgeState {
     entries: HashMap<i64, BadgeEntry>,
+    /// rrid → 最近一次失败（时刻 + 连续次数）。成功一次即清除。
+    failures: HashMap<i64, Failure>,
+    /// 上一轮 `done` 的时刻。用于**跨轮**节流（见 [`plan`]）。
+    last_round_end_ms: i64,
     pending: bool,
     generation: u64,
     error: Option<String>,
@@ -253,17 +288,36 @@ impl BadgeState {
         self.pending = false;
     }
 
-    /// 登出/会话失效：连缓存一起收掉。
+    /// 登出/会话失效：连缓存与失败记录一起收掉。
     pub fn clear(&mut self) {
         self.cancel();
         self.entries.clear();
+        self.failures.clear();
+        self.last_round_end_ms = 0;
         self.error = None;
     }
 
-    /// 列表换代后丢掉不再展示的缓存（保留的条目不重拉）。
+    /// 列表换代后丢掉不再展示的缓存与失败记录（保留的条目不重拉）。
     pub fn retain(&mut self, rows: &[RecordRow]) {
         self.entries
             .retain(|rrid, _| rows.iter().any(|row| row.rrid == *rrid));
+        self.failures
+            .retain(|rrid, _| rows.iter().any(|row| row.rrid == *rrid));
+    }
+
+    /// 这条现在能不能重试（失败退避 + 熔断）。
+    fn ready_for_retry(&self, rrid: i64, now_ms: i64) -> bool {
+        let Some(failure) = self.failures.get(&rrid) else {
+            return true;
+        };
+        // 连续失败到上限：停手。继续重试只会白花请求，并在服务端看来像脚本。
+        if failure.count >= BADGE_FAIL_LIMIT {
+            return false;
+        }
+        let index = (failure.count as usize)
+            .saturating_sub(1)
+            .min(BADGE_BACKOFF_MS.len() - 1);
+        now_ms.saturating_sub(failure.at_ms) >= BADGE_BACKOFF_MS[index]
     }
 
     /// 处理一条回填消息。返回是否被采纳（旧代数的回包一律丢）。
@@ -275,14 +329,22 @@ impl BadgeState {
         if payload.get("done").and_then(Value::as_bool) == Some(true) {
             self.pending = false;
             self.handle = None;
+            // B1：记下本轮结束时刻，让下一轮至少等 `BADGE_INTERVAL_MS` 才开始。
+            self.last_round_end_ms = now_ms;
             return true;
         }
         let Some(rrid) = payload.get("rrid").and_then(Value::as_i64) else {
             return false;
         };
         if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            // 只是这条没有徽标：不动列表、不动已有缓存。
+            // 只是这条没有徽标：不动列表、不动已有缓存，但要记失败供退避使用。
             self.error = Some(format!("rrid={rrid} 判定没取到：{error}"));
+            let failure = self.failures.entry(rrid).or_insert(Failure {
+                at_ms: now_ms,
+                count: 0,
+            });
+            failure.at_ms = now_ms;
+            failure.count = failure.count.saturating_add(1);
             return true;
         }
         let Some(status) = payload
@@ -292,6 +354,8 @@ impl BadgeState {
         else {
             return false;
         };
+        // 成功一次就把失败计数清掉（下次失败从 30s 重新算）。
+        self.failures.remove(&rrid);
         self.entries.insert(
             rrid,
             BadgeEntry {
@@ -321,18 +385,120 @@ pub fn recent(rows: &[RecordRow], limit: usize) -> Vec<i64> {
         .collect()
 }
 
-/// 本轮该拉哪几条：最近 N 条里，缓存没命中（或已过期）的那些。
+/// 本轮该拉哪几条：最近 N 条里，缓存没命中（或已过期）、且不在失败退避期内的那些。
+///
+/// **跨轮节流**：上一轮刚结束（不足 [`BADGE_INTERVAL_MS`]）就返回空 —— 否则
+/// 「失败 → 应用每 200 ms 重绘 → 立刻开新一轮」会让详情接口跑到 5 次/秒
+/// （盲审 BLOCKER-1）。"1 条/秒"必须在**轮与轮之间**也成立，而不只是轮内。
 pub fn plan(rows: &[RecordRow], badges: &BadgeState, now_ms: i64) -> Vec<i64> {
+    if badges.last_round_end_ms > 0
+        && now_ms.saturating_sub(badges.last_round_end_ms) < BADGE_INTERVAL_MS as i64
+    {
+        return Vec::new();
+    }
     recent(rows, BADGE_LIMIT)
         .into_iter()
         .filter(|rrid| badges.status_of(*rrid, now_ms).is_none())
+        .filter(|rrid| badges.ready_for_retry(*rrid, now_ms))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::cell::{Cell, RefCell};
+
+    /// BLOCKER-1 的回归锁：失败后**不许**在下一轮立刻重发。
+    ///
+    /// 盲审给的触发链是「失败 → 不写缓存 → 下一帧 plan 又排进去 → 新 pacer 首条立发」，
+    /// 应用每 200 ms 重绘一次，于是单条失败约 5 请求/秒。这条测试把三个闸门钉住：
+    /// 轮间 ≥1s、失败退避 30s→2min→10min、连续 3 次熔断。
+    #[test]
+    fn a_failed_row_backs_off_and_stops_retrying() {
+        let now = 1_700_000_000_000i64;
+        let mut badges = BadgeState::default();
+        let rows = vec![row(11, now, false)];
+
+        let run_failing_round = |badges: &mut BadgeState, at: i64| {
+            let control = std::sync::Arc::new(crate::task_control::Control::default());
+            let generation = badges.begin(control);
+            badges.apply(
+                &json!({"generation": generation, "rrid": 11, "error": "超时"}),
+                at,
+            );
+            badges.apply(&json!({"generation": generation, "done": true}), at);
+        };
+
+        // 第 1 轮：首条立即发（轮内允许）
+        assert_eq!(plan(&rows, &badges, now), vec![11]);
+        run_failing_round(&mut badges, now);
+
+        // 轮刚结束 200 ms：跨轮节流挡住 —— 这正是原来 "5 请求/秒" 的来源
+        assert!(
+            plan(&rows, &badges, now + 200).is_empty(),
+            "轮与轮之间也必须 ≥1s，否则每 200ms 重绘就等于 5 请求/秒"
+        );
+
+        // 过了轮间节流，但仍在 30s 退避内
+        assert!(
+            plan(&rows, &badges, now + 1_100).is_empty(),
+            "第一次失败要退避 30s"
+        );
+
+        // 30s 后允许重试，第 2 轮再失败 → 退避升到 2min
+        assert_eq!(plan(&rows, &badges, now + 30_000), vec![11]);
+        run_failing_round(&mut badges, now + 30_000);
+        assert!(
+            plan(&rows, &badges, now + 31_000).is_empty(),
+            "第二次失败要退避 2min"
+        );
+        assert_eq!(plan(&rows, &badges, now + 150_000), vec![11]);
+
+        // 第 3 次失败 → 熔断，永远不再自动重试，但失败原因保留
+        run_failing_round(&mut badges, now + 150_000);
+        assert!(
+            plan(&rows, &badges, now + 150_000 + 900_000).is_empty(),
+            "连续失败 3 次后必须停手，不能无限重试"
+        );
+        assert!(badges.error().is_some(), "停手后仍要保留失败原因");
+    }
+
+    /// 成功一次就把失败计数清掉：下次失败从 30s 重新算，不会一路熔断。
+    #[test]
+    fn a_successful_fetch_clears_the_failure_streak() {
+        let now = 1_700_000_000_000i64;
+        let mut badges = BadgeState::default();
+        let rows = vec![row(11, now, true)];
+
+        let control = std::sync::Arc::new(crate::task_control::Control::default());
+        let generation = badges.begin(control);
+        badges.apply(
+            &json!({"generation": generation, "rrid": 11, "error": "超时"}),
+            now,
+        );
+        badges.apply(&json!({"generation": generation, "done": true}), now);
+        assert!(plan(&rows, &badges, now + 1_100).is_empty());
+
+        // 模拟 30s 后成功
+        let control = std::sync::Arc::new(crate::task_control::Control::default());
+        let generation = badges.begin(control);
+        badges.apply(
+            &json!({"generation": generation, "rrid": 11, "status": "passed"}),
+            now + 30_000,
+        );
+        badges.apply(
+            &json!({"generation": generation, "done": true}),
+            now + 30_000,
+        );
+
+        // 缓存命中 → 不再排；失败计数也已清空（若再失败会从 30s 重新开始）
+        assert!(plan(&rows, &badges, now + 40_000).is_empty());
+        assert_eq!(
+            badges.status_of(11, now + 40_000),
+            Some(RecordStatus::Passed)
+        );
+    }
 
     fn row(rrid: i64, start_time: i64, complete: bool) -> RecordRow {
         RecordRow {
@@ -360,15 +526,26 @@ mod tests {
     fn detail(complete: bool, rules: &[(&str, bool)]) -> RunDetail {
         RunDetail {
             rrid: 0,
-            complete,
+            complete: Some(complete),
             reason_list: rules
                 .iter()
                 .map(|(text, ok)| crate::api::records::ReasonItem {
                     reason: (*text).into(),
-                    complete: *ok,
+                    complete: Some(*ok),
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Ok 空壳：既没有 `complete`、也没有 `reasonList`。
+    /// 徽标路径必须把它当作「本轮没取到」，**不得**写成「达标」或「未达标」（盲审 M1）。
+    fn detail_shell() -> RunDetail {
+        RunDetail {
+            rrid: 0,
+            complete: None,
+            reason_list: Vec::new(),
             ..Default::default()
         }
     }

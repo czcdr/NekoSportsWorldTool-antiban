@@ -99,7 +99,12 @@ pub struct RunDetail {
     pub valid_time: i64,
     pub address: String,
     pub status_info: String,
-    pub complete: bool,
+    /// 顶层判定。
+    ///
+    /// **`None` ≠ `false`**：`None` 是「服务端没写这个字段」，`Some(false)` 才是「判负」。
+    /// 折叠成 `bool` 会把「没写」显示成「未达标」——那是编出来的结论。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
     pub reason_list: Vec<ReasonItem>,
     pub start_time: i64,
 }
@@ -117,8 +122,12 @@ pub struct RunDetail {
 pub struct ReasonItem {
     #[serde(default)]
     pub reason: String,
-    #[serde(default)]
-    pub complete: bool,
+    /// 这一项通过与否。`None` = 服务端没给（不是「判负」）。
+    ///
+    /// 早先这里 `unwrap_or(false)`，于是「没写」被当成「没过」：一条没有 `complete`
+    /// 字段的条目会把整条记录打成「未达标」——假结论，而且正好落在风控信号上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
     /// 规则标识：来自 `ruleId` / `rule` / `ruleCode` / `ruleKey`（取第一个非空）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
@@ -149,7 +158,7 @@ impl ReasonItem {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
+            complete: r.get("complete").and_then(|v| v.as_bool()),
             rule_id: ["ruleId", "rule", "ruleCode", "ruleKey"]
                 .into_iter()
                 .find_map(text),
@@ -175,8 +184,16 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
             return Err("详情返回的记录编号与请求不一致，请刷新重试".into());
         }
     }
+    Ok(parse_detail(&raw, rrid))
+}
+
+/// 把 `get_one_record` 的内层 data 解析成 [`RunDetail`]（纯函数，不碰网络）。
+///
+/// `fetch_detail` 与测试走同一条解析路径：字段缺失的语义（例如 `complete` 缺失是
+/// `None` 而不是 `false`）只有一处定义，不会两条路径给出两个答案。
+pub fn parse_detail(raw: &Value, rrid: i64) -> RunDetail {
     let reasons = ReasonItem::from_list(raw.get("reasonList"));
-    Ok(RunDetail {
+    RunDetail {
         rrid,
         uuid: raw
             .get("uuid")
@@ -208,13 +225,11 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .into(),
-        complete: raw
-            .get("complete")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        // 顶层 `complete` 缺失 → `None`（不折叠成 false：那是编出来的「未达标」）。
+        complete: raw.get("complete").and_then(|v| v.as_bool()),
         reason_list: reasons,
         start_time: raw.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -230,7 +245,7 @@ mod tests {
             status_info: "有效".into(),
             reason_list: vec![ReasonItem {
                 reason: "里程达标".into(),
-                complete: true,
+                complete: Some(true),
                 ..Default::default()
             }],
             start_time: 1_700_000_000_000,
@@ -259,9 +274,29 @@ mod tests {
             "complete": false
         }));
         assert_eq!(item.reason, "运动数据有问题");
-        assert!(!item.complete);
+        assert_eq!(item.complete, Some(false));
         assert!(item.rule_id.is_none());
         assert!(item.kind_hint.is_none());
+    }
+
+    /// 「没写 complete」与「complete=false」必须分得开。
+    ///
+    /// 折叠成 `false` 会让一条没有该字段的条目看起来「没过」→ 整条记录被误判「未达标」。
+    #[test]
+    fn missing_complete_is_not_the_same_as_failed() {
+        let missing = ReasonItem::from_json(&serde_json::json!({"reason": "步频 40–300"}));
+        assert_eq!(missing.complete, None);
+        let failed = ReasonItem::from_json(&serde_json::json!({
+            "reason": "步频 40–300",
+            "complete": false
+        }));
+        assert_eq!(failed.complete, Some(false));
+
+        let detail = parse_detail(&serde_json::json!({"rrid": 7}), 7);
+        assert_eq!(
+            detail.complete, None,
+            "顶层 complete 缺失必须保留为 None，不能变成「未达标」"
+        );
     }
 
     /// 结构键原样保留，且序列化后（详情回传 UI 的形态）不丢。

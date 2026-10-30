@@ -200,7 +200,7 @@ pub fn diagnose(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Dia
             Ok(d) => d
                 .reason_list
                 .iter()
-                .filter(|x| !x.complete)
+                .filter(|x| x.complete == Some(false))
                 .map(|x| x.reason.clone())
                 .filter(|s| !s.trim().is_empty())
                 .collect(),

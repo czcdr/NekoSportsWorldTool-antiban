@@ -467,11 +467,19 @@ fn badge_backfill_marks_anomalous_row_red_without_touching_the_list() {
         has_text_starting_with(&output, "规则已达标，但运动数据有问题"),
         "红色徽标必须自解释，而不是只写「异常」两个字"
     );
-    // 未达标那条：徽标保持中性色，红色只留给风控信号。
+    // 没取到的那条（11 号超时）：必须显示「待核」，**不得**用列表的 complete 兜底。
+    //
+    // BLOCKER-2（盲审）：旧实现回退到 `row.complete`，于是「没核对」被显示成「未达标」；
+    // 更糟的是 `complete=true` 时会被显示成绿色「达标」——一条其实「通过但异常」的记录，
+    // 会因为详情没取到而看起来完美。没核对到就只能是「待核」。
     assert_eq!(
-        text_color(&output, "未达标"),
+        text_color(&output, "待核"),
         Some(theme::text_dim()),
-        "「未达标」是规则层结论，徽标不许标红"
+        "没核对到的行必须显示中性的「待核」"
+    );
+    assert!(
+        !has_text_starting_with(&output, "未达标"),
+        "没核对到 ≠ 未达标：不得替服务端下结论"
     );
     assert!(
         has_text_starting_with(&output, "判定没全部取到"),

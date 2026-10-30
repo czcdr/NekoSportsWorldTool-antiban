@@ -777,14 +777,15 @@ pub(crate) fn recheck_one(
             let reasons: Vec<String> = detail
                 .reason_list
                 .iter()
-                .filter(|r| !r.complete)
+                .filter(|r| r.complete == Some(false))
                 .map(|r| r.reason.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            // 与 `Verification::from_result` 同口径：reasonList 里任一 false 就是未达标，
-            // 哪怕顶层的 complete 自相矛盾。
+            // 与 `Verification::from_result` 同口径：reasonList 里任一 **明确 false** 就是
+            // 未达标，哪怕顶层的 complete 自相矛盾。顶层没写（`None`）时透传 None，
+            // 不折叠成 false —— 「没写」和「判负」不是一回事。
             let complete = if reasons.is_empty() {
-                Some(detail.complete)
+                detail.complete
             } else {
                 Some(false)
             };
