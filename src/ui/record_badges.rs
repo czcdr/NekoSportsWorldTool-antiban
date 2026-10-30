@@ -251,9 +251,14 @@ impl BadgeState {
     }
 
     fn entry(&self, rrid: i64, now_ms: i64) -> Option<&BadgeEntry> {
-        self.entries
-            .get(&rrid)
-            .filter(|entry| now_ms.saturating_sub(entry.at_ms) < BADGE_TTL_MS)
+        self.entries.get(&rrid).filter(|entry| {
+            // 复审 N4：墙钟回拨时 `now < at_ms`，差值会被夹成 0 —— 旧写法会让缓存
+            // **永不过期**（旧徽标一直挂着）。回拨一律当过期处理：宁可重拉一次。
+            if now_ms < entry.at_ms {
+                return false;
+            }
+            now_ms.saturating_sub(entry.at_ms) < BADGE_TTL_MS
+        })
     }
 
     /// 是否有回填在飞（含已取消但线程还没收尾的那一小段）。
@@ -289,6 +294,16 @@ impl BadgeState {
     }
 
     /// 登出/会话失效：连缓存与失败记录一起收掉。
+    /// 用户主动刷新记录页：清掉失败退避与熔断，让「救不回来」变成「再试一次」。
+    ///
+    /// 复审 N5：熔断（连续 3 次失败）原本没有任何恢复路径 —— 一次几分钟的网络抖动
+    /// 会让那几条整个会话停在「待核」，点刷新也不清，只有登出重登才行。
+    /// 缓存（`entries`）保留：已经拿到的结论不该因为刷新重拉。
+    pub fn forget_failures(&mut self) {
+        self.failures.clear();
+        self.error = None;
+    }
+
     pub fn clear(&mut self) {
         self.cancel();
         self.entries.clear();
@@ -314,6 +329,10 @@ impl BadgeState {
         if failure.count >= BADGE_FAIL_LIMIT {
             return false;
         }
+        // 复审 N4：墙钟回拨（now < at_ms）时不要惩罚用户 —— 否则退避可能永远不结束。
+        if now_ms < failure.at_ms {
+            return true;
+        }
         let index = (failure.count as usize)
             .saturating_sub(1)
             .min(BADGE_BACKOFF_MS.len() - 1);
@@ -324,7 +343,28 @@ impl BadgeState {
     pub fn apply(&mut self, payload: &Value, now_ms: i64) -> bool {
         let generation = payload.get("generation").and_then(Value::as_u64);
         if generation != Some(self.generation) {
-            return false; // 已取消 / 已换轮：迟到的结果不许写进当前状态
+            // 已取消 / 已换轮：**状态机**不许被迟到回包改动（`pending`/`handle`/`error`）。
+            //
+            // 但复审 M4：那一次请求**已经花掉了计数**，如果它还带着结论，就该进缓存 ——
+            // 丢掉只会在切页/切回时对同一个 rrid 再拉一次，白花两次。
+            // 只补空缺、不覆盖新结论，且不动失败计数（那是当前轮的账）。
+            if let Some(rrid) = payload.get("rrid").and_then(Value::as_i64) {
+                if let Some(status) = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(RecordStatus::from_code)
+                {
+                    self.entries.entry(rrid).or_insert(BadgeEntry {
+                        status,
+                        anomaly: payload
+                            .get("anomaly")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        at_ms: now_ms,
+                    });
+                }
+            }
+            return false;
         }
         if payload.get("done").and_then(Value::as_bool) == Some(true) {
             self.pending = false;
@@ -391,7 +431,10 @@ pub fn recent(rows: &[RecordRow], limit: usize) -> Vec<i64> {
 /// 「失败 → 应用每 200 ms 重绘 → 立刻开新一轮」会让详情接口跑到 5 次/秒
 /// （盲审 BLOCKER-1）。"1 条/秒"必须在**轮与轮之间**也成立，而不只是轮内。
 pub fn plan(rows: &[RecordRow], badges: &BadgeState, now_ms: i64) -> Vec<i64> {
+    // 复审 N4：只有时钟**没有回拨**时节流检查才有意义。回拨（now < 上一轮结束时刻）
+    // 时旧写法会让 `plan` 永久返回空 —— 徽标再也不更新，且没有任何提示。
     if badges.last_round_end_ms > 0
+        && now_ms >= badges.last_round_end_ms
         && now_ms.saturating_sub(badges.last_round_end_ms) < BADGE_INTERVAL_MS as i64
     {
         return Vec::new();
@@ -464,6 +507,33 @@ mod tests {
         assert!(badges.error().is_some(), "停手后仍要保留失败原因");
     }
 
+    /// M1（盲审）的回归锁：Ok 空壳（既没有 `complete`、也没有 `reasonList`）在徽标
+    /// 路径上必须当作「本轮没取到」，**不得**据此写下「达标」或「未达标」的结论。
+    ///
+    /// 这条路径此前零覆盖（`detail_shell()` 定义了没人用），而它正是「同一份 payload
+    /// 在徽标与详情页给出不同答案」的源头。
+    #[test]
+    fn an_empty_shell_detail_is_not_fetched_rather_than_a_verdict() {
+        let clock = Cell::new(1_700_000_000_000i64);
+        let mut pacer = BadgePacer::new(vec![11]);
+        let control = crate::task_control::Control::default();
+        let mut outcomes = Vec::new();
+        let report = run_backfill(
+            &mut pacer,
+            &control,
+            || clock.get(),
+            |_ms| {},
+            |_rrid| Ok(detail_shell()),
+            |outcome| outcomes.push(outcome),
+        );
+        assert_eq!(report.fetched, 0, "空壳不算「取到」");
+        assert_eq!(report.failed, 1, "空壳要走失败路径（进退避），不能当结论");
+        assert!(
+            matches!(outcomes.first(), Some(BadgeOutcome::Failed { .. })),
+            "必须上报 Failed，而不是 Fetched(某个结论)"
+        );
+    }
+
     /// 成功一次就把失败计数清掉：下次失败从 30s 重新算，不会一路熔断。
     #[test]
     fn a_successful_fetch_clears_the_failure_streak() {
@@ -506,7 +576,7 @@ mod tests {
             total_dis: 2000.0,
             total_time: 840,
             start_time,
-            complete,
+            complete: Some(complete),
             avg_step_freq: 160,
             calorie: 0,
             avg_power: 0,
@@ -739,14 +809,20 @@ mod tests {
             badges.status_of(7, 2_000),
             Some(RecordStatus::PassedButAnomalous)
         );
-        // 迟到回包（旧代数）不许写进当前状态。
+        // 迟到回包（旧代数）**不许改动状态机**，但它带的结论仍然进缓存 ——
+        // 那一次请求已经花掉了计数，丢掉等于切页/切回时对同一 rrid 再拉一次（复审 M4）。
         assert!(!badges.apply(
             &serde_json::json!({
                 "generation": generation, "rrid": 6, "status": "passed"
             }),
             3_000
         ));
-        assert_eq!(badges.status_of(6, 3_000), None);
+        assert_eq!(
+            badges.status_of(6, 3_000),
+            Some(RecordStatus::Passed),
+            "迟到的成功结论应该入缓存（不白花那次请求）"
+        );
+        assert!(!badges.in_flight(), "迟到回包不许把状态机拉回「在飞」");
     }
 
     /// 错误消息只记录原因，不清缓存、不清在飞状态（done 才收尾）。

@@ -14,7 +14,13 @@ pub struct RecordRow {
     pub total_dis: f64,
     pub total_time: i64,
     pub start_time: i64,
-    pub complete: bool,
+    /// 列表里的达标标记。**`None` = 服务端没给这个字段**，不是「未达标」。
+    ///
+    /// 与 `RunDetail.complete` / `ReasonItem.complete` 同一口径（复审 M3）：
+    /// 折叠成 `bool` 会让 CLI 与 `recover` 把「没写」当成「判负」，
+    /// 于是挑出一些根本没被判负的记录去「修复」。
+    #[serde(default)]
+    pub complete: Option<bool>,
     pub avg_step_freq: i64,
     #[serde(default)]
     pub calorie: i64,
@@ -52,7 +58,7 @@ pub fn fetch_records(client: &mut ApiClient) -> Result<Vec<RecordRow>, String> {
             total_dis: r.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
             total_time: r.get("totalTime").and_then(|v| v.as_i64()).unwrap_or(0),
             start_time: r.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
-            complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
+            complete: r.get("complete").and_then(|v| v.as_bool()),
             avg_step_freq: r.get("avgStepFreq").and_then(|v| v.as_i64()).unwrap_or(0),
             calorie: r.get("calorie").and_then(|v| v.as_i64()).unwrap_or(0),
             avg_power: r.get("avgPower").and_then(|v| v.as_i64()).unwrap_or(0),

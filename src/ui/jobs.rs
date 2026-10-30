@@ -652,6 +652,9 @@ impl App {
             self.status = "请先登录".into();
             return;
         };
+        // 复审 N5：主动刷新 = 用户要求重来一次，必须把失败退避/熔断清掉。
+        // 否则一次 ~3 分钟的网络抖动会让那几条整个会话停在「待核」，点刷新也救不回。
+        self.records_page.badges.forget_failures();
         let identity = self.identity.clone();
         self.records_busy = true;
         self.status = "记录拉取中…".into();
@@ -730,6 +733,9 @@ impl App {
     pub fn ensure_record_badges(&mut self) {
         if self.records_page.rows.is_empty()
             || self.session.is_none()
+            // 切到「AI 运动」子标签时不该继续拉跑步详情（复审 M5：原来只看顶层 tab，
+            // 于是子标签页上仍在 1 条/秒地打详情接口）。
+            || self.records_page.sub != 0
             || self.records_busy
             || self.records_page.badges.in_flight()
         {

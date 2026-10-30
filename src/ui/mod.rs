@@ -435,7 +435,11 @@ impl App {
 
         // 离开记录页就把徽标回填停掉：这不是「刷新」，是在读会计数的详情接口。
         // 放在这一层是因为切页不经过记录页自己的代码，只有 shell 知道用户走没走。
-        if self.tab != records::RECORDS_TAB && self.records_page.badges.in_flight() {
+        //
+        // 复审 M5：**记录页内的「AI 运动」子标签也算离开**（`sub != 0`）—— 原来只看
+        // 顶层 tab，于是切到子标签后仍在 1 条/秒地打跑步详情接口。
+        let left_records = self.tab != records::RECORDS_TAB || self.records_page.sub != 0;
+        if left_records && self.records_page.badges.in_flight() {
             self.records_page.badges.cancel();
         }
     }

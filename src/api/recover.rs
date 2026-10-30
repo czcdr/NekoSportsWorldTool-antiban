@@ -195,7 +195,9 @@ pub fn diagnose(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Dia
     let rows = records::fetch_records(client)?;
     let total_records = rows.len();
     let mut abnormal = Vec::new();
-    for row in rows.iter().filter(|r| !r.complete) {
+    // 只挑「明确未达标」和「没给结论」的：`None` 不确定，值得复查一次；
+    // 但**不能**把 `None` 说成未达标（复审 M3：以前 `unwrap_or(false)` 就是那样）。
+    for row in rows.iter().filter(|r| r.complete != Some(true)) {
         let reasons = match records::fetch_detail(client, row.rrid) {
             Ok(d) => d
                 .reason_list

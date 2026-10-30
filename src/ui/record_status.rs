@@ -355,6 +355,14 @@ pub fn classify(complete: bool, reasons: &[ReasonItem]) -> RecordStatus {
     if reasons.iter().any(anomaly_signal) {
         return RecordStatus::PassedButAnomalous;
     }
+    // 规则项**没给结果**（`None`）也不能算通过：那是「没核对」，不是「通过」。
+    // 顶层 true、规则项全是 None 时输出 Unverified，而不是替服务端宣布达标（复审 N8）。
+    if reasons
+        .iter()
+        .any(|r| item_kind(r) == ReasonKind::Rule && r.complete.is_none())
+    {
+        return RecordStatus::PassedUnverified;
+    }
     // 有**真正认不出来源**的条目：不能替服务端说「达标」。
     //
     // 但「没问题」「符合要求」这类**正常性陈述**不算认不出：它们明确表达了通过，
@@ -419,10 +427,18 @@ pub fn failed_rule_count(reasons: &[ReasonItem]) -> usize {
 }
 
 /// 认不出来的条目数（界面上如实提示，不参与风控判定，但会压掉「达标」结论）。
+///
+/// **口径必须与 [`classify`] 一致**（复审 N7）：那边排除了「正常性陈述」与「被否定的
+/// 异常」，这里若只按 `item_kind` 数，文案里的 N 会大于实际压掉达标的条目数 ——
+/// 于是「有 3 项认不出来源」可能对应 0 项实际影响，数字吓人而结论没变。
 pub fn unclassified_count(reasons: &[ReasonItem]) -> usize {
     reasons
         .iter()
-        .filter(|r| item_kind(r) == ReasonKind::Unclassified)
+        .filter(|r| {
+            item_kind(r) == ReasonKind::Unclassified
+                && !has_normal_marker(&r.reason)
+                && !anomaly_is_negated(&r.reason)
+        })
         .count()
 }
 
@@ -562,8 +578,9 @@ mod tests {
     fn missing_complete_is_unknown_not_failed() {
         let mut reasons = passing_rules();
         reasons[2] = item("跑 14 分钟以上", None);
-        // 规则项没写通过与否：不算失败，结论仍是达标（顶层说达标）。
-        assert_eq!(classify(true, &reasons), RecordStatus::Passed);
+        // 规则项没写通过与否：**不算失败**（不标红），但也**不算通过** ——
+        // 「没核对」不能替服务端宣布达标（复审 N8）。
+        assert_eq!(classify(true, &reasons), RecordStatus::PassedUnverified);
         // 顶层没写 → 不给结论（而不是「未达标」）。
         assert_eq!(classify_detail_parts(None, &reasons), None);
         assert_eq!(

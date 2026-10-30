@@ -173,7 +173,12 @@ pub(crate) fn print_rows(rows: &[RecordRow]) {
             ),
             pace,
             r.avg_step_freq,
-            if r.complete { "是" } else { "否" },
+            // 「未知」必须与「否」分开：字段缺失不是判负（复审 M3）。
+            match r.complete {
+                Some(true) => "是",
+                Some(false) => "否",
+                None => "未知",
+            },
             r.rrid
         );
     }

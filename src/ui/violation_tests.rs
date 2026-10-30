@@ -396,7 +396,7 @@ fn record_row(rrid: i64, start_time: i64, complete: bool) -> crate::api::records
         total_dis: 2000.0,
         total_time: 840,
         start_time,
-        complete,
+        complete: Some(complete),
         avg_step_freq: 160,
         calorie: 120,
         avg_power: 90,
