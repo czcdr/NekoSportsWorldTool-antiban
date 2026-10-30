@@ -706,17 +706,33 @@ fn draw_detail_verdict(ui: &mut egui::Ui, raw: &serde_json::Value) {
         let kind = record_status::item_kind(&item);
         mobile::row(ui, |ui| {
             match kind {
-                // 非规则项：规则全过也可能出现的那一行，红色 + 图标 + 「异常」标签。
+                // 非规则项：只有**真的算风控信号**才画红（复审 N2）。
+                //
+                // 旧实现在这里无条件 `theme::err()` + 「异常」标签，于是
+                // 「运动数据正常」这类被极性豁免的行也画红，出现「顶部绿达标 +
+                // 下面红异常」的同屏矛盾。判据必须与 `classify` 用同一个
+                // `anomaly_signal`，否则模型与渲染各说一套。
                 ReasonKind::NonRule => {
+                    let signal = record_status::anomaly_signal(&item);
+                    let color = if signal {
+                        theme::err()
+                    } else {
+                        theme::text_dim()
+                    };
                     // `None` = 服务端没写这一项的结果，不是「判负」——用「?」而不是「×」。
-                    let (mark, color) = match item.complete {
-                        Some(true) => ("√", theme::err()),
-                        Some(false) => ("×", theme::err()),
-                        None => ("?", theme::text_dim()),
+                    let mark = match item.complete {
+                        Some(true) => "√",
+                        Some(false) => "×",
+                        None => "?",
                     };
                     ui.colored_label(color, mark);
-                    ui.colored_label(theme::err(), egui::RichText::new("异常").small().strong());
-                    ui.colored_label(theme::err(), egui::RichText::new(&item.reason).strong());
+                    if signal {
+                        ui.colored_label(
+                            theme::err(),
+                            egui::RichText::new("异常").small().strong(),
+                        );
+                    }
+                    ui.colored_label(color, egui::RichText::new(&item.reason).strong());
                 }
                 ReasonKind::Rule => {
                     match item.complete {
@@ -866,9 +882,17 @@ fn draw_run_badge_word(
         Some(RecordStatus::Failed) => {
             ui.label(egui::RichText::new("未达标").color(theme::text_dim()));
         }
-        // 规则全过但有条目认不出来源：不能写「达标」（那是替服务端下结论），
-        // 也不标红（认不出 ≠ 被判可疑）。
-        Some(RecordStatus::PassedUnverified) | None => {
+        // 规则全过但有条目认不出来源：已核对过，只是结论不确定 —— 用「含未识别」
+        // 与「待核」（压根没核对）区分开（复审 N3）。
+        Some(RecordStatus::PassedUnverified) => {
+            ui.label(
+                egui::RichText::new(RecordStatus::PassedUnverified.short_label())
+                    .color(theme::text_dim()),
+            );
+        }
+        // `None` = **根本没核对到**（详情没取到，或不在最近 5 条的计划内）。
+        // BLOCKER-2：不许用 `row.complete` 兜底成「达标」。
+        None => {
             ui.label(egui::RichText::new("待核").color(theme::text_dim()));
         }
     }

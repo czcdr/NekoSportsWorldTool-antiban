@@ -146,6 +146,9 @@ pub const ANOMALY_KEYWORDS: &[&str] = &[
     "异常",
     "违规",
     "作弊",
+    // 「非正常」不含「异常」二字，但意思就是异常。复审 N1：`「数据非正常」` 曾落到
+    // Unclassified，于是只显示「含未识别」而没有标红。
+    "非正常",
     // 参数一致性 / 自洽性
     "不自洽",
     "不合理",
@@ -165,7 +168,10 @@ pub const ANOMALY_KEYWORDS: &[&str] = &[
 const NORMAL_MARKERS: &[&str] = &["正常", "无误", "没有问题", "已恢复", "符合要求"];
 
 /// 紧贴在异常词前面时构成否定的词。
-const NEGATIONS: &[&str] = &["无", "没有", "未", "非", "不存在", "通过"];
+///
+/// `"不"` 必须有：`「不符合要求」`、`「不异常」` 都靠它。复审 N1 发现缺了它时，
+/// `「不符合要求」` 会因为含 `「符合要求」` 子串被判成正常性陈述。
+const NEGATIONS: &[&str] = &["无", "没有", "未", "非", "不存在", "通过", "不"];
 
 /// 一条判定的类别：**先看结构，结构确实没有区分时才退回文案**。
 pub fn item_kind(item: &ReasonItem) -> ReasonKind {
@@ -234,32 +240,73 @@ fn kind_from_text(text: &str) -> ReasonKind {
     ReasonKind::Unclassified
 }
 
-/// 这句话是不是「正常/没问题」的陈述（`正常 / 无误 / 符合要求 / 已恢复`）。
+/// 这句话是不是「正常/没问题」的陈述。
+///
+/// 判据必须比「含『正常』二字」严格得多：复审 N1 抓到过一个**回归** ——
+/// `「运动数据异常，其余正常」` 因为含「正常」被判成正常性陈述，于是一条真风控信号
+/// 显示成绿色「达标」（旧实现本来是红的）。原则：**宁可误报红，不可漏报**。
 fn has_normal_marker(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return false;
     }
-    // 「不正常」「未恢复正常」恰恰是异常：否定之否定要先排除，别被「正常」两个字骗了。
-    if t.contains("不正常") || t.contains("未正常") || t.contains("未恢复") {
+    // ① 否定之否定：「不正常」「非正常」「未恢复」本身就是坏消息。
+    if t.contains("不正常") || t.contains("非正常") || t.contains("未正常") || t.contains("未恢复")
+    {
+        return false;
+    }
+    // ② 正常词前面**直接**跟否定词：「不符合要求」「未达标」不是正常。
+    if NEGATIONS.iter().any(|n| {
+        NORMAL_MARKERS
+            .iter()
+            .any(|m| t.contains(&format!("{n}{m}")))
+    }) {
+        return false;
+    }
+    // ③ 句子里还有**未被否定、也不是「X 正常」形式**的异常词 → 整条不是正常性陈述。
+    let has_real_signal = ANOMALY_KEYWORDS
+        .iter()
+        .any(|k| t.contains(k) && !keyword_followed_by_normal(t, k));
+    if has_real_signal && !anomaly_is_negated(t) {
         return false;
     }
     NORMAL_MARKERS.iter().any(|m| t.contains(m))
 }
 
-/// 异常词是否被否定（`无异常` / `未发现违规` / `没有作弊`）。
+/// 异常词后面**紧跟**正常词：`「运动数据正常」` 是在说该数据没问题，不是异常。
+fn keyword_followed_by_normal(t: &str, keyword: &str) -> bool {
+    t.match_indices(keyword).any(|(start, _)| {
+        let rest = &t[start + keyword.len()..];
+        NORMAL_MARKERS
+            .iter()
+            .any(|m| rest.trim_start().starts_with(m))
+    })
+}
+
+/// 异常词是否全部被否定（`无异常` / `未发现违规` / `没有作弊`）。
 ///
-/// 只看**紧挨着异常词前面的三个字**，不做语法分析：`「无异常」` 是否定，
-/// `「数据异常，无有效轨迹」` 里的 `异常` 仍然算异常（`无` 在它后面，不该抹掉它）。
+/// 两条硬规则（复审 N1）：
+/// - 含转折词（但/却/然而/不过）时**一律不算否定**——前后是两件事，
+///   `「无重复路段，但运动数据异常」` 后半句是真信号，不能被前半句抹掉；
+/// - 必须**每一处**异常词都被否定才算整条否定（旧实现「任一命中即 return true」
+///   会把同句里未被否定的异常一起吞掉）。
 fn anomaly_is_negated(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return false;
     }
+    if ["但", "却", "然而", "不过", "只是"]
+        .iter()
+        .any(|w| t.contains(w))
+    {
+        return false;
+    }
+    let mut saw = false;
     for keyword in ANOMALY_KEYWORDS {
         let mut search_from = 0;
         while let Some(offset) = t[search_from..].find(keyword) {
             let start_of_keyword = search_from + offset;
+            saw = true;
             let window_start = t[..start_of_keyword]
                 .char_indices()
                 .rev()
@@ -268,8 +315,8 @@ fn anomaly_is_negated(text: &str) -> bool {
                 .map(|(index, _)| index)
                 .unwrap_or(start_of_keyword);
             let before = &t[window_start..start_of_keyword];
-            if NEGATIONS.iter().any(|n| before.contains(n)) {
-                return true;
+            if !NEGATIONS.iter().any(|n| before.contains(n)) {
+                return false; // 有一处没被否定 → 整条算真信号
             }
             search_from = start_of_keyword + keyword.len();
             if search_from >= t.len() {
@@ -277,7 +324,7 @@ fn anomaly_is_negated(text: &str) -> bool {
             }
         }
     }
-    false
+    saw
 }
 
 /// 这条判定是不是**风控信号**：非规则项 + 自己没过 + 文案不是「正常/无异常」。
@@ -396,6 +443,60 @@ pub fn sorted_for_display(reasons: &[ReasonItem]) -> Vec<ReasonItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 复审 N1 的回归锁：极性判断不许把真风控信号吞成绿色「达标」。
+    ///
+    /// 上一版用整串 `contains` 判「正常」，于是「运动数据异常，其余正常」因为含
+    /// 「正常」被判成正常性陈述 —— 一条真信号显示成绿色，而且这是相对旧实现的**回归**
+    /// （旧实现本来会标红）。原则：**宁可误报红，不可漏报**。
+    #[test]
+    fn a_real_anomaly_is_never_swallowed_by_a_normal_word_elsewhere() {
+        let rules = vec![rule("最少要跑2.00公里", true)];
+
+        for text in [
+            "运动数据异常，其余正常",     // 含「正常」，但真异常在前
+            "数据非正常",                 // 「非正常」= 异常
+            "无重复路段，但运动数据异常", // 转折词后是真信号
+            "无违规，但轨迹异常",         // 同上
+        ] {
+            let mut reasons = rules.clone();
+            reasons.push(anomalous(text));
+            assert_eq!(
+                classify(true, &reasons),
+                RecordStatus::PassedButAnomalous,
+                "「{text}」是真风控信号，必须标红"
+            );
+        }
+    }
+
+    /// 反向：真正的正常性陈述不该误报红（否则红色就没有含义了）。
+    #[test]
+    fn genuinely_normal_statements_stay_green() {
+        let rules = vec![rule("最少要跑2.00公里", true)];
+        for text in ["运动数据正常", "无异常", "没有问题", "符合要求"] {
+            let mut reasons = rules.clone();
+            reasons.push(ReasonItem {
+                reason: text.into(),
+                complete: Some(true),
+                ..Default::default()
+            });
+            assert_eq!(
+                classify(true, &reasons),
+                RecordStatus::Passed,
+                "「{text}」是正常性陈述，不该标红"
+            );
+        }
+    }
+
+    /// 「不符合要求」不是正常性陈述：它含「符合要求」子串，但前置否定。
+    #[test]
+    fn negated_requirement_is_not_a_normal_statement() {
+        assert!(!has_normal_marker("不符合要求"));
+        assert!(!has_normal_marker("未达到要求"));
+        assert!(!has_normal_marker("不正常"));
+        assert!(has_normal_marker("符合要求"));
+        assert!(has_normal_marker("运动数据正常"));
+    }
 
     fn item(text: &str, complete: Option<bool>) -> ReasonItem {
         ReasonItem {
